@@ -1,0 +1,421 @@
+/*
+ * Mark screens (sheet + door): a photo stage with controls floating over it.
+ *
+ * Everything is scoped under .sm-mark. The door screen's help sheet is appended
+ * to <body>, outside the screen, so its content wrapper carries
+ * .sm-mark.sm-mark--help itself.
+ */
+
+.sm-mark {
+  /* 44px, the minimum comfortable touch target, built from the spacing scale. */
+  --sm-mark-hit: calc(var(--sm-space-6) + var(--sm-space-3));
+
+  /* Plain-token values first: browsers without color-mix() keep these. */
+  --sm-mark-stage-bg: var(--sm-text);
+  --sm-mark-float-bg: var(--sm-text);
+  --sm-mark-float-fg: var(--sm-surface);
+  --sm-mark-float-line: var(--sm-muted);
+  --sm-mark-float-press: var(--sm-muted);
+  --sm-mark-door-fill: var(--sm-surface);
+}
+
+/* A var() inside color-mix() cannot fall back per declaration, hence @supports. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .sm-mark {
+    --sm-mark-stage-bg: color-mix(in srgb, var(--sm-text) 30%, black);
+    --sm-mark-float-bg: color-mix(in srgb, var(--sm-text) 86%, transparent);
+    --sm-mark-float-line: color-mix(in srgb, var(--sm-surface) 38%, transparent);
+    --sm-mark-float-press: color-mix(in srgb, var(--sm-text) 68%, var(--sm-surface));
+    --sm-mark-door-fill: color-mix(in srgb, var(--sm-primary) 10%, var(--sm-surface));
+  }
+}
+
+/* Several pieces are shown and hidden with the hidden attribute while having
+   an explicit display value below. */
+.sm-mark [hidden] {
+  display: none !important;
+}
+
+/* ---------- Banner: a full-width instruction strip above the photo ---------- */
+
+.sm-mark .sm-mark__banner {
+  flex: none;
+  margin: 0;
+  border-width: 0 0 1px;
+  border-radius: 0;
+}
+
+/* Focused by the app on entry so screen readers start here; it is not a control. */
+.sm-mark .sm-mark__banner:focus {
+  outline: none;
+}
+
+/* ---------- Stage: the photo and everything floating over it ---------- */
+
+.sm-mark .sm-mark__stage {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--sm-mark-stage-bg);
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The editor's own container: fills the stage, so it has a definite size. */
+.sm-mark .sm-mark__canvas {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+
+/* Overlay rows let touches fall through to the photo; only the controls
+   inside them take pointer events. */
+.sm-mark .sm-mark__top,
+.sm-mark .sm-mark__controls {
+  position: absolute;
+  right: 0;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  padding: var(--sm-space-3);
+  padding-right: max(var(--sm-space-3), env(safe-area-inset-right));
+  padding-left: max(var(--sm-space-3), env(safe-area-inset-left));
+  pointer-events: none;
+}
+
+.sm-mark .sm-mark__top {
+  top: 0;
+  align-items: flex-start;
+  gap: var(--sm-space-2);
+}
+
+/* Spans the whole stage (it lets touches through) so the nudge pad can sit at
+   the bottom or half-way up a side; mark-common.js picks whichever spot keeps
+   it off the corner handles. */
+.sm-mark .sm-mark__controls {
+  top: 0;
+  bottom: 0;
+  align-items: flex-end;
+}
+
+/* Pad on the right, Fit on the left. */
+.sm-mark .sm-mark__controls--flip {
+  flex-direction: row-reverse;
+}
+
+/* Pad half-way up the side; Fit stays in its bottom corner. */
+.sm-mark .sm-mark__controls--mid .sm-mark__pad {
+  align-self: center;
+}
+
+/* ---------- Chips and small tools over the top of the photo ---------- */
+
+.sm-mark .sm-mark__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sm-space-2);
+  min-width: 0;
+}
+
+/* Lift the chips off the photo behind them. */
+.sm-mark .sm-mark__chips > * {
+  box-shadow: var(--sm-shadow);
+}
+
+.sm-mark .sm-mark__tools {
+  display: flex;
+  flex: none;
+  gap: var(--sm-space-2);
+  margin-left: auto;
+}
+
+/* ---------- Floating controls ---------- */
+
+/* Inverted (text-coloured) so they read over white doors and dark doors alike. */
+.sm-mark .sm-mark__float {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sm-space-2);
+  box-sizing: border-box;
+  min-width: var(--sm-mark-hit);
+  min-height: var(--sm-mark-hit);
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--sm-mark-float-line);
+  border-radius: var(--sm-radius);
+  background: var(--sm-mark-float-bg);
+  color: var(--sm-mark-float-fg);
+  box-shadow: var(--sm-shadow);
+  font: inherit;
+  font-size: var(--sm-text-sm);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-appearance: none;
+  appearance: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 120ms ease, opacity 120ms ease;
+}
+
+.sm-mark .sm-mark__float svg {
+  display: block;
+  flex: none;
+}
+
+.sm-mark .sm-mark__float:active {
+  background: var(--sm-mark-float-press);
+}
+
+/* The stage is dark, so the ring uses the accent rather than the kit's default. */
+.sm-mark .sm-mark__float:focus-visible {
+  outline: 3px solid var(--sm-accent);
+  outline-offset: 2px;
+}
+
+.sm-mark .sm-mark__float:disabled {
+  cursor: default;
+}
+
+.sm-mark .sm-mark__fab {
+  width: var(--sm-mark-hit);
+  height: var(--sm-mark-hit);
+  border-radius: 50%;
+}
+
+.sm-mark .sm-mark__pill {
+  padding: 0 var(--sm-space-4) 0 var(--sm-space-3);
+  border-radius: var(--sm-mark-hit);
+}
+
+.sm-mark .sm-mark__fit {
+  margin-left: auto;
+}
+
+.sm-mark .sm-mark__controls--flip .sm-mark__fit {
+  margin-right: auto;
+  margin-left: 0;
+}
+
+/* ---------- Nudge pad: four arrows in a cross ---------- */
+
+/* Only the four arms take touches; the empty corners of the grid stay clear. */
+.sm-mark .sm-mark__pad {
+  display: grid;
+  flex: none;
+  grid-template-rows: repeat(3, var(--sm-mark-hit));
+  grid-template-columns: repeat(3, var(--sm-mark-hit));
+  grid-template-areas:
+    '. up .'
+    'left hub right'
+    '. down .';
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.sm-mark .sm-mark__nudge {
+  width: var(--sm-mark-hit);
+  height: var(--sm-mark-hit);
+  box-shadow: none;
+}
+
+.sm-mark .sm-mark__nudge--up {
+  grid-area: up;
+  border-bottom-width: 0;
+  border-radius: var(--sm-radius) var(--sm-radius) 0 0;
+}
+
+.sm-mark .sm-mark__nudge--down {
+  grid-area: down;
+  border-top-width: 0;
+  border-radius: 0 0 var(--sm-radius) var(--sm-radius);
+}
+
+.sm-mark .sm-mark__nudge--left {
+  grid-area: left;
+  border-right-width: 0;
+  border-radius: var(--sm-radius) 0 0 var(--sm-radius);
+}
+
+.sm-mark .sm-mark__nudge--right {
+  grid-area: right;
+  border-left-width: 0;
+  border-radius: 0 var(--sm-radius) var(--sm-radius) 0;
+}
+
+.sm-mark .sm-mark__pad-hub {
+  display: grid;
+  grid-area: hub;
+  place-items: center;
+  background: var(--sm-mark-float-bg);
+}
+
+.sm-mark .sm-mark__pad-hub::after {
+  width: var(--sm-space-2);
+  height: var(--sm-space-2);
+  border-radius: 50%;
+  background: var(--sm-mark-float-line);
+  content: '';
+}
+
+/* No corner selected: dim the pad and let touches through to the photo, so a
+   handle underneath it can still be grabbed. */
+.sm-mark .sm-mark__pad--idle {
+  opacity: 0.45;
+}
+
+.sm-mark .sm-mark__pad--idle .sm-mark__nudge {
+  pointer-events: none;
+}
+
+/* ---------- Action bar extras (sheet screen) ---------- */
+
+/* The hint and the snap button share one cell and swap visibility, so the bar
+   keeps its height and the photo never shifts when the button appears. */
+.sm-mark .sm-mark__slot {
+  display: grid;
+  align-items: center;
+}
+
+.sm-mark .sm-mark__slot > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+.sm-mark .sm-mark__hint {
+  margin: 0;
+}
+
+.sm-mark .sm-mark__slot .sm-mark__snap {
+  visibility: hidden;
+}
+
+.sm-mark .sm-mark__slot--snap .sm-mark__snap {
+  visibility: visible;
+}
+
+.sm-mark .sm-mark__slot--snap .sm-mark__hint {
+  visibility: hidden;
+}
+
+/* ---------- Help sheet content (door screen) ---------- */
+
+.sm-mark.sm-mark--help {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-4);
+}
+
+.sm-mark--help .sm-mark__diagram {
+  display: block;
+  width: 100%;
+  max-width: calc(var(--sm-space-6) * 8);
+  height: auto;
+  margin: 0 auto;
+}
+
+.sm-mark--help .sm-mark__help-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-mark--help .sm-mark__help-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-3);
+  font-size: var(--sm-text-md);
+  line-height: 1.45;
+}
+
+.sm-mark--help .sm-mark__help-icon {
+  display: inline-flex;
+  flex: none;
+  margin-top: 2px;
+  color: var(--sm-primary);
+}
+
+/* Diagram parts: coloured from the theme so the illustration follows the skin. */
+.sm-mark--help .sm-mark__dg-wall {
+  fill: var(--sm-bg);
+}
+
+.sm-mark--help .sm-mark__dg-trim {
+  fill: var(--sm-border);
+}
+
+.sm-mark--help .sm-mark__dg-door {
+  fill: var(--sm-mark-door-fill);
+  stroke: var(--sm-muted);
+  stroke-width: 1.5;
+}
+
+.sm-mark--help .sm-mark__dg-panel {
+  fill: none;
+  stroke: var(--sm-border);
+  stroke-width: 1.5;
+}
+
+.sm-mark--help .sm-mark__dg-handle {
+  fill: var(--sm-muted);
+}
+
+.sm-mark--help .sm-mark__dg-floor {
+  stroke: var(--sm-muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.sm-mark--help .sm-mark__dg-sheet {
+  fill: var(--sm-surface);
+  stroke: var(--sm-accent);
+  stroke-width: 2;
+}
+
+.sm-mark--help .sm-mark__dg-tape {
+  fill: var(--sm-accent);
+}
+
+.sm-mark--help .sm-mark__dg-outline {
+  fill: none;
+  stroke: var(--sm-success);
+  stroke-width: 2;
+  stroke-dasharray: 6 5;
+}
+
+.sm-mark--help .sm-mark__dg-ring {
+  fill: var(--sm-surface);
+  stroke: var(--sm-success);
+  stroke-width: 3;
+}
+
+.sm-mark--help .sm-mark__dg-dot {
+  fill: var(--sm-success);
+}
+
+.sm-mark--help .sm-mark__dg-wrong {
+  fill: none;
+  stroke: var(--sm-danger);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-mark .sm-mark__float,
+  .sm-mark .sm-mark__pad {
+    transition: none;
+  }
+}

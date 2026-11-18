@@ -1,0 +1,856 @@
+// End-to-end test of the real measuring pipeline under Node, with no DOM: a synthetic door photo goes
+// through exactly the calls the screens make, in the same order and with the same arguments.
+//
+//   sheet screen    detectSheet(photo.image, tap, { luma }) -> sheetOutlineIsPlausible
+//                   (refineQuad for "Snap to edges")
+//   door screen     measureDoor({ ...config sigmas }) -> applyMeasurementRules
+//   result screen   warpToRect(photo.image, measure.planeToImage, ...)
+//   quote screen    calculateQuote(config, { ...size, productId, selections, includeInstallation })
+//   details screen  validateCustomer -> buildLeadPayload -> submitLead
+//
+// The photos come from tools/scene.mjs, which knows where every corner really is. The scenes are rendered
+// in the canvas pixel convention (DEMO_SCENE's pixelOrigin: 'corner'), the frame js/vision.js and the
+// corner editor work in, so truth and detection are directly comparable.
+
+import { test, describe, before } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+import { cameraHomography } from '../tools/camera.mjs';
+import { DEMO_SCENE, decodePng, renderScene, sceneTruth, truthToJson } from '../tools/scene.mjs';
+import { detectSheet, refineQuad, warpToRect } from '../js/vision.js';
+import { applyHomography, measureDoor } from '../js/geometry.js';
+import { applyMeasurementRules, calculateQuote } from '../js/quote.js';
+import { buildLeadPayload, leadMode, submitLead, validateCustomer } from '../js/lead.js';
+import { deepMerge, loadConfig } from '../js/theme.js';
+import { getLuma, getSheetMm } from '../js/photo.js';
+import { sheetOutlineIsPlausible } from '../js/screens/mark-common.js';
+import baseConfig from '../js/config.js';
+import { mulberry32 } from './helpers/synth.mjs';
+
+const TRUE_WIDTH_MM = 820;
+const TRUE_HEIGHT_MM = 2040;
+
+// How far a customer's hand-placed door corner is off, per axis (uniform within +-2 px), and the fixed
+// seed behind "the" marked corners. The sweeps below show the chosen seed is nothing special.
+const DOOR_SLIP_PX = 2;
+const DOOR_SEED = 20240607;
+const SWEEP_SEEDS = 300;
+
+// Sheet corners must land within 0.75 px of the truth at worst. A clean scene is held much tighter: a
+// half-pixel disagreement about the pixel convention between the renderer and vision.js would show up as
+// a 0.71 px corner error, and 0.75 px would let that through.
+const CLEAN_SHEET_TOL_PX = 0.25;
+const NOISY_SHEET_TOL_PX = 0.5;
+// On a pale door the paper's outline is mostly its own soft shadow, which pulls the detected edges in by
+// up to about half a pixel.
+const PALE_SHEET_TOL_PX = 0.75;
+
+const PREVIEW_MARGIN_MM = 60; // js/screens/result.js
+const PREVIEW_WIDTH_PX = 560;
+
+const PAPER_RGB = hexToRgb(DEMO_SCENE.sheet.color);
+const DOOR_RGB = [34, 63, 94]; //         tools/scene.mjs default door colour #223f5e
+const ARCHITRAVE_RGB = [241, 238, 231]; // tools/scene.mjs default architrave colour #f1eee7
+const COLOUR_TOL = 25; // lighting, lens blur and sensor noise move a flat colour by up to about 10 levels
+
+const DETECT_FAILURE_REASONS = ['no_region', 'touches_border', 'too_large', 'too_small', 'not_quad'];
+
+const CUSTOMER = {
+  name: 'Alex Taylor',
+  phone: '0400 000 000',
+  email: 'alex@example.com',
+  postcode: '3000',
+  notes: 'Side gate is unlocked.',
+  consent: true,
+};
+
+// A harder photo: standing well to one side with the phone at eye level, the sheet taped on crooked,
+// and a noisier, softer image. (tools/camera.mjs counts pitch as positive when the phone is BELOW the
+// point it looks at; a customer's phone is above it, so 8 degrees of tilt is pitchDeg -8.)
+const STRONG_CAMERA = { focalPx: 2100, target: { x: 410, y: 1090 }, distanceMm: 3000, yawDeg: 15, pitchDeg: -8, rollDeg: -1 };
+const STRONG_SCENE = {
+  ...DEMO_SCENE,
+  camera: STRONG_CAMERA,
+  planeToImage: cameraHomography({ imageWidth: DEMO_SCENE.width, imageHeight: DEMO_SCENE.height, ...STRONG_CAMERA }),
+  sheet: { ...DEMO_SCENE.sheet, rotDeg: 6 },
+  noiseSigma: 3,
+  blurPx: 0.8,
+  seed: 7,
+};
+
+// The demo door painted white: white paper on a white door, told apart only by the paper's faint outline
+// and the shadow round it. Most front doors are pale, so this is the everyday hard case.
+const WHITE_DOOR_SCENE = { ...DEMO_SCENE, colors: { door: '#f4f2ee', doorPanel: '#ebe9e4' }, noiseSigma: 3, blurPx: 0.9, seed: 3 };
+
+// The same A4 sheet taped on sideways. The config still says 210 x 297: measureDoor has to work out
+// which side is which.
+const LANDSCAPE_SCENE = { ...DEMO_SCENE, sheet: { ...DEMO_SCENE.sheet, w: 297, h: 210 } };
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* Small helpers                                                                                          */
+/* ------------------------------------------------------------------------------------------------------ */
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+const centroid = (quad) => ({
+  x: quad.reduce((sum, p) => sum + p.x, 0) / quad.length,
+  y: quad.reduce((sum, p) => sum + p.y, 0) / quad.length,
+});
+
+/** Largest distance between matching corners of two quads in the same [TL, TR, BR, BL] order. */
+const maxCornerError = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y)));
+
+/** Hand-placed corners: every coordinate off by a fixed pseudo-random amount within +-ampPx. */
+function slipQuad(quad, seed, ampPx) {
+  const rng = mulberry32(seed);
+  return quad.map((p) => ({ x: p.x + (rng() * 2 - 1) * ampPx, y: p.y + (rng() * 2 - 1) * ampPx }));
+}
+
+const sum = (values) => values.reduce((total, v) => total + v, 0);
+
+function assertColour(actual, expected, label) {
+  const worst = Math.max(...expected.map((v, c) => Math.abs(actual[c] - v)));
+  assert.ok(worst <= COLOUR_TOL, `${label}: expected about rgb(${expected.join(', ')}), got rgb(${actual.slice(0, 3).join(', ')})`);
+}
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* The pipeline, call for call as the screens run it                                                      */
+/* ------------------------------------------------------------------------------------------------------ */
+
+/** What loadPhoto (js/photo.js) hands the screens, minus the canvas. */
+const asPhoto = (image) => ({ canvas: null, image, width: image.width, height: image.height, isDemo: true, _luma: null });
+
+/** The slice of the app state the measuring code reads. */
+const initialState = (config) => ({
+  referenceId: config.measurement.defaultReferenceId,
+  customReference: { widthMm: null, heightMm: null },
+});
+
+/** js/screens/sheet.js: the customer taps the sheet. */
+const tapSheet = (photo, point) => detectSheet(photo.image, point, { luma: getLuma(photo) });
+
+/** js/screens/sheet.js: is a detected outline shown as the sheet, or does the screen ask for manual corners? */
+const sheetAccepted = (config, state, photo, sheet) =>
+  Boolean(sheet.ok) &&
+  sheetOutlineIsPlausible(sheet.quad, getSheetMm(state, config), photo.width, photo.height, config.measurement.plausible);
+
+/** js/screens/door.js: "Measure my door". */
+function measure(config, state, photo, sheet, doorPx) {
+  const m = config.measurement;
+  return measureDoor({
+    sheetPx: sheet.quad,
+    doorPx,
+    sheetMm: getSheetMm(state, config),
+    imageSize: { width: photo.width, height: photo.height },
+    sigmaSheetPx: sheet.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
+    sigmaDoorPx: m.sigmaDoorPx,
+    plausible: m.plausible,
+  });
+}
+
+/** js/screens/door.js: the rule-adjusted, rounded size every later screen works from. */
+const toSize = (config, result) => ({
+  ...applyMeasurementRules(config.measurement, { widthMm: result.widthMm, heightMm: result.heightMm }),
+  source: 'photo',
+});
+
+/** js/screens/result.js: the flattened preview of the door. */
+const flatten = (photo, result) =>
+  warpToRect(photo.image, result.planeToImage, {
+    widthMm: result.widthMm,
+    heightMm: result.heightMm,
+    marginMm: PREVIEW_MARGIN_MM,
+    outWidth: PREVIEW_WIDTH_PX,
+  });
+
+/** js/screens/details.js: the measurement block of the enquiry. */
+const leadMeasurement = (size, result) => ({
+  widthMm: size.widthMm,
+  heightMm: size.heightMm,
+  source: size.source,
+  quality: result.quality.level,
+  sigmaWidthMm: result.sigmaWidthMm,
+  sigmaHeightMm: result.sigmaHeightMm,
+});
+
+/**
+ * Photograph a scene and take it as far as a size, the way a customer would: one tap in the middle of
+ * the sheet, then four door corners placed a couple of pixels out. Never asserts and never throws for a
+ * failed stage (later stages are null), so each test can report the first thing that actually went wrong.
+ */
+function runPipeline(sceneOptions, config = baseConfig) {
+  const { image, truth } = renderScene(sceneOptions);
+  const photo = asPhoto(image);
+  const state = initialState(config);
+  const sheet = tapSheet(photo, centroid(truth.sheetPx));
+  const doorPx = slipQuad(truth.doorPx, DOOR_SEED, DOOR_SLIP_PX);
+  const result = sheet.ok ? measure(config, state, photo, sheet, doorPx) : null;
+  const size = result && result.ok ? toSize(config, result) : null;
+  return { config, photo, truth, state, sheet, doorPx, result, size };
+}
+
+/** Colour of the flattened preview at a door-plane position (mm from the opening's top-left corner). */
+function previewColourAt(preview, result, xMm, yMm) {
+  const u = Math.floor(((xMm + PREVIEW_MARGIN_MM) / (result.widthMm + 2 * PREVIEW_MARGIN_MM)) * preview.width);
+  const v = Math.floor(((yMm + PREVIEW_MARGIN_MM) / (result.heightMm + 2 * PREVIEW_MARGIN_MM)) * preview.height);
+  const i = (v * preview.width + u) * 4;
+  return Array.from(preview.data.subarray(i, i + 4));
+}
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* Shared assertions                                                                                      */
+/* ------------------------------------------------------------------------------------------------------ */
+
+function assertSheetFound(sheet, truthQuad, tolPx, label) {
+  assert.equal(sheet.ok, true, `${label}: sheet found (reason: ${sheet.reason})`);
+  assert.equal(sheet.refined, true, `${label}: corners refined to sub-pixel accuracy`);
+  assert.ok(sheet.confidence > 0.8 && sheet.confidence <= 1, `${label}: confidence ${sheet.confidence}`);
+  const error = maxCornerError(sheet.quad, truthQuad);
+  assert.ok(error <= tolPx, `${label}: worst corner is ${error.toFixed(3)} px from the truth (limit ${tolPx})`);
+}
+
+function assertMeasured(run, { widthTolMm, heightTolMm, orientation }) {
+  const { result, size } = run;
+  assert.ok(result, 'the sheet was found, so there is a measurement');
+  assert.equal(result.ok, true, `measureDoor succeeded (${result.error}: ${result.message})`);
+
+  const widthError = result.widthMm - TRUE_WIDTH_MM;
+  const heightError = result.heightMm - TRUE_HEIGHT_MM;
+  assert.ok(Math.abs(widthError) <= widthTolMm, `width ${result.widthMm.toFixed(1)} mm is within ${widthTolMm} mm of ${TRUE_WIDTH_MM}`);
+  assert.ok(Math.abs(heightError) <= heightTolMm, `height ${result.heightMm.toFixed(1)} mm is within ${heightTolMm} mm of ${TRUE_HEIGHT_MM}`);
+
+  assert.ok(['good', 'fair'].includes(result.quality.level), `quality is ${result.quality.level} (${result.quality.issues.join(', ')})`);
+  assert.ok(result.quality.score > 0 && result.quality.score <= 1);
+  for (const major of ['high_residual', 'methods_disagree', 'implausible_size']) {
+    assert.ok(!result.quality.issues.includes(major), `no ${major}`);
+  }
+
+  assert.ok(result.sigmaWidthMm > 0 && Number.isFinite(result.sigmaWidthMm));
+  assert.ok(result.sigmaHeightMm > 0 && Number.isFinite(result.sigmaHeightMm));
+  assert.ok(Math.abs(widthError) <= 4 * result.sigmaWidthMm, `width error ${widthError.toFixed(2)} mm vs sigma ${result.sigmaWidthMm.toFixed(2)} mm`);
+  assert.ok(Math.abs(heightError) <= 4 * result.sigmaHeightMm, `height error ${heightError.toFixed(2)} mm vs sigma ${result.sigmaHeightMm.toFixed(2)} mm`);
+
+  assert.equal(result.sheetOrientation, orientation);
+  // The model can absorb most of a small slip (16 observations, 13 parameters), so the residual stays
+  // well under the slips themselves.
+  assert.ok(result.rmsResidualPx < DOOR_SLIP_PX, `reprojection RMS ${result.rmsResidualPx.toFixed(2)} px`);
+
+  // imageToPlane: origin at the door's top-left corner, x right, y down, in mm.
+  const planeCorners = [
+    { x: 0, y: 0 },
+    { x: result.widthMm, y: 0 },
+    { x: result.widthMm, y: result.heightMm },
+    { x: 0, y: result.heightMm },
+  ];
+  run.doorPx.forEach((corner, i) => {
+    const onPlane = applyHomography(result.imageToPlane, corner);
+    const off = Math.hypot(onPlane.x - planeCorners[i].x, onPlane.y - planeCorners[i].y);
+    assert.ok(off < 12, `marked door corner ${i} maps to within 12 mm of its plane corner (${off.toFixed(1)} mm)`);
+    const back = applyHomography(result.planeToImage, onPlane);
+    assert.ok(Math.hypot(back.x - corner.x, back.y - corner.y) < 1e-6, 'planeToImage undoes imageToPlane');
+  });
+
+  assert.deepEqual(size, { widthMm: Math.round(result.widthMm), heightMm: Math.round(result.heightMm), source: 'photo' });
+}
+
+/** The same door marked SWEEP_SEEDS different ways: how the size and its claimed uncertainty hold up. */
+function sweepDoorSlips(run, { widthTolMm, heightTolMm }) {
+  const stats = { failed: 0, poor: 0, withinTol: 0, worstZ: 0, rmsZ: 0 };
+  let sumZ2 = 0;
+  let measured = 0;
+  for (let seed = 1; seed <= SWEEP_SEEDS; seed++) {
+    const result = measure(run.config, run.state, run.photo, run.sheet, slipQuad(run.truth.doorPx, seed, DOOR_SLIP_PX));
+    if (!result.ok) {
+      stats.failed++;
+      continue;
+    }
+    measured++;
+    if (result.quality.level === 'poor') stats.poor++;
+    const widthError = result.widthMm - TRUE_WIDTH_MM;
+    const heightError = result.heightMm - TRUE_HEIGHT_MM;
+    if (Math.abs(widthError) <= widthTolMm && Math.abs(heightError) <= heightTolMm) stats.withinTol++;
+    const zw = widthError / result.sigmaWidthMm;
+    const zh = heightError / result.sigmaHeightMm;
+    sumZ2 += zw * zw + zh * zh;
+    stats.worstZ = Math.max(stats.worstZ, Math.abs(zw), Math.abs(zh));
+  }
+  stats.rmsZ = Math.sqrt(sumZ2 / (2 * Math.max(1, measured)));
+  return stats;
+}
+
+function assertSweep(run, t, { widthTolMm, heightTolMm, minShare }) {
+  const stats = sweepDoorSlips(run, { widthTolMm, heightTolMm });
+  const share = stats.withinTol / SWEEP_SEEDS;
+  t.diagnostic(
+    `${SWEEP_SEEDS} markings: ${(100 * share).toFixed(1)}% within ${widthTolMm} / ${heightTolMm} mm, ` +
+      `worst error ${stats.worstZ.toFixed(2)} sigma, rms ${stats.rmsZ.toFixed(2)} sigma`,
+  );
+  assert.equal(stats.failed, 0, 'every marking gives a measurement');
+  assert.equal(stats.poor, 0, 'no marking is graded poor');
+  assert.ok(share >= minShare, `${(100 * share).toFixed(1)}% of markings are within ${widthTolMm} / ${heightTolMm} mm`);
+  assert.ok(stats.worstZ <= 4, `worst error is ${stats.worstZ.toFixed(2)} reported sigmas`);
+
+  // Calibration. A uniform +-DOOR_SLIP_PX slip is DOOR_SLIP_PX / sqrt(3) px rms per axis, against the
+  // sigmaDoorPx the fit was told to expect, so errors should run at about that fraction of the reported
+  // sigma: a little under, because the reported sigma also budgets for sheet-corner error that a refined
+  // sheet barely has. Far below means the uncertainty is overstated; above, understated.
+  const expectedZ = DOOR_SLIP_PX / Math.sqrt(3) / run.config.measurement.sigmaDoorPx;
+  assert.ok(
+    stats.rmsZ > 0.5 * expectedZ && stats.rmsZ < 1.15 * expectedZ,
+    `errors run at ${stats.rmsZ.toFixed(2)} of the reported sigma (about ${expectedZ.toFixed(2)} expected)`,
+  );
+}
+
+function assertPreview(run) {
+  const { photo, result } = run;
+  const preview = flatten(photo, result);
+  const totalW = result.widthMm + 2 * PREVIEW_MARGIN_MM;
+  const totalH = result.heightMm + 2 * PREVIEW_MARGIN_MM;
+
+  assert.equal(preview.width, PREVIEW_WIDTH_PX);
+  assert.ok(Math.abs(preview.height - (PREVIEW_WIDTH_PX * totalH) / totalW) <= 0.5, 'height follows from (H + 2m) / (W + 2m)');
+  assert.ok(Math.abs(preview.width / preview.height - totalW / totalH) < 1 / preview.height, 'aspect ratio matches (W + 2m) / (H + 2m)');
+  assert.equal(preview.data.length, preview.width * preview.height * 4);
+
+  const at = (xMm, yMm) => previewColourAt(preview, result, xMm, yMm);
+  const midY = TRUE_HEIGHT_MM / 2;
+  assertColour(at(410, 700), PAPER_RGB, 'sheet centre is paper white');
+  assertColour(at(57, midY), DOOR_RGB, 'left stile is the door colour');
+  assertColour(at(410, 60), DOOR_RGB, 'top rail is the door colour');
+
+  // The opening's edges land where the preview says they are: door just inside, frame just outside.
+  assertColour(at(15, midY), DOOR_RGB, '15 mm inside the left edge');
+  assertColour(at(-15, midY), ARCHITRAVE_RGB, '15 mm outside the left edge');
+  assertColour(at(TRUE_WIDTH_MM - 15, 600), DOOR_RGB, '15 mm inside the right edge');
+  assertColour(at(TRUE_WIDTH_MM + 15, 600), ARCHITRAVE_RGB, '15 mm outside the right edge');
+  assertColour(at(410, 15), DOOR_RGB, '15 mm inside the top edge');
+  assertColour(at(410, -15), ARCHITRAVE_RGB, '15 mm outside the top edge');
+  assertColour(at(410, TRUE_HEIGHT_MM - 15), DOOR_RGB, '15 mm inside the bottom edge');
+
+  for (const [x, y] of [[410, 700], [57, midY], [-15, midY]]) assert.equal(at(x, y)[3], 255, 'pixels inside the photo are opaque');
+  return preview;
+}
+
+/** What a quote should come to for a standard-size door, worked out from the config alone. */
+function expectedStandardTotal(config, product, selections, includeInstallation) {
+  const { options, installation } = config.pricing;
+  let total = product.basePrice;
+  for (const option of options) {
+    if (option.type === 'select') {
+      const chosen = option.choices.find((choice) => choice.id === (selections[option.id] ?? option.default));
+      total += chosen.price;
+    } else if (selections[option.id] ?? option.default) {
+      total += option.price;
+    }
+  }
+  if (installation.enabled && includeInstallation) total += installation.price;
+  return total;
+}
+
+/** Every way the options can be set: each select choice x each checkbox on or off. */
+function optionCombinations(options) {
+  let combos = [{}];
+  for (const option of options) {
+    const values = option.type === 'select' ? option.choices.map((choice) => choice.id) : [false, true];
+    combos = combos.flatMap((combo) => values.map((value) => ({ ...combo, [option.id]: value })));
+  }
+  return combos;
+}
+
+function assertQuoteAddsUp(quote, config, label) {
+  assert.equal(quote.ok, true, `${label}: ok (${quote.messages.join(' ')})`);
+  assert.equal(quote.status, 'ok', label);
+  assert.ok(quote.total > 0, `${label}: positive total`);
+  const lineTotal = sum(quote.lineItems.map((item) => item.amount));
+  const expected = config.pricing.pricesIncludeTax ? lineTotal : lineTotal + quote.taxAmount;
+  assert.equal(quote.total, expected, `${label}: total equals the sum of its line items`);
+  assert.equal(quote.subtotal + quote.taxAmount, quote.total, `${label}: subtotal + tax = total`);
+  assert.equal(quote.currency, config.pricing.currency);
+  assert.equal(quote.lineItems[0].id, 'product');
+}
+
+async function assertLeadGoesThrough(run, quote, product) {
+  const { config, size, result } = run;
+  assert.equal(leadMode(config), 'demo', 'the shipped config sends nothing anywhere');
+
+  assert.deepEqual(validateCustomer(config, CUSTOMER), { ok: true, errors: {} });
+  const refused = validateCustomer(config, { ...CUSTOMER, consent: false });
+  assert.equal(refused.ok, false);
+  assert.ok(refused.errors.consent, 'consent is required');
+
+  const payload = buildLeadPayload({
+    config,
+    customer: CUSTOMER,
+    measurement: leadMeasurement(size, result),
+    quote,
+    selections: quote.selections,
+    includeInstallation: quote.includeInstallation,
+    product,
+    photoDataUrl: null,
+    now: new Date('2026-03-04T05:06:07Z'),
+  });
+  assert.match(payload.reference, /^SM-[0-9A-Z]{6}$/);
+  assert.equal(payload.createdAt, '2026-03-04T05:06:07.000Z');
+  assert.equal(payload.brand, config.brand.name);
+  assert.equal(payload.customer.name, CUSTOMER.name);
+  assert.equal(payload.customer.consent, true);
+  assert.equal(payload.measurement.widthMm, size.widthMm);
+  assert.equal(payload.measurement.heightMm, size.heightMm);
+  assert.equal(payload.measurement.source, 'photo');
+  assert.equal(payload.measurement.quality, result.quality.level);
+  assert.deepEqual(payload.product, { id: product.id, name: product.name });
+  assert.equal(payload.includeInstallation, quote.includeInstallation);
+  assert.equal(payload.quote.status, 'ok');
+  assert.equal(payload.quote.total, quote.total);
+  assert.deepEqual(payload.quote.lineItems, quote.lineItems);
+  assert.ok(!('photo' in payload), 'no photo unless the company asks for one');
+  assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload, 'payload survives JSON unchanged');
+
+  assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'demo' });
+  return payload;
+}
+
+/** The enquiry for a run's size with the first product at its default options, built under `config`. */
+function enquiryFor(config, run) {
+  const { size, result } = run;
+  const product = config.pricing.products[0];
+  const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+  return buildLeadPayload({
+    config,
+    customer: CUSTOMER,
+    measurement: leadMeasurement(size, result),
+    quote,
+    selections: quote.selections,
+    includeInstallation: quote.includeInstallation,
+    product,
+    photoDataUrl: null,
+    now: new Date('2026-03-04T05:06:07Z'),
+  });
+}
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* The bundled demo scene                                                                                 */
+/* ------------------------------------------------------------------------------------------------------ */
+
+// The demo scene is shared with the skin tests further down, so it is rendered once.
+let demoRun = null;
+const getDemoRun = () => (demoRun ??= runPipeline(DEMO_SCENE));
+
+describe('demo scene, default config: one photo to a price and an enquiry', () => {
+  let demo;
+  before(() => {
+    demo = getDemoRun();
+  });
+
+  test('a tap in the middle of the sheet finds it, refined to a small fraction of a pixel', () => {
+    assertSheetFound(demo.sheet, demo.truth.sheetPx, CLEAN_SHEET_TOL_PX, 'centre tap');
+  });
+
+  test('taps 40 px away from the middle find the same sheet', () => {
+    const centre = centroid(demo.truth.sheetPx);
+    const offsets = [[40, 0], [-40, 0], [0, 40], [0, -40], [28.3, 28.3], [-28.3, 28.3], [28.3, -28.3], [-28.3, -28.3]];
+    for (const [dx, dy] of offsets) {
+      const sheet = tapSheet(demo.photo, { x: centre.x + dx, y: centre.y + dy });
+      assertSheetFound(sheet, demo.truth.sheetPx, CLEAN_SHEET_TOL_PX, `tap at ${dx}, ${dy}`);
+      assert.ok(maxCornerError(sheet.quad, demo.sheet.quad) < 0.1, 'same outline as the centre tap');
+    }
+  });
+
+  test('a tap that misses the sheet fails cleanly, so the screen can fall back to manual corners', () => {
+    const H = demo.truth.planeToImage;
+    const misses = {
+      'door stile': applyHomography(H, { x: 57, y: 1020 }),
+      wall: applyHomography(H, { x: -300, y: 1000 }),
+      'outside the photo': { x: -10, y: 50 },
+    };
+    for (const [where, point] of Object.entries(misses)) {
+      const sheet = tapSheet(demo.photo, point);
+      assert.equal(sheet.ok, false, `${where}: not a sheet`);
+      assert.equal(sheet.quad, null);
+      assert.equal(sheet.refined, false);
+      assert.ok(DETECT_FAILURE_REASONS.includes(sheet.reason), `${where}: reason ${sheet.reason}`);
+    }
+  });
+
+  test('only the sheet is announced as found: a tapped door panel, step or handle plate goes the manual way', () => {
+    const { config, state, photo, truth } = demo;
+    assert.equal(sheetAccepted(config, state, photo, demo.sheet), true, 'the real sheet is accepted');
+
+    // Door-plane positions (mm) of things that are quad-shaped too. detectSheet returns most of them as
+    // clean, confident outlines; the screen must not tell the customer the sheet was found.
+    const H = truth.planeToImage;
+    const decoys = {
+      'upper panel': { x: 410, y: 300 },
+      'lower left panel': { x: 240, y: 1500 },
+      'lower right panel': { x: 580, y: 1500 },
+      step: { x: 410, y: 2110 },
+      'handle plate': { x: 760, y: 1080 },
+    };
+    let outlined = 0;
+    for (const [what, mm] of Object.entries(decoys)) {
+      const found = tapSheet(photo, applyHomography(H, mm));
+      if (found.ok) outlined++;
+      assert.equal(sheetAccepted(config, state, photo, found), false, `${what} is not taken for the sheet`);
+    }
+    assert.ok(outlined >= 3, `the check is what rejects them: ${outlined} of 5 decoys came back as outlines`);
+
+    // The same sheet is still accepted when the customer says it is US Letter (close in shape and size),
+    // and refused as a bank card, which could never be that big with the whole door in the photo.
+    const as = (referenceId) => sheetAccepted(config, { ...state, referenceId }, photo, demo.sheet);
+    assert.equal(as('letter'), true);
+    assert.equal(as('card'), false);
+  });
+
+  test('"Snap to edges" pulls hand-placed sheet corners onto the paper', () => {
+    for (let seed = 1; seed <= 20; seed++) {
+      const rough = slipQuad(demo.truth.sheetPx, seed, 6);
+      const snapped = refineQuad(getLuma(demo.photo), rough);
+      assert.equal(snapped.ok, true, `seed ${seed}: ${snapped.reason}`);
+      const error = maxCornerError(snapped.quad, demo.truth.sheetPx);
+      assert.ok(error <= CLEAN_SHEET_TOL_PX, `seed ${seed}: worst corner ${error.toFixed(3)} px from the truth`);
+    }
+  });
+
+  test('door corners marked a couple of pixels out still measure 820 x 2040 mm', () => {
+    assertMeasured(demo, { widthTolMm: 4, heightTolMm: 6, orientation: 'portrait' });
+  });
+
+  test('the answer holds however the door corners are a couple of pixels out', (t) => {
+    assertSweep(demo, t, { widthTolMm: 4, heightTolMm: 6, minShare: 0.9 });
+  });
+
+  test('corner order and the way round the sheet size is given make no difference', () => {
+    const { config, photo, sheet, doorPx, result } = demo;
+    const shuffledSheet = { ...sheet, quad: [sheet.quad[2], sheet.quad[0], sheet.quad[3], sheet.quad[1]] };
+    const shuffledDoor = [doorPx[3], doorPx[1], doorPx[0], doorPx[2]];
+    const sideways = { referenceId: 'custom', customReference: { widthMm: 297, heightMm: 210 } };
+    const again = measure(config, sideways, photo, shuffledSheet, shuffledDoor);
+    assert.equal(again.ok, true);
+    assert.ok(Math.abs(again.widthMm - result.widthMm) < 1e-6);
+    assert.ok(Math.abs(again.heightMm - result.heightMm) < 1e-6);
+    assert.equal(again.sheetOrientation, 'portrait');
+  });
+
+  test('the flattened preview shows the sheet, the door and its frame where the measurement says', () => {
+    const preview = assertPreview(demo);
+    let transparent = 0;
+    for (let i = 3; i < preview.data.length; i += 4) if (preview.data[i] === 0) transparent++;
+    assert.equal(transparent, 0, 'the whole preview lies inside the demo photo');
+  });
+
+  test('the measured size prices instantly for the first product', () => {
+    const { config, size } = demo;
+    const product = config.pricing.products[0];
+    const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+    assertQuoteAddsUp(quote, config, product.id);
+    assert.equal(quote.sizeCategory, 'standard');
+    assert.equal(quote.total, expectedStandardTotal(config, product, {}, config.pricing.installation.default));
+    assert.equal(quote.productId, product.id);
+  });
+
+  test('the enquiry validates, builds and submits in demo mode', async () => {
+    const { config, size } = demo;
+    const product = config.pricing.products[0];
+    const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+    await assertLeadGoesThrough(demo, quote, product);
+  });
+
+  test('with lead.endpoint set, the same enquiry is POSTed to the company as JSON', async (t) => {
+    const config = deepMerge(baseConfig, { lead: { endpoint: 'https://crm.example/securemeasure-leads' } });
+    assert.equal(leadMode(config), 'webhook');
+    const payload = enquiryFor(config, demo);
+
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      requests.push({ url, init });
+      return { ok: true, status: 204 };
+    });
+    assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'webhook' });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, 'https://crm.example/securemeasure-leads');
+    assert.equal(requests[0].init.method, 'POST');
+    assert.equal(requests[0].init.headers['Content-Type'], 'application/json');
+    assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+
+    t.mock.method(globalThis, 'fetch', async () => ({ ok: false, status: 500 }));
+    assert.deepEqual(await submitLead(config, payload), { ok: false, mode: 'webhook', error: 'http_500' });
+  });
+
+  test('with lead.mailto set, the enquiry opens as a readable, pre-filled email', async () => {
+    const config = deepMerge(baseConfig, { lead: { mailto: 'sales@doors.example' } });
+    assert.equal(leadMode(config), 'mailto');
+    const payload = enquiryFor(config, demo);
+    const { size, result } = demo;
+
+    globalThis.location = { href: 'https://doors.example/measure/' };
+    try {
+      assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'mailto' });
+      const url = new URL(globalThis.location.href);
+      assert.equal(url.protocol, 'mailto:');
+      assert.equal(url.pathname, 'sales@doors.example');
+      assert.ok(globalThis.location.href.length < 2000, 'short enough for every mail client');
+      assert.ok(url.searchParams.get('subject').includes(payload.reference));
+      const body = url.searchParams.get('body');
+      for (const line of [
+        `Reference: ${payload.reference}`,
+        `Door size: ${size.widthMm} mm wide x ${size.heightMm} mm high`,
+        // The same "accurate to about" figures the customer saw: two sigma, rounded up.
+        `confidence ${result.quality.level} (about +/- ${Math.ceil(2 * result.sigmaWidthMm)} mm wide, +/- ${Math.ceil(2 * result.sigmaHeightMm)} mm high)`,
+        `Product: ${config.pricing.products[0].name}`,
+        CUSTOMER.name,
+        CUSTOMER.phone,
+        CUSTOMER.notes,
+      ]) {
+        assert.ok(body.includes(line), `email body mentions "${line}"`);
+      }
+    } finally {
+      delete globalThis.location;
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* The committed assets                                                                                   */
+/* ------------------------------------------------------------------------------------------------------ */
+
+describe('bundled demo photo (assets/demo-door.png)', () => {
+  const pngBytes = readFileSync(new URL('../assets/demo-door.png', import.meta.url));
+  const truthJson = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+
+  test('is a 1536 x 2048 PNG under 1.2 MB with a truth file that matches DEMO_SCENE', () => {
+    assert.equal(pngBytes.toString('latin1', 12, 16), 'IHDR');
+    assert.equal(pngBytes.readUInt32BE(16), 1536);
+    assert.equal(pngBytes.readUInt32BE(20), 2048);
+    assert.ok(pngBytes.length < 1.2 * 1024 * 1024, `demo PNG is ${pngBytes.length} bytes`);
+    assert.deepEqual(truthJson, truthToJson(sceneTruth(DEMO_SCENE), DEMO_SCENE));
+    assert.equal(truthJson.widthMm, TRUE_WIDTH_MM);
+    assert.equal(truthJson.heightMm, TRUE_HEIGHT_MM);
+  });
+
+  test('measures 820 x 2040 mm from one tap and the true door corners', () => {
+    const photo = asPhoto(decodePng(pngBytes));
+    assert.equal(photo.width, truthJson.imageWidth);
+    assert.equal(photo.height, truthJson.imageHeight);
+
+    const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
+    assertSheetFound(sheet, truthJson.sheetPx, CLEAN_SHEET_TOL_PX, 'committed photo');
+
+    const result = measure(baseConfig, initialState(baseConfig), photo, sheet, truthJson.doorPx);
+    assert.equal(result.ok, true);
+    assert.ok(Math.abs(result.widthMm - truthJson.widthMm) < 1, `width ${result.widthMm.toFixed(2)} mm`);
+    assert.ok(Math.abs(result.heightMm - truthJson.heightMm) < 1, `height ${result.heightMm.toFixed(2)} mm`);
+    assert.ok(['good', 'fair'].includes(result.quality.level), `quality ${result.quality.level}`);
+    assert.deepEqual(toSize(baseConfig, result), { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM, source: 'photo' });
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* Harder photos                                                                                          */
+/* ------------------------------------------------------------------------------------------------------ */
+
+describe('stronger pose: 15 degrees to the side, 8 degrees of tilt, crooked sheet, noisy photo', () => {
+  let run;
+  before(() => {
+    run = runPipeline(STRONG_SCENE);
+  });
+
+  test('the photo really is a harder one, with the whole door still in frame', () => {
+    const [tl, tr, br, bl] = run.truth.doorPx;
+    const left = Math.hypot(bl.x - tl.x, bl.y - tl.y);
+    const right = Math.hypot(br.x - tr.x, br.y - tr.y);
+    assert.ok(Math.max(left, right) / Math.min(left, right) > 1.04, 'the near side of the door is clearly longer');
+    for (const p of run.truth.doorPx) {
+      assert.ok(p.x > 0.05 * run.photo.width && p.x < 0.95 * run.photo.width, `corner x ${p.x.toFixed(0)}`);
+      assert.ok(p.y > 0.05 * run.photo.height && p.y < 0.95 * run.photo.height, `corner y ${p.y.toFixed(0)}`);
+    }
+    const [stl, str] = run.truth.sheetPx;
+    const tiltDeg = (Math.atan2(str.y - stl.y, str.x - stl.x) * 180) / Math.PI;
+    assert.ok(Math.abs(tiltDeg) > 3, `sheet top edge runs at ${tiltDeg.toFixed(1)} degrees`);
+  });
+
+  test('the sheet is found and refined, from the middle and from 40 px away', () => {
+    assertSheetFound(run.sheet, run.truth.sheetPx, NOISY_SHEET_TOL_PX, 'centre tap');
+    assert.equal(sheetAccepted(run.config, run.state, run.photo, run.sheet), true, 'and the screen accepts it');
+    const centre = centroid(run.truth.sheetPx);
+    for (const [dx, dy] of [[40, 0], [-28.3, 28.3], [0, -40]]) {
+      const sheet = tapSheet(run.photo, { x: centre.x + dx, y: centre.y + dy });
+      assertSheetFound(sheet, run.truth.sheetPx, NOISY_SHEET_TOL_PX, `tap at ${dx}, ${dy}`);
+    }
+  });
+
+  test('the door measures 820 x 2040 mm within 6 / 9 mm', () => {
+    assertMeasured(run, { widthTolMm: 6, heightTolMm: 9, orientation: 'portrait' });
+  });
+
+  test('the answer holds however the door corners are a couple of pixels out', (t) => {
+    assertSweep(run, t, { widthTolMm: 6, heightTolMm: 9, minShare: 0.9 });
+  });
+
+  test('the flattened preview is square-on, and the size prices and submits', async () => {
+    assertPreview(run);
+    const { config, size } = run;
+    const product = config.pricing.products[0];
+    const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+    assertQuoteAddsUp(quote, config, product.id);
+    await assertLeadGoesThrough(run, quote, product);
+  });
+});
+
+describe('sheet taped on sideways (landscape)', () => {
+  let run;
+  before(() => {
+    run = runPipeline(LANDSCAPE_SCENE);
+  });
+
+  test('the sheet is found, wider than it is tall', () => {
+    assertSheetFound(run.sheet, run.truth.sheetPx, CLEAN_SHEET_TOL_PX, 'centre tap');
+    assert.equal(sheetAccepted(run.config, run.state, run.photo, run.sheet), true, 'and the screen accepts it');
+    const [tl, tr, , bl] = run.sheet.quad;
+    assert.ok(Math.hypot(tr.x - tl.x, tr.y - tl.y) > 1.2 * Math.hypot(bl.x - tl.x, bl.y - tl.y));
+    const centre = centroid(run.truth.sheetPx);
+    assertSheetFound(tapSheet(run.photo, { x: centre.x + 40, y: centre.y }), run.truth.sheetPx, CLEAN_SHEET_TOL_PX, 'tap 40 px right');
+  });
+
+  test('measureDoor works out which way round the sheet is and still gets 820 x 2040 mm', () => {
+    assert.deepEqual(getSheetMm(run.state, run.config), { w: 210, h: 297 }, 'the config still describes the sheet as 210 x 297');
+    assertMeasured(run, { widthTolMm: 4, heightTolMm: 6, orientation: 'landscape' });
+  });
+
+  test('the answer holds however the door corners are a couple of pixels out', (t) => {
+    assertSweep(run, t, { widthTolMm: 4, heightTolMm: 6, minShare: 0.9 });
+  });
+
+  test('the flattened preview is right, and the size prices and submits', async () => {
+    assertPreview(run);
+    const { config, size } = run;
+    const product = config.pricing.products[0];
+    const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+    assertQuoteAddsUp(quote, config, product.id);
+    await assertLeadGoesThrough(run, quote, product);
+  });
+});
+
+describe('white paper on a white door', () => {
+  let run;
+  before(() => {
+    run = runPipeline(WHITE_DOOR_SCENE);
+  });
+
+  test('the photo really has little contrast between paper and door', () => {
+    const { photo, truth } = run;
+    const luma = getLuma(photo);
+    const lumaAt = (p) => luma.data[Math.floor(p.y) * luma.width + Math.floor(p.x)];
+    const H = truth.planeToImage;
+    const paper = lumaAt(applyHomography(H, { x: 410, y: 700 }));
+    const door = lumaAt(applyHomography(H, { x: 410, y: 300 }));
+    assert.ok(paper > 235, `paper luma ${paper.toFixed(0)}`);
+    assert.ok(Math.abs(paper - door) < 25, `paper ${paper.toFixed(0)} vs door ${door.toFixed(0)}`);
+  });
+
+  test('the sheet is still found on the paper itself, not on the edge of its shadow', () => {
+    assertSheetFound(run.sheet, run.truth.sheetPx, PALE_SHEET_TOL_PX, 'centre tap');
+    assert.equal(sheetAccepted(run.config, run.state, run.photo, run.sheet), true, 'and the screen accepts it');
+    const centre = centroid(run.truth.sheetPx);
+    for (const [dx, dy] of [[40, 0], [-40, 0], [0, 40], [0, -40], [28.3, -28.3]]) {
+      const sheet = tapSheet(run.photo, { x: centre.x + dx, y: centre.y + dy });
+      assertSheetFound(sheet, run.truth.sheetPx, PALE_SHEET_TOL_PX, `tap at ${dx}, ${dy}`);
+    }
+  });
+
+  test('the door measures 820 x 2040 mm within 6 / 9 mm', () => {
+    assertMeasured(run, { widthTolMm: 6, heightTolMm: 9, orientation: 'portrait' });
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* Skins                                                                                                  */
+/* ------------------------------------------------------------------------------------------------------ */
+
+describe('acme skin (?skin=acme): the same photo through a re-skinned config', () => {
+  let acme;
+  let demo;
+  let run;
+  before(async () => {
+    acme = await loadConfig('?skin=acme');
+    demo = getDemoRun();
+    // Same photo and the same marked corners as the default run, measured with the skinned config.
+    const { photo, truth, sheet, doorPx } = demo;
+    const state = initialState(acme);
+    const result = sheet.ok ? measure(acme, state, photo, sheet, doorPx) : null;
+    run = { config: acme, photo, truth, state, sheet, doorPx, result, size: result && result.ok ? toSize(acme, result) : null };
+  });
+
+  test('the skin is merged over the default config', () => {
+    assert.notEqual(acme.brand.name, baseConfig.brand.name);
+    assert.notDeepEqual(acme.pricing.products.map((p) => p.id), baseConfig.pricing.products.map((p) => p.id));
+    assert.deepEqual(acme.measurement, baseConfig.measurement, 'measurement settings are inherited');
+    assert.deepEqual(acme.lead.fields, baseConfig.lead.fields, 'lead form is inherited');
+  });
+
+  test('the door measures the same under the skin', () => {
+    assertMeasured(run, { widthTolMm: 4, heightTolMm: 6, orientation: 'portrait' });
+    assert.deepEqual(run.size, demo.size);
+  });
+
+  for (const [label, getConfig] of [['acme', () => acme], ['default', () => baseConfig]]) {
+    test(`${label} config: every product prices with the default options`, () => {
+      const config = getConfig();
+      const { size } = run;
+      assert.ok(config.pricing.products.length > 0);
+      for (const product of config.pricing.products) {
+        const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+        assertQuoteAddsUp(quote, config, product.id);
+        assert.equal(quote.sizeCategory, 'standard');
+        assert.equal(quote.lineItems[0].label, product.name);
+        assert.equal(quote.lineItems[0].amount, product.basePrice);
+        assert.equal(quote.total, expectedStandardTotal(config, product, {}, config.pricing.installation.default), product.id);
+      }
+    });
+
+    test(`${label} config: every product prices with every combination of options`, (t) => {
+      const config = getConfig();
+      const { size } = run;
+      const combos = optionCombinations(config.pricing.options);
+      let priced = 0;
+      for (const product of config.pricing.products) {
+        for (const selections of combos) {
+          for (const includeInstallation of [true, false]) {
+            const quote = calculateQuote(config, {
+              widthMm: size.widthMm,
+              heightMm: size.heightMm,
+              productId: product.id,
+              selections,
+              includeInstallation,
+            });
+            const what = `${product.id} ${JSON.stringify(selections)} install ${includeInstallation}`;
+            assertQuoteAddsUp(quote, config, what);
+            assert.equal(quote.total, expectedStandardTotal(config, product, selections, includeInstallation), what);
+            assert.deepEqual(quote.selections, selections, what);
+            assert.equal(quote.includeInstallation, includeInstallation, what);
+            priced++;
+          }
+        }
+      }
+      t.diagnostic(`${priced} quotes priced`);
+      assert.equal(priced, config.pricing.products.length * combos.length * 2);
+    });
+  }
+
+  test('the enquiry carries the skin brand and submits in demo mode', async () => {
+    const { size } = run;
+    const product = acme.pricing.products.at(-1);
+    const selections = Object.fromEntries(
+      acme.pricing.options.map((option) => [option.id, option.type === 'select' ? option.choices.at(-1).id : true]),
+    );
+    const quote = calculateQuote(acme, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id, selections, includeInstallation: false });
+    assertQuoteAddsUp(quote, acme, product.id);
+    const payload = await assertLeadGoesThrough(run, quote, product);
+    assert.equal(payload.brand, 'Acme Security Doors');
+    assert.deepEqual(payload.selections, selections);
+    assert.equal(payload.includeInstallation, false);
+  });
+});

@@ -1,0 +1,220 @@
+/* Done screen: success mark, reference, summary, next steps, demo payload. */
+
+/* ---- Success mark ---- */
+
+.sm-screen--done .sm-done-mark {
+  align-self: center;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 88px;
+  height: 88px;
+  margin-top: var(--sm-space-4);
+  border: 2px solid var(--sm-success);
+  border-radius: 50%;
+  background: var(--sm-surface);
+  color: var(--sm-success);
+  animation: sm-done-pop 420ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+}
+
+/* A var() inside color-mix() cannot fall back per declaration, hence the @supports gate. */
+@supports (background: color-mix(in srgb, red 50%, blue)) {
+  .sm-screen--done .sm-done-mark {
+    border-color: color-mix(in srgb, var(--sm-success) 28%, var(--sm-surface));
+    background: color-mix(in srgb, var(--sm-success) 14%, var(--sm-surface));
+  }
+}
+
+@keyframes sm-done-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-screen--done .sm-done-mark {
+    animation: none;
+  }
+}
+
+.sm-screen--done .sm-screen-header {
+  text-align: center;
+}
+
+/* ---- Reference ---- */
+
+.sm-screen--done .sm-done-ref {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sm-space-2);
+}
+
+.sm-screen--done .sm-done-ref__label {
+  margin: 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+}
+
+.sm-screen--done .sm-done-ref__chip {
+  max-width: 100%;
+  padding: var(--sm-space-2) var(--sm-space-4);
+  color: var(--sm-text);
+  font-size: var(--sm-text-xl);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.08em;
+  overflow-wrap: anywhere;
+  /* One tap selects the whole reference for copying. */
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+/* ---- Cards ---- */
+
+.sm-screen--done .sm-done-heading {
+  margin: 0 0 var(--sm-space-3);
+  color: var(--sm-text);
+  font-size: var(--sm-text-lg);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.sm-screen--done .sm-done-summary__list {
+  margin: 0;
+}
+
+.sm-screen--done .sm-done-summary__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sm-space-3);
+  padding: var(--sm-space-2) 0;
+  border-top: 1px solid var(--sm-border);
+}
+
+.sm-screen--done .sm-done-summary__row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.sm-screen--done .sm-done-summary__row:last-child {
+  padding-bottom: 0;
+}
+
+/* The label gives way first (down to its longest word); the value only wraps once it must. */
+.sm-screen--done .sm-done-summary__row dt {
+  flex: 1 1 0%;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+}
+
+.sm-screen--done .sm-done-summary__row dd {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--sm-text);
+  font-weight: 600;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.sm-screen--done .sm-done-summary__row--total dd {
+  font-size: var(--sm-text-xl);
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.sm-screen--done .sm-done-summary__note {
+  display: block;
+  margin-top: var(--sm-space-1);
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  font-weight: 400;
+  line-height: 1.3;
+}
+
+/* ---- What happens next ---- */
+
+.sm-screen--done .sm-done-next__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: sm-done-step;
+}
+
+.sm-screen--done .sm-done-next__list li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-3);
+  line-height: 1.45;
+  counter-increment: sm-done-step;
+}
+
+.sm-screen--done .sm-done-next__list li::before {
+  content: counter(sm-done-step);
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--sm-primary);
+  color: var(--sm-primary-contrast);
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* Nudge the text so its first line centres on the 28px number. */
+.sm-screen--done .sm-done-next__list li > span {
+  min-width: 0;
+  padding-top: 2px;
+}
+
+/* ---- Call button (an <a> wearing the kit's button classes) ---- */
+
+.sm-screen--done .sm-done-call {
+  text-decoration: none;
+}
+
+/* ---- Demo payload ---- */
+
+.sm-screen--done .sm-done-demo-hint {
+  margin: var(--sm-space-3) 0 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+}
+
+.sm-screen--done .sm-done-payload {
+  max-width: 100%;
+  margin: var(--sm-space-3) 0 0;
+  padding: var(--sm-space-3);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--sm-border);
+  border-radius: calc(var(--sm-radius-box, var(--sm-radius)) / 2);
+  background: var(--sm-bg);
+  color: var(--sm-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: calc(var(--sm-text-sm) - 2px);
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 2;
+  text-align: left;
+}
+
+.sm-screen--done .sm-done-payload:focus-visible {
+  outline: 2px solid var(--sm-primary);
+  outline-offset: 2px;
+}

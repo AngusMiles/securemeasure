@@ -1,0 +1,122 @@
+/* Details screen: order summary and lead form. Only what the UI kit does not cover. */
+
+/* A chip is a flex child of the screen column; stop it stretching edge to edge. */
+.sm-screen--details .sm-details-demo {
+  align-self: flex-start;
+}
+
+/* ---- Order summary ---- */
+
+.sm-screen--details .sm-details-summary__list {
+  margin: 0;
+}
+
+.sm-screen--details .sm-details-summary__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sm-space-3);
+  padding: var(--sm-space-2) 0;
+  border-top: 1px solid var(--sm-border);
+}
+
+.sm-screen--details .sm-details-summary__row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.sm-screen--details .sm-details-summary__row:last-child {
+  padding-bottom: 0;
+}
+
+/* The label gives way first (down to its longest word); the value only wraps once it must. */
+.sm-screen--details .sm-details-summary__row dt {
+  flex: 1 1 0%;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+}
+
+.sm-screen--details .sm-details-summary__row dd {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--sm-text);
+  font-weight: 600;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.sm-screen--details .sm-details-summary__row--total dd {
+  font-size: var(--sm-text-xl);
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.sm-screen--details .sm-details-summary__note {
+  display: block;
+  margin-top: var(--sm-space-1);
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  font-weight: 400;
+  line-height: 1.3;
+}
+
+/* ---- Form ---- */
+
+.sm-screen--details .sm-details-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-4);
+  margin: 0;
+}
+
+.sm-screen--details .sm-details-privacy {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-2);
+  margin: 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+}
+
+.sm-screen--details .sm-details-privacy svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+/* ---- "Couldn't send" message ---- */
+
+.sm-screen--details .sm-details-alert {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+}
+
+/* The live region stays in the DOM while empty; cancel the screen gap so it takes no room. */
+.sm-screen--details .sm-details-alert:empty {
+  margin-top: calc(-1 * var(--sm-space-4));
+}
+
+.sm-screen--details .sm-details-alert__call {
+  margin: 0;
+  color: var(--sm-text);
+  font-size: var(--sm-text-md);
+}
+
+/* Vertical padding makes the inline phone link a 44px+ touch target. */
+.sm-screen--details .sm-details-alert__link {
+  display: inline-block;
+  padding: var(--sm-space-3) var(--sm-space-1);
+  color: var(--sm-text);
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  white-space: nowrap;
+}
+
+.sm-screen--details .sm-details-alert__link:focus-visible {
+  outline: 2px solid var(--sm-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}

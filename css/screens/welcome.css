@@ -1,0 +1,160 @@
+/* Welcome screen: only what the shared kit does not cover. */
+
+.sm-screen--welcome .sm-welcome__heading {
+  margin: 0;
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+/* ---- What you'll need ---------------------------------------------------------------------- */
+
+.sm-screen--welcome .sm-welcome__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-screen--welcome .sm-welcome__item {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-3);
+}
+
+.sm-screen--welcome .sm-welcome__tile {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: calc(var(--sm-radius) * 0.7);
+  background: var(--sm-bg);
+  color: var(--sm-primary);
+}
+
+.sm-screen--welcome .sm-welcome__item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sm-screen--welcome .sm-welcome__item-title {
+  margin: 0;
+  font-size: var(--sm-text-md);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--sm-text);
+}
+
+.sm-screen--welcome .sm-welcome__item-detail {
+  margin: 0;
+  font-size: var(--sm-text-sm);
+  line-height: 1.4;
+  color: var(--sm-muted);
+}
+
+/* ---- How it works strip -------------------------------------------------------------------- */
+
+.sm-screen--welcome .sm-welcome__how {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+}
+
+.sm-screen--welcome .sm-welcome__steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sm-space-2);
+  margin: 0;
+  padding: var(--sm-space-2) 0 0;
+  list-style: none;
+}
+
+.sm-screen--welcome .sm-welcome__step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sm-space-2);
+  text-align: center;
+}
+
+/* Connector running from the previous step's circle to this one (circles are 48px wide). */
+.sm-screen--welcome .sm-welcome__step + .sm-welcome__step::before {
+  content: '';
+  position: absolute;
+  top: 23px;
+  right: calc(50% + 24px + var(--sm-space-1));
+  width: calc(100% + var(--sm-space-2) - 48px - var(--sm-space-1) * 2);
+  height: 2px;
+  border-radius: 1px;
+  background: var(--sm-border);
+}
+
+.sm-screen--welcome .sm-welcome__step-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--sm-border);
+  border-radius: 50%;
+  background: var(--sm-surface);
+  color: var(--sm-primary);
+}
+
+.sm-screen--welcome .sm-welcome__step-num {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--sm-primary);
+  color: var(--sm-primary-contrast);
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 0 0 2px var(--sm-bg);
+}
+
+.sm-screen--welcome .sm-welcome__step-label {
+  font-size: var(--sm-text-sm);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--sm-text);
+}
+
+/* ---- Privacy line -------------------------------------------------------------------------- */
+
+.sm-screen--welcome .sm-welcome__privacy {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-2);
+  margin: 0;
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+  color: var(--sm-muted);
+}
+
+.sm-screen--welcome .sm-welcome__privacy svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--sm-success);
+}
+
+/* color-mix() wrapped around var() cannot fall back by declaration order (it only fails at
+   computed-value time), so the tint is opt-in for engines that support it. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .sm-screen--welcome .sm-welcome__tile {
+    background: color-mix(in srgb, var(--sm-primary) 10%, var(--sm-surface));
+  }
+}

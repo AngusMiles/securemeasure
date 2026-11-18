@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data: https:; connect-src 'self' https:; base-uri 'self'">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="color-scheme" content="only light">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="description" content="Measure your front door from one photo and get an instant price.">
+  <title>SecureMeasure</title>
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/screens/welcome.css">
+  <link rel="stylesheet" href="css/screens/prepare.css">
+  <link rel="stylesheet" href="css/screens/mark.css">
+  <link rel="stylesheet" href="css/screens/result.css">
+  <link rel="stylesheet" href="css/screens/quote.css">
+  <link rel="stylesheet" href="css/screens/details.css">
+  <link rel="stylesheet" href="css/screens/done.css">
+</head>
+<body>
+  <div id="sm-app" class="sm-app">
+    <header class="sm-header">
+      <button type="button" class="sm-header__back" id="sm-back" hidden></button>
+      <div class="sm-brand" id="sm-brand"></div>
+      <p class="sm-stepper" id="sm-stepper" hidden>
+        <span class="sm-stepper__count" id="sm-step-count"></span>
+        <span class="sm-stepper__name" id="sm-step-name"></span>
+      </p>
+      <div class="sm-progress" id="sm-progress" aria-hidden="true">
+        <span class="sm-progress__seg"></span>
+        <span class="sm-progress__seg"></span>
+        <span class="sm-progress__seg"></span>
+        <span class="sm-progress__seg"></span>
+      </div>
+    </header>
+
+    <main id="sm-main" class="sm-main">
+      <div class="sm-boot">
+        <span class="sm-spinner" aria-hidden="true"></span>
+        <p class="sm-boot__text">Loading&hellip;</p>
+        <p class="sm-boot__slow">Still loading? Check your connection, then refresh this page.</p>
+      </div>
+    </main>
+
+    <div id="sm-toasts" class="sm-toasts" aria-live="polite" aria-atomic="false"></div>
+
+    <div id="sm-busy" class="sm-busy" role="status" aria-live="polite" hidden>
+      <div class="sm-busy__panel">
+        <span class="sm-spinner" aria-hidden="true"></span>
+        <p class="sm-busy__message" id="sm-busy-message"></p>
+      </div>
+    </div>
+  </div>
+
+  <noscript>
+    <div class="sm-noscript">
+      <p><strong>This measuring tool needs JavaScript.</strong></p>
+      <p>Please turn JavaScript on in your browser settings, then refresh this page.</p>
+    </div>
+  </noscript>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

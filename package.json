@@ -1,0 +1,16 @@
+{
+  "name": "securemeasure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "White-label, phone-first door measuring and instant-quote web app for security door companies.",
+  "type": "module",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "simulate": "node tools/simulate.mjs",
+    "make-demo": "node tools/make-demo.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,328 @@
+/* Result screen (step 3): size readout, flattened preview, issue list, manual entry.
+   Everything is scoped under .sm-screen--result and built from the shared tokens, so a
+   skin re-themes it. Each tinted rule sets a plain colour; the color-mix() version sits in
+   the @supports block at the end of the file, because a color-mix() holding var() is only
+   rejected at computed-value time, where an earlier fallback in the same rule is not used
+   (iOS 15 / Chrome 100). */
+
+/* Several blocks here are flex/grid containers that get toggled with the hidden attribute. */
+.sm-screen--result [hidden] {
+  display: none !important;
+}
+
+/* ---- Hero readout ------------------------------------------------- */
+
+.sm-screen--result .sm-result__hero {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+}
+
+.sm-screen--result .sm-result__readout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  margin: 0;
+}
+
+/* Focus is moved here only programmatically, to announce and reveal a changed size. */
+.sm-screen--result .sm-result__readout:focus {
+  outline: none;
+}
+
+.sm-screen--result .sm-result__dim {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+  min-width: 0;
+  padding-right: var(--sm-space-3);
+}
+
+.sm-screen--result .sm-result__dim + .sm-result__dim {
+  padding-right: 0;
+  padding-left: var(--sm-space-4);
+  border-left: 1px solid var(--sm-border);
+}
+
+.sm-screen--result .sm-result__label {
+  font-size: var(--sm-text-sm);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+.sm-screen--result .sm-result__value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--sm-space-1);
+  margin: 0;
+}
+
+.sm-screen--result .sm-result__number {
+  font-size: var(--sm-text-3xl);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--sm-text);
+}
+
+.sm-screen--result .sm-result__unit {
+  font-size: var(--sm-text-md);
+  font-weight: 600;
+  color: var(--sm-muted);
+}
+
+/* Four digits at the full hero size do not fit two-up on the narrowest phones. */
+@media (max-width: 380px) {
+  .sm-screen--result .sm-result__number {
+    font-size: clamp(var(--sm-text-2xl), 9vw, var(--sm-text-3xl));
+  }
+}
+
+.sm-screen--result .sm-result__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sm-space-2) var(--sm-space-3);
+}
+
+.sm-screen--result .sm-result__chip {
+  display: inline-flex;
+}
+
+.sm-screen--result .sm-result__note {
+  margin: 0;
+}
+
+.sm-screen--result .sm-result__manual-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sm-space-1) var(--sm-space-3);
+  padding-top: var(--sm-space-3);
+  border-top: 1px solid var(--sm-border);
+}
+
+.sm-screen--result .sm-result__manual-note p {
+  margin: 0;
+}
+
+.sm-screen--result .sm-result__manual-note .sm-btn {
+  min-height: 44px;
+}
+
+/* ---- Issue list --------------------------------------------------- */
+
+.sm-screen--result .sm-result__issues {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  border-color: var(--sm-warning);
+  background: var(--sm-surface);
+}
+
+.sm-screen--result .sm-result__issues[data-level='poor'] {
+  border-color: var(--sm-danger);
+  background: var(--sm-surface);
+}
+
+.sm-screen--result .sm-result__issues-title {
+  margin: 0;
+  font-size: var(--sm-text-md);
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--sm-text);
+}
+
+.sm-screen--result .sm-result__issue-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-screen--result .sm-result__issue {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--sm-space-2);
+  font-size: var(--sm-text-md);
+  line-height: 1.45;
+  color: var(--sm-text);
+}
+
+.sm-screen--result .sm-result__issue svg {
+  margin-top: 0.15em;
+  color: var(--sm-warning);
+}
+
+.sm-screen--result .sm-result__issues[data-level='poor'] .sm-result__issue svg {
+  color: var(--sm-danger);
+}
+
+/* ---- Flattened preview -------------------------------------------- */
+
+.sm-screen--result .sm-result__figure {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sm-space-3);
+  margin: 0;
+}
+
+/* The border and rounding live on the frame so the canvas fills its content box exactly;
+   the script reads the frame width to pick the canvas resolution. */
+.sm-screen--result .sm-result__frame {
+  width: 100%;
+  max-width: 280px;
+  overflow: hidden;
+  border: 1px solid var(--sm-border);
+  /* Capped: a pill-button skin (--sm-radius: 999px) would otherwise round the door's corners away. */
+  border-radius: min(calc(var(--sm-radius) * 0.6), var(--sm-space-3));
+  background: var(--sm-bg);
+}
+
+.sm-screen--result .sm-result__canvas {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+.sm-screen--result .sm-result__canvas.is-ready {
+  opacity: 1;
+}
+
+.sm-screen--result .sm-result__caption {
+  max-width: 34ch;
+  margin: 0;
+  text-align: center;
+}
+
+/* ---- Fix-it tools and tape override ------------------------------- */
+
+.sm-screen--result .sm-result__tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sm-space-3);
+}
+
+/* Side by side when both labels fit, stacked when they do not (320 px phones). */
+.sm-screen--result .sm-result__tools > * {
+  flex: 1 1 140px;
+  width: auto;
+  min-height: 44px;
+}
+
+.sm-screen--result .sm-result__override {
+  padding-top: var(--sm-space-2);
+}
+
+.sm-screen--result .sm-result__override p {
+  margin: 0;
+}
+
+.sm-screen--result .sm-result__form {
+  margin: 0;
+}
+
+/* ---- Manual entry mode -------------------------------------------- */
+
+.sm-screen--result .sm-result__howto {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sm-space-4);
+}
+
+.sm-screen--result .sm-result__art {
+  display: block;
+  width: 84px;
+  height: auto;
+  color: var(--sm-muted);
+}
+
+.sm-screen--result .sm-result__art-frame {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sm-screen--result .sm-result__art-leaf {
+  fill: var(--sm-bg);
+}
+
+.sm-screen--result .sm-result__art-handle {
+  fill: currentColor;
+}
+
+.sm-screen--result .sm-result__art-measure {
+  fill: none;
+  stroke: var(--sm-primary);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sm-screen--result .sm-result__tips {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-screen--result .sm-result__tip {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+  line-height: 1.4;
+}
+
+.sm-screen--result .sm-result__tip strong {
+  font-size: var(--sm-text-md);
+  color: var(--sm-text);
+}
+
+.sm-screen--result .sm-result__tip span {
+  font-size: var(--sm-text-sm);
+  color: var(--sm-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-screen--result .sm-result__canvas {
+    transition: none;
+  }
+}
+
+/* ---- Tints (browsers with color-mix) ------------------------------ */
+
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .sm-screen--result .sm-result__issues {
+    border-color: color-mix(in srgb, var(--sm-warning) 45%, var(--sm-border));
+    background: color-mix(in srgb, var(--sm-warning) 8%, var(--sm-surface));
+  }
+
+  .sm-screen--result .sm-result__issues[data-level='poor'] {
+    border-color: color-mix(in srgb, var(--sm-danger) 45%, var(--sm-border));
+    background: color-mix(in srgb, var(--sm-danger) 7%, var(--sm-surface));
+  }
+
+  .sm-screen--result .sm-result__frame {
+    background: color-mix(in srgb, var(--sm-text) 6%, var(--sm-surface));
+  }
+
+  .sm-screen--result .sm-result__art-leaf {
+    fill: color-mix(in srgb, var(--sm-primary) 10%, var(--sm-surface));
+  }
+}
