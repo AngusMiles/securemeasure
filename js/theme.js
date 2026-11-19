@@ -218,7 +218,9 @@ function usableStandardSizes(value) {
  *   - `measurement.standardSizes` keeps only usable sizes, and falls back to the built-in Australian list
  *     when none is left.
  * A setting that had to be changed is reported with a console warning; a missing one (a config written
- * before these settings existed) is filled in quietly. Nothing else in the config is touched.
+ * before these settings existed) is filled in quietly. Methods that leave most phones only a typed-in
+ * size (camera and paper both off, manual sizes on) are kept as they are, with a warning. Nothing else
+ * in the config is touched.
  *
  * Changes `config` in place (loadConfig hands it a fresh copy) and returns it.
  *
@@ -242,6 +244,12 @@ export function normaliseConfig(config) {
   if (isPlainObject(raw) && raw.paper === false && methods.paper) {
     warn(
       'measurement.methods leaves neither camera nor paper on and measurement.allowManualOverride is false, so most customers would have no way to a size (AR works on some Android phones only); keeping paper on.',
+    );
+  } else if (!methods.camera && !methods.paper) {
+    // Allowed (a company may run the app as a price calculator), but rarely what was meant: AR alone
+    // feels like enough until an iPhone opens the page.
+    warn(
+      'measurement.methods leaves neither camera nor paper on, so customers on most phones (every iPhone) can only type in a door size; AR works on some Android phones only. Turn camera or paper on to let them measure with their phone.',
     );
   }
   measurement.methods = methods;

@@ -69,9 +69,19 @@ export const LEAD_MAIL_STRINGS = Object.freeze({
     "Measured: estimated from the built-in demo photo, not the customer's own door, matched to the nearest standard size",
   'lead.mail.measuredAr': "Measured: with the phone's AR camera — needs a check measure",
   'lead.mail.alternatives': 'Other standard sizes it could be: {sizes}',
+  // When the door size has the company's adjustments in it, the matched catalogue size is named and
+  // the second line replaces the one above, so catalogue sizes are not read as quoted sizes.
+  'lead.mail.standardSize': 'Matched standard size, before your fitting allowance: {size}',
+  'lead.mail.alternativesUnadjusted': 'Other standard sizes it could be, before your fitting allowance: {sizes}',
+  // What the result screen warned the customer about (it showed them a banner for each).
+  'lead.mail.estimateNonStandard': 'The app flagged: the door may not be a standard size, so this size could be some way out',
+  'lead.mail.estimateUnsure': 'The app flagged: it could not be sure which standard size this is',
+  'lead.mail.estimateIssues': 'Photo checks flagged: {issues}',
   'lead.mail.sizeShort': '{width} x {height} mm',
   'lead.mail.arReading': 'AR reading of the opening: {size}',
   'lead.mail.arStandard': 'the customer chose the nearest standard size',
+  'lead.mail.arOwn': 'the customer kept this reading rather than the nearest standard size',
+  'lead.mail.arNoStandard': 'no standard size was close enough to offer',
   'lead.mail.arWarnings': 'AR checks flagged: {warnings}',
   'lead.mail.confidence': 'confidence {quality}',
   'lead.mail.accuracy': 'about +/- {width} mm wide, +/- {height} mm high',
@@ -112,7 +122,8 @@ const MEASUREMENT_SOURCES = new Set(['photo', 'estimate', 'ar', 'manual']);
 /** The sources that read the size off a photo, so the only ones whose size can be the demo door's. */
 const PHOTO_SOURCES = new Set(['photo', 'estimate']);
 
-// Short, bounded lists: they are the company's catalogue and measureOpening's checks, never free text.
+// Short, bounded lists: they are the company's catalogue and the estimate's and measureOpening's
+// checks, never free text.
 const MAX_ALTERNATIVES = 3;
 const MAX_WARNINGS = 12;
 
@@ -217,19 +228,29 @@ function cleanSize(size) {
   return { widthMm: Math.round(widthMm), heightMm: Math.round(heightMm) };
 }
 
+/** Check codes as a short list of non-empty strings (the estimate's issues, the AR warnings). */
+function cleanCodes(codes) {
+  const given = Array.isArray(codes) ? codes : [];
+  return given.filter((code) => typeof code === 'string' && code !== '').slice(0, MAX_WARNINGS);
+}
+
 /**
  * The measurement block of the lead. Each source carries only what means something for it:
  *
  * - 'photo' (paper): the fit quality, its issue codes and the two sigmas, as before.
- * - 'estimate': `alternatives`, the other standard sizes the photo could also be, and `aspectHW`,
- *   the height-to-width ratio read from the photo. No quality or sigmas: the estimate has no
+ * - 'estimate': `standardSize`, the standard size accepted, as listed in the catalogue (before the
+ *   company's rules); `alternatives`, the other standard sizes the photo could also be; `aspectHW`,
+ *   the height-to-width ratio read from the photo; and what the customer was warned about:
+ *   `nonStandard`, `confident` and the `issues` codes. No quality or sigmas: the estimate has no
  *   millimetre scale of its own, and the company must not be told a "plus or minus" nobody measured.
- * - 'ar': `measured`, the AR reading of the opening before the company's rules, and `warnings`,
- *   the AR self-check codes.
+ * - 'ar': `measured`, the AR reading of the opening before the company's rules; `warnings`, the AR
+ *   self-check codes; and `standardOffered`, whether a standard size was close enough to offer.
  * - 'manual': the size alone.
  *
  * `standard` (true when the size is a standard size from the company's list that the customer
- * accepted) is carried for any source that sets it.
+ * accepted) is carried for any source that sets it. The estimate's warning flags and
+ * `standardOffered` are carried only when the caller gives them, so a lead never claims a
+ * confidence nobody worked out.
  */
 function cleanMeasurement(measurement) {
   const source = MEASUREMENT_SOURCES.has(measurement?.source) ? measurement.source : 'photo';
@@ -254,16 +275,22 @@ function cleanMeasurement(measurement) {
       if (sigma !== null) out[key] = Math.round(sigma * 10) / 10;
     }
   } else if (source === 'estimate') {
+    const standardSize = cleanSize(measurement?.standardSize);
+    if (standardSize) out.standardSize = standardSize;
     // Always present (possibly empty) for an estimate, so a CRM can map the field once.
     const given = Array.isArray(measurement?.alternatives) ? measurement.alternatives : [];
     out.alternatives = given.map(cleanSize).filter(Boolean).slice(0, MAX_ALTERNATIVES);
     const aspect = finiteOrNull(measurement?.aspectHW);
     if (aspect !== null && aspect > 0) out.aspectHW = Math.round(aspect * 10000) / 10000;
+    for (const key of ['nonStandard', 'confident']) {
+      if (typeof measurement?.[key] === 'boolean') out[key] = measurement[key];
+    }
+    if (Array.isArray(measurement?.issues)) out.issues = cleanCodes(measurement.issues);
   } else if (source === 'ar') {
     const measured = cleanSize(measurement?.measured);
     if (measured) out.measured = measured;
-    const given = Array.isArray(measurement?.warnings) ? measurement.warnings : [];
-    out.warnings = given.filter((code) => typeof code === 'string' && code !== '').slice(0, MAX_WARNINGS);
+    out.warnings = cleanCodes(measurement?.warnings);
+    if (typeof measurement?.standardOffered === 'boolean') out.standardOffered = measurement.standardOffered;
   }
   return out;
 }
@@ -377,8 +404,9 @@ export function validateCustomer(config, customer) {
  * @param {object} input.measurement the size and how it was got:
  *   `{ widthMm, heightMm, source, standard? }` plus, by source, 'photo' (paper):
  *   `quality?` (a level string or the whole { level, issues } object), `sigmaWidthMm?`, `sigmaHeightMm?`;
- *   'estimate': `alternatives?: { widthMm, heightMm }[]`, `aspectHW?`; 'ar': `measured?: { widthMm, heightMm }`,
- *   `warnings?: string[]`; 'manual': nothing more. An unknown source is recorded as 'photo'.
+ *   'estimate': `standardSize?: { widthMm, heightMm }`, `alternatives?: { widthMm, heightMm }[]`, `aspectHW?`,
+ *   `nonStandard?: boolean`, `confident?: boolean`, `issues?: string[]`; 'ar': `measured?: { widthMm, heightMm }`,
+ *   `warnings?: string[]`, `standardOffered?: boolean`; 'manual': nothing more. An unknown source is recorded as 'photo'.
  * @param {object | null} [input.quote] a calculateQuote result
  * @param {Record<string, string | boolean>} [input.selections] chosen options keyed by option id
  * @param {{ id: string, name: string } | null} [input.product] the chosen product from config.pricing.products
@@ -563,22 +591,45 @@ function sizeText(config, measurement, key = 'lead.mail.size') {
   return mailText(config, key, { width: Math.round(widthMm), height: Math.round(heightMm) });
 }
 
+/** Whether two sizes are the same once rounded to whole mm, as the email shows them. */
+function sameWholeMm(a, b) {
+  return Math.round(a.widthMm) === Math.round(b.widthMm) && Math.round(a.heightMm) === Math.round(b.heightMm);
+}
+
 /**
- * The lines under "Measured:" that only an estimate or an AR reading has: the other standard sizes
- * an estimate could be, so whoever books the check measure knows what to expect; and the AR reading
- * itself with any self-check it failed, so a priced standard size can be told from what was measured.
+ * The lines under "Measured:" that only an estimate or an AR reading has. For an estimate: the
+ * other standard sizes it could be, so whoever books the check measure knows what to expect, and
+ * anything the customer was warned about. For AR: the reading itself, whether a standard size was
+ * chosen, turned down or never on offer, and any self-check it failed, so a priced standard size
+ * can be told from what was measured.
  */
 function sourceDetailLines(config, measurement) {
   const lines = [];
   if (measurement?.source === 'estimate') {
+    // The door size has the company's adjustments in it; the standard sizes are as its catalogue lists
+    // them. When the two differ, the matched catalogue size is named and the list says which it is.
+    const matched = sizeText(config, measurement.standardSize, 'lead.mail.sizeShort');
+    const adjusted =
+      matched !== '' && sizeText(config, measurement) !== '' && !sameWholeMm(measurement.standardSize, measurement);
+    if (adjusted) lines.push(mailText(config, 'lead.mail.standardSize', { size: matched }));
     const alternatives = Array.isArray(measurement.alternatives) ? measurement.alternatives : [];
     const sizes = alternatives.map((size) => sizeText(config, size, 'lead.mail.sizeShort')).filter(Boolean);
-    if (sizes.length > 0) lines.push(mailText(config, 'lead.mail.alternatives', { sizes: sizes.join(', ') }));
+    if (sizes.length > 0) {
+      const key = adjusted ? 'lead.mail.alternativesUnadjusted' : 'lead.mail.alternatives';
+      lines.push(mailText(config, key, { sizes: sizes.join(', ') }));
+    }
+    // Only when the caller said so: an estimate with no flags given is not reported as unsure.
+    if (measurement.nonStandard === true) lines.push(mailText(config, 'lead.mail.estimateNonStandard'));
+    else if (measurement.confident === false) lines.push(mailText(config, 'lead.mail.estimateUnsure'));
+    const issues = (Array.isArray(measurement.issues) ? measurement.issues : []).map(oneLine).filter(Boolean);
+    if (issues.length > 0) lines.push(mailText(config, 'lead.mail.estimateIssues', { issues: issues.join(', ') }));
   } else if (measurement?.source === 'ar') {
     const reading = sizeText(config, measurement.measured);
     if (reading) {
       let line = mailText(config, 'lead.mail.arReading', { size: reading });
       if (measurement.standard === true) line += ` (${mailText(config, 'lead.mail.arStandard')})`;
+      else if (measurement.standardOffered === true) line += ` (${mailText(config, 'lead.mail.arOwn')})`;
+      else if (measurement.standardOffered === false) line += ` (${mailText(config, 'lead.mail.arNoStandard')})`;
       lines.push(line);
     }
     const warnings = (Array.isArray(measurement.warnings) ? measurement.warnings : []).map(oneLine).filter(Boolean);

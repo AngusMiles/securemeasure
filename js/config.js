@@ -101,6 +101,8 @@ export default {
     //           photo its scale (see references below).
     // Sizes from ar and camera are estimates, and the customer is told so: a
     // check measure confirms the exact size before their door is made.
+    // Keep camera or paper on: with both off, customers on most phones (every
+    // iPhone) can only type in a door size they measured by hand.
     methods: {
       ar: true, //     Android phones with AR
       camera: true, // every phone, no paper

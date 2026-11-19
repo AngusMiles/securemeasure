@@ -9,9 +9,9 @@
  * cannot be used (blocked, missing, busy, an in-app browser).
  *
  * The camera is never left running behind the customer's back: it stops when they leave this screen, when
- * the page is hidden, before the camera app opens, and as soon as a photo is taken or picked. It restarts
- * when the page is shown again while this screen is still up. (The AR screen cannot start its session while
- * this one holds the camera.)
+ * the page is hidden, before the camera app or the photo picker opens, and as soon as a photo is taken or
+ * picked. It restarts when the page is shown again while this screen is still up. (The AR screen cannot
+ * start its session while this one holds the camera.)
  */
 import { loadPhoto, setPhoto } from '../photo.js';
 import { findDoor } from '../door-find.js';
@@ -47,6 +47,8 @@ export const strings = {
     'When your phone asks, tap Allow so you can see your door here. Your photo stays on your phone unless you send us an enquiry.',
   'capture.starting.inapp':
     "If the camera doesn't appear, use your camera app below, or open this page in Safari or Chrome.",
+  'capture.starting.slow': "If your phone hasn't asked, tap Allow camera to ask again, or use your camera app below.",
+  'capture.ready': 'Camera ready. Fit the whole door opening inside the frame, then tap Take photo.',
   'capture.paused.title': 'Camera paused',
   'capture.paused.text': 'Tap Allow camera to see your door here.',
   'capture.ended.text': 'The camera stopped. Tap Allow camera to start it again.',
@@ -54,6 +56,11 @@ export const strings = {
   'capture.blocked.text': 'You can still take the photo with your camera app, using the button below.',
   'capture.blocked.help.ios':
     'To turn it back on, tap the aA or page menu button in the address bar, choose Website Settings and set Camera to Allow. Then tap Allow camera.',
+  // Chrome, Firefox, Edge or Opera on an iPhone or iPad ({browser} is its name): no aA button or Website
+  // Settings there. The app itself needs the camera (iOS Settings), and the refusal is remembered until the
+  // page is loaded again.
+  'capture.blocked.help.iosbrowser':
+    'To turn it back on, check Camera is on for {browser} in your Settings app, then reload this page and tap Allow when you are asked.',
   'capture.blocked.help.android':
     'To turn it back on, tap the icon to the left of the web address, choose Permissions and turn on Camera. Then tap Allow camera.',
   'capture.blocked.help.other':
@@ -86,12 +93,30 @@ export const strings = {
  * it straight away.
  */
 const RESUME_DELAY_MS = 1000;
+/**
+ * How long 'starting' waits on the browser before Allow camera works again. Until then a tap must not ask
+ * twice, as the prompt is most likely up. But a prompt the page can be used around (Firefox for Android's,
+ * on the address bar) can be left unanswered, and an app's built-in browser may never answer at all; the
+ * request then never settles, and without this the button would spin for ever.
+ */
+const START_PATIENCE_MS = 8000;
 const ERROR_TOAST_MS = 6000;
 /** The kit's button variants and sizes (js/ui.js), for restyling a button in place. */
 const BUTTON_VARIANTS = ['primary', 'secondary', 'ghost', 'danger'];
 const BUTTON_SIZES = ['sm', 'md', 'lg'];
 /** getUserMedia failures that mean "no camera at all" rather than "no camera API". */
 const NO_CAMERA_ERRORS = new Set(['NotFoundError', 'DevicesNotFoundError', 'OverconstrainedError', 'ConstraintNotSatisfiedError']);
+/**
+ * The other iPhone and iPad browsers, by the token each puts in its user agent, with the name the
+ * re-enable steps call it by. All are WebKit underneath, but none has Safari's aA menu or Website
+ * Settings, so Safari's steps would send their customers looking for buttons that are not there.
+ */
+const IOS_BROWSERS = [
+  [/\bCriOS\//, 'Chrome'],
+  [/\bFxiOS\//, 'Firefox'],
+  [/\bEdgiOS\//, 'Edge'],
+  [/\b(?:OPiOS|OPT)\//, 'Opera'],
+];
 
 /**
  * The capture screen can always be entered.
@@ -105,7 +130,8 @@ export function canEnter() {
  * Build the capture screen.
  *
  * Phases:
- *  - 'starting'     getUserMedia is out (the permission prompt may be up)
+ *  - 'starting'     getUserMedia is out (the permission prompt may be up); after START_PATIENCE_MS
+ *                   without an answer, Allow camera asks again
  *  - 'paused'       no live picture: the page was hidden, the stream ended, or iOS wants a tap to play
  *  - 'live'         the viewfinder is running (the shutter waits for the video to have a size)
  *  - 'capturing'    taking the still
@@ -125,15 +151,24 @@ export function mount(root, ctx) {
   const t = (key, vars) => ctx.t(key, vars);
   const nav = globalThis.navigator;
   const inApp = isKnownInAppBrowser();
-  const platform = platformOf(nav);
+  const { platform, browser } = platformOf(nav);
 
   let alive = true;
   /** A photo is being taken or loaded: no second photo, and the camera stays closed. */
   let processing = false;
   /** { stream, track } while this screen holds the camera. */
   let camera = null;
-  /** One getUserMedia at a time, so an old stream can never land on the video after a newer one. */
+  /**
+   * A getUserMedia of the current epoch is out: no second one beside it. One that is out of date no
+   * longer counts (releaseCamera drops it), as it may never settle; startCamera's signal keeps its stream,
+   * should one still come, off the video.
+   */
   let startPending = false;
+  /** Aborts the getUserMedia that is out, for startCamera (see releaseCamera). */
+  let startAbort = null;
+  /** The getUserMedia that is out has had START_PATIENCE_MS: Allow camera may ask again. */
+  let startOverdue = false;
+  let patienceTimer = 0;
   /** Bumped whenever the camera is released; a start that began before then is out of date. */
   let epoch = 0;
   /** Whether the camera should be running while the page is visible (false after a failure). */
@@ -167,6 +202,13 @@ export function mount(root, ctx) {
   const guideEl = h('div', { class: 'sm-capture__guide', hidden: true, attrs: { 'aria-hidden': 'true' } });
   // Focusable from script only: focus lands here when the card is put away and the shutter cannot take it yet.
   const hint = h('p', { class: 'sm-capture__hint', hidden: true, attrs: { 'aria-live': 'polite', tabindex: '-1' } });
+  // Says so when the camera is ready to take the photo. The hint cannot: it is hidden until then, and a
+  // live region that is shown already holding its text is not reliably read out. This one is never hidden,
+  // only emptied while the camera is not live, so each time the camera comes back it is a change.
+  const readyStatus = h('p', {
+    class: 'sm-capture__status sm-visually-hidden',
+    attrs: { role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' },
+  });
 
   const panelIcon = h('span', { class: 'sm-capture__panel-icon' });
   const panelTitle = h('h2', { class: 'sm-capture__panel-title' });
@@ -185,7 +227,7 @@ export function mount(root, ctx) {
     ),
   );
 
-  const stage = h('div', { class: 'sm-capture__stage' }, video, guideEl, hint, panel);
+  const stage = h('div', { class: 'sm-capture__stage' }, video, guideEl, hint, readyStatus, panel);
 
   // ---- Shutter and fallbacks -------------------------------------------------------------------
 
@@ -249,11 +291,14 @@ export function mount(root, ctx) {
     if (phase === 'capturing') hintText = t('capture.capturing');
     else if (muted) hintText = t('capture.hint.paused');
     else if (isPhoneOnItsSide()) hintText = t('capture.upright');
-    if (hint.textContent !== hintText) hint.textContent = hintText;
+    setText(hint, hintText);
 
     shutter.disabled = phase !== 'live' || processing || muted || !hasFrame();
     if (phase === 'capturing') shutter.setAttribute('aria-busy', 'true');
     else shutter.removeAttribute('aria-busy');
+    // Set once the shutter works, and kept through a mute or a photo being taken (the hint speaks then).
+    if (!live) setText(readyStatus, '');
+    else if (!shutter.disabled) setText(readyStatus, t('capture.ready'));
 
     // The fallbacks take over whenever the live camera is no use.
     restyle(cameraAppButton, unusable ? 'primary' : 'secondary', unusable ? 'lg' : 'sm');
@@ -293,7 +338,8 @@ export function mount(root, ctx) {
         iconName = 'camera';
         title = t('capture.starting.title');
         text = t('capture.starting.text');
-        help = inApp ? t('capture.starting.inapp') : '';
+        if (inApp) help = t('capture.starting.inapp');
+        else if (startOverdue) help = t('capture.starting.slow');
         break;
       case 'paused':
         iconName = 'camera';
@@ -304,7 +350,7 @@ export function mount(root, ctx) {
         iconName = 'lock';
         title = t('capture.blocked.title');
         text = t('capture.blocked.text');
-        help = t(`capture.blocked.help.${platform}`);
+        help = t(`capture.blocked.help.${platform}`, { browser });
         break;
       case 'busy':
         title = t('capture.busy.title');
@@ -323,15 +369,16 @@ export function mount(root, ctx) {
     }
     panelIcon.replaceChildren(ui.icon(iconName, 26));
     panelIcon.classList.toggle('sm-capture__panel-icon--alert', unusable);
-    panelTitle.textContent = title;
-    panelText.textContent = text;
-    panelHelp.textContent = help;
+    // render() runs on every resize and video event: rewriting the same words would have them read out again.
+    setText(panelTitle, title);
+    setText(panelText, text);
+    setText(panelHelp, help);
     panelHelp.hidden = help === '';
 
     allowButton.hidden = !allow;
     // After a failure, "Allow camera" is the second choice: the camera app is the sure way on.
     restyle(allowButton, unusable ? 'secondary' : 'primary', unusable ? 'md' : 'lg');
-    const waiting = phase === 'starting';
+    const waiting = phase === 'starting' && !startOverdue;
     allowButton.setLoading(waiting);
     allowButton.setAttribute('aria-disabled', waiting ? 'true' : 'false');
   }
@@ -367,13 +414,24 @@ export function mount(root, ctx) {
     resumeTimer = 0;
     wantCamera = true;
     startPending = true;
+    startOverdue = false;
     const startedIn = epoch;
+    const request = typeof AbortController === 'function' ? new AbortController() : null;
+    startAbort = request;
+    clearTimeout(patienceTimer);
+    patienceTimer = setTimeout(() => {
+      patienceTimer = 0;
+      if (!alive || startedIn !== epoch || !startPending) return;
+      startOverdue = true;
+      render();
+    }, START_PATIENCE_MS);
     setPhase('starting');
     // startCamera calls getUserMedia before it awaits anything, so a tap that got us here still counts
     // as the gesture behind the permission prompt.
-    startCamera(video).then(
+    startCamera(video, request ? { signal: request.signal } : undefined).then(
       (result) => {
-        startPending = false;
+        // Only the request of the current epoch is the one start() waits on; a newer one may be out.
+        if (startedIn === epoch) endStartWait();
         if (startedIn !== epoch || !alive || processing) {
           discard(result);
           resumeLater();
@@ -385,7 +443,7 @@ export function mount(root, ctx) {
         else setPhase('paused', 'tap');
       },
       (error) => {
-        startPending = false;
+        if (startedIn === epoch) endStartWait();
         if (startedIn !== epoch || !alive || processing) {
           resumeLater();
           return;
@@ -402,9 +460,24 @@ export function mount(root, ctx) {
     if (video.srcObject === result.stream) video.srcObject = null;
   }
 
-  /** Let go of the camera now: stop every track and empty the viewfinder. */
+  /** The getUserMedia start() waits on has settled, or is out of date: it no longer holds up the next. */
+  function endStartWait() {
+    startPending = false;
+    startOverdue = false;
+    startAbort = null;
+    clearTimeout(patienceTimer);
+    patienceTimer = 0;
+  }
+
+  /**
+   * Let go of the camera now: stop every track and empty the viewfinder. A getUserMedia still out is out
+   * of date from here and is dropped: it must not hold up the next start, since a prompt left unanswered
+   * may keep it out for ever, and should it still bring a stream, startCamera stops that at once.
+   */
   function releaseCamera() {
     epoch += 1;
+    if (startAbort) startAbort.abort();
+    endStartWait();
     const held = camera;
     camera = null;
     muted = false;
@@ -419,7 +492,7 @@ export function mount(root, ctx) {
     video.srcObject = null;
   }
 
-  /** Pause the camera for something that needs it (the camera app) or a hidden page; resume later. */
+  /** Pause the camera for something that needs it (the camera app, a photo picker) or a hidden page; resume later. */
   function pauseCamera() {
     if (!camera && !startPending) return;
     releaseCamera();
@@ -428,6 +501,10 @@ export function mount(root, ctx) {
 
   function fail(error) {
     wantCamera = false;
+    // Every way this ends (unavailable, blocked, busy, failed) means the camera here did not work this time:
+    // the result screen then tells a customer with a picked photo how to retake it with the camera app.
+    // ('starting' and 'paused' say nothing about it either way, so they leave it alone.)
+    ctx.state.liveCamera = false;
     const kind = cameraErrorKind(error);
     const name = error && typeof error.name === 'string' ? error.name : '';
     if (kind === 'insecure') setPhase('unavailable', 'insecure');
@@ -448,6 +525,9 @@ export function mount(root, ctx) {
       if (phase !== 'paused') setPhase('paused', 'tap');
       return;
     }
+    // The live camera works on this phone: the result screen may send the customer back here to retake a
+    // picked photo (estimateIssueKeys in js/screens/result-standard.js).
+    ctx.state.liveCamera = true;
     setPhase('live');
   }
 
@@ -489,7 +569,13 @@ export function mount(root, ctx) {
   }
 
   function onAllow() {
-    if (processing || startPending) return;
+    if (processing) return;
+    if (startPending) {
+      // Still waiting on the browser: most likely its prompt is up, so a tap must not ask twice. Once it
+      // has had START_PATIENCE_MS, drop that request and ask again.
+      if (!startOverdue) return;
+      releaseCamera();
+    }
     if (camera) {
       // The stream is open and only playback is waiting for a tap (iOS): play() inside this tap.
       let attempt;
@@ -578,6 +664,9 @@ export function mount(root, ctx) {
         setPhoto(state, photo);
         state.method = 'estimate';
         const prior = view ? priorFromGuide({ ...view, photoW: photo.width, photoH: photo.height }) : null;
+        // Kept with the photo (setPhoto has just cleared the last one's): if this search runs out of time,
+        // the door screen looks again in the background near the same guide.
+        if (prior) state.door.prior = prior.map((p) => ({ x: p.x, y: p.y }));
         const detection = await detectDoor(photo, prior);
         // The customer may have left while detection ran and started on another photo.
         if (state.photo === photo) state.door.detection = detection;
@@ -613,8 +702,10 @@ export function mount(root, ctx) {
     if (wantCamera) resumeLater();
   };
   // The camera app needs the camera itself (Android will not share it), and the page may never be
-  // hidden while it is up (iOS shows it over the page), so let go of ours first.
-  const onCameraAppTap = (event) => {
+  // hidden while it is up (iOS shows it over the page), so let go of ours first. The same goes for
+  // "Choose a photo": iOS offers Take Photo beside the library, and Chrome on Android its camera, and
+  // while the customer browses their photos the camera light would stay on for nothing.
+  const onPickerTap = (event) => {
     if (processing) {
       event.preventDefault();
       return;
@@ -642,8 +733,10 @@ export function mount(root, ctx) {
       window.removeEventListener('resize', layout);
     });
   }
-  cameraAppButton.addEventListener('click', onCameraAppTap, true);
-  for (const input of [cameraAppButton.input, chooseButton.input]) input.addEventListener('cancel', onPickerDone);
+  for (const button of [cameraAppButton, chooseButton]) {
+    button.addEventListener('click', onPickerTap, true);
+    button.input.addEventListener('cancel', onPickerDone);
+  }
 
   // The video reports its size (and a new one when the phone turns) only after it has started.
   const onVideoEvent = () => (camera ? evaluate() : undefined);
@@ -664,7 +757,7 @@ export function mount(root, ctx) {
   return () => {
     alive = false;
     clearTimeout(resumeTimer);
-    releaseCamera();
+    releaseCamera(); // also clears the patience timer
     for (const cleanup of cleanups) cleanup();
     root.classList.remove('sm-screen--flush', 'sm-capture');
   };
@@ -711,15 +804,25 @@ function restyle(el, variant, size) {
   for (const name of BUTTON_SIZES) el.classList.toggle(`sm-btn--${name}`, name === size);
 }
 
+/** Writes text only when it differs, so unchanged nodes are not re-announced by a live region. */
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
 /**
- * Which re-enable steps to show: they differ between iPhone and Android browsers.
+ * Which re-enable steps to show: they differ between Safari, the other iPhone and iPad browsers, and
+ * Android.
  * @param {Navigator | undefined} nav
- * @returns {'ios' | 'android' | 'other'}
+ * @returns {{ platform: 'ios' | 'iosbrowser' | 'android' | 'other', browser: string }}
+ *   browser: the name of an 'iosbrowser' (see IOS_BROWSERS), for its steps; '' otherwise
  */
 function platformOf(nav) {
   const ua = nav && typeof nav.userAgent === 'string' ? nav.userAgent : '';
   // iPadOS reports itself as a Mac; a Mac with a touch screen is an iPad.
-  if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && nav.maxTouchPoints > 1)) return 'ios';
-  if (/Android/.test(ua)) return 'android';
-  return 'other';
+  if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && nav.maxTouchPoints > 1)) {
+    const other = IOS_BROWSERS.find(([marker]) => marker.test(ua));
+    return other ? { platform: 'iosbrowser', browser: other[1] } : { platform: 'ios', browser: '' };
+  }
+  if (/Android/.test(ua)) return { platform: 'android', browser: '' };
+  return { platform: 'other', browser: '' };
 }

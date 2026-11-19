@@ -8,13 +8,19 @@ import {
   FALLBACK_GUARDS,
   FALLBACK_STEPS,
   interruptedPhotoScreen,
+  isSessionEntry,
+  newSessionToken,
+  requestedScreen,
   resolveScreenId,
   SCREEN_ORDER,
 } from '../js/app.js';
 import { BUNDLED_DEMO_PHOTO, demoPhotoFocal35mm, demoPhotoUrl, loadDemo, selectDemoReference, useDemoPhoto } from '../js/demo.js';
 import { estimateFromCorners, FULL_FRAME_DIAGONAL_MM, photoFocal, standardSizesFrom } from '../js/estimate.js';
 import { DEMO_SCENE } from '../tools/scene.mjs';
-import { COMMON, buildStrings } from '../js/strings.js';
+import { COMMON, buildStrings, createTranslator } from '../js/strings.js';
+import { deepMerge } from '../js/theme.js';
+import { noteArRefused, resetArSupport } from '../js/ar-support.js';
+import * as ui from '../js/ui.js';
 import { SHIPPED_CONFIG } from './helpers/shipped-config.mjs';
 import * as welcome from '../js/screens/welcome.js';
 import * as prepare from '../js/screens/prepare.js';
@@ -105,6 +111,7 @@ describe('createInitialState', () => {
       photo: null,
       sheet: { points: null, refined: false, detected: false },
       door: { points: null, detection: null },
+      liveCamera: null,
       measure: null,
       size: null,
       quoteInput: { productId: null, selections: {}, includeInstallation: null },
@@ -292,6 +299,922 @@ describe('interruptedPhotoScreen', () => {
     assert.equal(interruptedPhotoScreen({ screen: 'prepare', idx: 1, picking: 'yes' }), null);
     assert.equal(interruptedPhotoScreen({ screen: 'door', idx: 2, picking: note }), null, 'no picker there');
     assert.equal(interruptedPhotoScreen({ screen: 'result', idx: 3, picking: note }), null);
+  });
+});
+
+describe('history entries of other page loads and sessions', () => {
+  test("only an entry with this session's mark is one of its own", () => {
+    const session = newSessionToken();
+    assert.equal(isSessionEntry({ screen: 'door', idx: 2, session }, session), true);
+    assert.equal(isSessionEntry({ screen: 'door', idx: 2, session: newSessionToken() }, session), false, 'an earlier load or session');
+    assert.equal(isSessionEntry({ screen: 'door', idx: 2 }, session), false, 'written before entries carried a session');
+    assert.equal(isSessionEntry({ screen: 'door', idx: 2 }, undefined), false);
+    assert.equal(isSessionEntry(null, session), false);
+    assert.equal(isSessionEntry('door', session), false);
+  });
+
+  test('every page load and every "Start again" gets a mark of its own', () => {
+    const marks = new Set(Array.from({ length: 2000 }, () => newSessionToken()));
+    assert.equal(marks.size, 2000);
+    for (const mark of marks) assert.equal(typeof mark, 'string');
+  });
+
+  test('Back onto an old journey\'s entry asks for the welcome screen, Forward for the screen on show', () => {
+    const session = newSessionToken();
+    for (const screen of SCREEN_ORDER) {
+      for (const old of [{ screen, idx: 2, session: newSessionToken() }, { screen, idx: 2 }]) {
+        assert.equal(requestedScreen(old, session, true, 'welcome'), 'welcome', `Back onto ${screen}`);
+        assert.equal(requestedScreen(old, session, true, 'prepare'), 'welcome', `Back onto ${screen} from "Get set up"`);
+        assert.equal(requestedScreen(old, session, false, 'welcome'), 'welcome', `Forward onto ${screen}`);
+        assert.equal(requestedScreen(old, session, false, 'result'), 'result', `Forward onto ${screen} from the result`);
+      }
+      // This session's own entries still lead where they say.
+      assert.equal(requestedScreen({ screen, idx: 2, session }, session, true, 'welcome'), screen);
+      assert.equal(requestedScreen({ screen, idx: 2, session }, session, false, 'welcome'), screen);
+    }
+  });
+});
+
+// ---- A browser, just enough of one ------------------------------------------------------------
+//
+// The router and the welcome screen run here as they do in a phone's browser: js/ui.js builds real
+// (fake) elements, js/app.js boots on a document, and the session history keeps its entries across
+// page loads, as a browser's does through a reload or a tab the phone discarded.
+
+class FakeNode {
+  constructor(doc) {
+    this.ownerDocument = doc;
+    this.parentNode = null;
+    this.childNodes = [];
+  }
+
+  get children() {
+    return this.childNodes.filter((node) => node instanceof FakeElement);
+  }
+
+  get nextSibling() {
+    if (!this.parentNode) return null;
+    const siblings = this.parentNode.childNodes;
+    return siblings[siblings.indexOf(this) + 1] || null;
+  }
+
+  get textContent() {
+    return this.childNodes.map((node) => node.textContent).join('');
+  }
+
+  set textContent(value) {
+    const text = value === null || value === undefined ? '' : String(value);
+    this.replaceChildren(...(text ? [text] : []));
+  }
+
+  appendChild(node) {
+    return this.insertBefore(node, null);
+  }
+
+  insertBefore(node, ref) {
+    node.remove();
+    const at = ref ? this.childNodes.indexOf(ref) : -1;
+    if (at < 0) this.childNodes.push(node);
+    else this.childNodes.splice(at, 0, node);
+    node.parentNode = this;
+    return node;
+  }
+
+  /** As in a browser, append() and friends write anything that is not a node (null too) as text. */
+  asNodes(items) {
+    return items.map((item) => (item instanceof FakeNode ? item : this.ownerDocument.createTextNode(String(item))));
+  }
+
+  append(...items) {
+    for (const node of this.asNodes(items)) this.appendChild(node);
+  }
+
+  prepend(...items) {
+    const first = this.childNodes[0] || null;
+    for (const node of this.asNodes(items)) this.insertBefore(node, first);
+  }
+
+  replaceChildren(...items) {
+    for (const node of [...this.childNodes]) node.remove();
+    this.append(...items);
+  }
+
+  remove() {
+    if (!this.parentNode) return;
+    const siblings = this.parentNode.childNodes;
+    siblings.splice(siblings.indexOf(this), 1);
+    this.parentNode = null;
+  }
+
+  contains(node) {
+    for (let at = node; at; at = at.parentNode) if (at === this) return true;
+    return false;
+  }
+}
+
+class FakeText extends FakeNode {
+  constructor(doc, data) {
+    super(doc);
+    this.data = data;
+  }
+
+  get textContent() {
+    return this.data;
+  }
+
+  set textContent(value) {
+    this.data = String(value);
+  }
+}
+
+const dataAttribute = (name) => `data-${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+
+class FakeElement extends FakeNode {
+  constructor(doc, tag) {
+    super(doc);
+    this.localName = tag;
+    this.attrs = new Map();
+    this.listeners = new Map();
+    this.hidden = false;
+    this.disabled = false;
+    this.scrollTop = 0;
+    this.offsetHeight = 0;
+    this.style = { cssText: '', setProperty() {}, removeProperty() {} };
+    const el = this;
+    this.dataset = new Proxy(
+      {},
+      {
+        get: (_, name) => (typeof name === 'string' ? (el.getAttribute(dataAttribute(name)) ?? undefined) : undefined),
+        set: (_, name, value) => {
+          el.setAttribute(dataAttribute(String(name)), value);
+          return true;
+        },
+      },
+    );
+    const classes = () => new Set((el.getAttribute('class') || '').split(/\s+/).filter(Boolean));
+    const write = (set) => el.setAttribute('class', [...set].join(' '));
+    this.classList = {
+      add: (...names) => write(new Set([...classes(), ...names])),
+      remove: (...names) => write(new Set([...classes()].filter((name) => !names.includes(name)))),
+      toggle: (name, force) => {
+        const on = force === undefined ? !classes().has(name) : Boolean(force);
+        if (on) this.classList.add(name);
+        else this.classList.remove(name);
+        return on;
+      },
+      contains: (name) => classes().has(name),
+      [Symbol.iterator]: () => classes()[Symbol.iterator](),
+    };
+  }
+
+  get tagName() {
+    return this.localName.toUpperCase();
+  }
+
+  /** As on <input>, `type` reflects the attribute: js/app.js tells a photo picker by type="file". */
+  get type() {
+    return this.getAttribute('type') ?? (this.localName === 'input' ? 'text' : '');
+  }
+
+  set type(value) {
+    this.setAttribute('type', value);
+  }
+
+  get nodeName() {
+    return this.tagName;
+  }
+
+  get id() {
+    return this.getAttribute('id') || '';
+  }
+
+  set id(value) {
+    this.setAttribute('id', value);
+  }
+
+  get className() {
+    return this.getAttribute('class') || '';
+  }
+
+  set className(value) {
+    this.setAttribute('class', value);
+  }
+
+  get attributes() {
+    return [...this.attrs].map(([name, value]) => ({ name, value }));
+  }
+
+  setAttribute(name, value) {
+    this.attrs.set(name, String(value));
+  }
+
+  getAttribute(name) {
+    return this.attrs.has(name) ? this.attrs.get(name) : null;
+  }
+
+  hasAttribute(name) {
+    return this.attrs.has(name);
+  }
+
+  removeAttribute(name) {
+    this.attrs.delete(name);
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(type, (this.listeners.get(type) || []).filter((fn) => fn !== listener));
+  }
+
+  click() {
+    if (this.disabled) return;
+    const event = { type: 'click', target: this, defaultPrevented: false };
+    event.preventDefault = () => {
+      event.defaultPrevented = true;
+    };
+    for (const listener of [...(this.listeners.get('click') || [])]) listener(event);
+  }
+
+  focus() {
+    this.ownerDocument.activeElement = this;
+  }
+
+  /** The selectors js/ui.js, js/app.js and the welcome screen use: tag, .class and [attr] / [attr="value"], in lists. */
+  matches(selector) {
+    return selector.split(',').some((part) => {
+      const found = /^([a-zA-Z*][\w-]*)?((?:\.[\w-]+)*)((?:\[[^\]]+\])*)$/.exec(part.trim());
+      if (!found) throw new Error(`the fake DOM does not know the selector "${part}"`);
+      const [, tag, classNames, attributes] = found;
+      if (tag && tag !== '*' && tag.toLowerCase() !== this.localName.toLowerCase()) return false;
+      if (!classNames.split('.').filter(Boolean).every((name) => this.classList.contains(name))) return false;
+      for (const [, name, value] of attributes.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/g)) {
+        if (!this.hasAttribute(name) || (value !== undefined && this.getAttribute(name) !== value)) return false;
+      }
+      return true;
+    });
+  }
+
+  querySelectorAll(selector) {
+    const found = [];
+    const walk = (node) => {
+      for (const child of node.children) {
+        if (child.matches(selector)) found.push(child);
+        walk(child);
+      }
+    };
+    walk(this);
+    return found;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+}
+
+class FakeDocument {
+  constructor() {
+    this.readyState = 'complete';
+    this.visibilityState = 'visible';
+    this.activeElement = null;
+    this.title = '';
+    this.head = null;
+    this.listeners = new Map();
+    this.documentElement = this.createElement('html');
+    this.body = this.createElement('body');
+    this.documentElement.append(this.body);
+  }
+
+  createElement(tag) {
+    return new FakeElement(this, tag);
+  }
+
+  createElementNS(namespace, tag) {
+    return new FakeElement(this, tag);
+  }
+
+  createTextNode(data) {
+    return new FakeText(this, String(data));
+  }
+
+  importNode(node) {
+    return node;
+  }
+
+  getElementById(id) {
+    return this.documentElement.querySelectorAll('*').find((el) => el.getAttribute('id') === id) || null;
+  }
+
+  querySelector(selector) {
+    return this.documentElement.querySelector(selector);
+  }
+
+  contains(node) {
+    return this.documentElement.contains(node);
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(type, (this.listeners.get(type) || []).filter((fn) => fn !== listener));
+  }
+
+  /** Hand `event` to this document's `type` listeners, as an event that reaches the document does. */
+  fire(type, event) {
+    for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
+  }
+}
+
+/** Parses nothing: every static SVG the screens draw becomes an empty <svg>, which is all a test needs. */
+class FakeDOMParser {
+  parseFromString() {
+    return { documentElement: globalThis.document.createElementNS('http://www.w3.org/2000/svg', 'svg'), getElementsByTagName: () => [] };
+  }
+}
+
+class FakeWindow {
+  constructor() {
+    this.parent = this;
+    this.listeners = new Map();
+    this.scrollX = 0;
+    this.scrollY = 0;
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(type, (this.listeners.get(type) || []).filter((fn) => fn !== listener));
+  }
+
+  scrollTo() {}
+
+  fire(type, event) {
+    for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
+  }
+}
+
+/**
+ * A session history: the page the customer came from, then the app's entries. As in a browser, a move
+ * is reported later (a popstate task) and only within the app's own page; a move onto the page before
+ * the app leaves it. A reload keeps every entry and starts a new page in the current one.
+ */
+class FakeHistory {
+  constructor() {
+    this.entries = [{ page: 'outside', state: null }];
+    this.index = 0;
+    this.window = null;
+    this.pending = 0;
+  }
+
+  get state() {
+    return structuredClone(this.entries[this.index].state);
+  }
+
+  get length() {
+    return this.entries.length;
+  }
+
+  /** Where the customer is: 'app' or 'outside'. */
+  where() {
+    return this.entries[this.index].page;
+  }
+
+  /** The states of the app's entries, oldest first. */
+  appStates() {
+    return this.entries.filter((entry) => entry.page === 'app').map((entry) => structuredClone(entry.state));
+  }
+
+  navigateToApp() {
+    this.entries.splice(this.index + 1, Infinity, { page: 'app', state: null });
+    this.index += 1;
+  }
+
+  pushState(state) {
+    this.entries.splice(this.index + 1, Infinity, { page: 'app', state: structuredClone(state) });
+    this.index += 1;
+  }
+
+  replaceState(state) {
+    this.entries[this.index].state = structuredClone(state);
+  }
+
+  go(delta) {
+    const to = this.index + delta;
+    if (!delta || to < 0 || to >= this.entries.length) return;
+    this.pending += 1;
+    setTimeout(() => {
+      this.pending -= 1;
+      this.index = to;
+      const entry = this.entries[to];
+      // Another page: the app is gone, and nothing of it hears about the move.
+      if (entry.page === 'app') this.window.fire('popstate', { state: structuredClone(entry.state) });
+    }, 0);
+  }
+
+  back() {
+    this.go(-1);
+  }
+
+  forward() {
+    this.go(1);
+  }
+}
+
+const BROWSER_GLOBALS = ['document', 'window', 'history', 'location', 'navigator', 'Node', 'DOMParser', 'isSecureContext'];
+let pageLoads = 0;
+
+/**
+ * Install the fake browser's globals; `uninstall()` puts back whatever was there. Each `open()` or
+ * `reload()` starts js/app.js on a new page (a new module instance, so a new router) and returns the
+ * page, with the screens its router mounted (`mounted`). `cameraStarts` counts getUserMedia() calls.
+ */
+function fakeBrowser({ xr = null } = {}) {
+  const saved = BROWSER_GLOBALS.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  const history = new FakeHistory();
+  let cameraStarts = 0;
+  const set = (name, value) => Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  set('history', history);
+  set('location', { search: '', href: 'https://doors.example/measure/', reload() {} });
+  set('Node', FakeNode);
+  set('DOMParser', FakeDOMParser);
+  set('isSecureContext', Boolean(xr));
+  set('navigator', {
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 Version/18.1 Mobile/15E148 Safari/604.1',
+    xr: xr || undefined,
+    mediaDevices: {
+      getUserMedia: () => {
+        cameraStarts += 1;
+        return Promise.reject(new Error('no camera in a test'));
+      },
+    },
+  });
+  resetArSupport();
+
+  /** A new page: its own document, window and shell (index.html), in the history's current entry. */
+  function newPage() {
+    const doc = new FakeDocument();
+    const win = new FakeWindow();
+    set('document', doc);
+    set('window', win);
+    history.window = win;
+    const el = (tag, id, ...children) => {
+      const node = doc.createElement(tag);
+      if (id) node.setAttribute('id', id);
+      node.append(...children);
+      return node;
+    };
+    const segments = [1, 2, 3, 4].map(() => {
+      const segment = doc.createElement('span');
+      segment.classList.add('sm-progress__seg');
+      return segment;
+    });
+    const main = el('main', 'sm-main');
+    doc.body.append(
+      el(
+        'div',
+        'sm-app',
+        el('button', 'sm-back'),
+        el('div', 'sm-brand'),
+        el('p', 'sm-stepper', el('span', 'sm-step-count'), el('span', 'sm-step-name')),
+        el('div', 'sm-progress', ...segments),
+        main,
+        el('div', 'sm-toasts'),
+        el('div', 'sm-busy', el('p', 'sm-busy-message')),
+      ),
+    );
+    const page = { doc, mounted: [] };
+    // The router shows a screen by making it the only child of .sm-main.
+    const replace = main.replaceChildren.bind(main);
+    main.replaceChildren = (...nodes) => {
+      page.mounted.push(nodes[0] && nodes[0].dataset ? nodes[0].dataset.screen : undefined);
+      replace(...nodes);
+    };
+    page.screen = () => (main.children[0] ? main.children[0].dataset.screen : undefined);
+    return page;
+  }
+
+  async function start() {
+    const page = newPage();
+    pageLoads += 1;
+    await import(new URL(`../js/app.js?page=${pageLoads}`, import.meta.url).href);
+    await settle();
+    return page;
+  }
+
+  /** Let every move the browser owes the page arrive, and whatever each one sets off. */
+  async function settle() {
+    for (let quiet = 0; quiet < 3; ) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      quiet = history.pending > 0 ? 0 : quiet + 1;
+    }
+  }
+
+  return {
+    history,
+    get cameraStarts() {
+      return cameraStarts;
+    },
+    open() {
+      history.navigateToApp();
+      return start();
+    },
+    reload: start,
+    settle,
+    newPage,
+    uninstall() {
+      for (const [name, descriptor] of saved) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete globalThis[name];
+      }
+      resetArSupport();
+    },
+  };
+}
+
+/** The kit button (js/ui.js button or fileButton) on `page` whose label reads `label`. */
+function buttonLabelled(page, label) {
+  const found = page.doc.documentElement
+    .querySelectorAll('.sm-btn')
+    .find((button) => button.querySelector('.sm-btn__label')?.textContent === label);
+  assert.ok(found, `no "${label}" button on the page`);
+  return found;
+}
+
+/** A click on `target` as it reaches the document: one no screen has prevented. */
+function clickOn(target) {
+  const event = { type: 'click', target, defaultPrevented: false };
+  event.preventDefault = () => {
+    event.defaultPrevented = true;
+  };
+  return event;
+}
+
+describe('the router after a reload or "Start again" (js/app.js in a fake browser)', () => {
+  /** What an earlier page load wrote for the camera way in: welcome(0) -> capture(1) -> door(2) -> result(3). */
+  async function cameraJourney(browser, { marked = true } = {}) {
+    await browser.open();
+    const first = browser.history.state;
+    assert.deepEqual([first.screen, first.idx], ['welcome', 0]);
+    assert.equal(typeof first.session, 'string', 'every entry carries its session');
+    const session = marked ? { session: first.session } : {};
+    if (!marked) browser.history.replaceState({ screen: 'welcome', idx: 0 });
+    for (const [idx, screen] of [[1, 'capture'], [2, 'door'], [3, 'result']]) browser.history.pushState({ screen, idx, ...session });
+    return first.session;
+  }
+
+  for (const marked of [true, false]) {
+    test(`Back from the fresh welcome screen leaves the app, opening none of the old screens${marked ? '' : ' (entries from before session marks)'}`, async (t) => {
+      const errors = t.mock.method(console, 'error', () => {}).mock;
+      const browser = fakeBrowser();
+      try {
+        const oldSession = await cameraJourney(browser, { marked });
+        // iOS discards the tab while the customer is in another app, or they pull to refresh: the page
+        // loads again in the result's entry, with the three older entries still behind it.
+        const page = await browser.reload();
+        assert.deepEqual(page.mounted, ['welcome']);
+        const start = browser.history.state;
+        assert.equal(start.screen, 'welcome');
+        assert.equal(start.idx, 3, 'the page keeps its place above the old entries, so Back still reads as Back');
+        assert.notEqual(start.session, oldSession);
+
+        browser.history.back();
+        await browser.settle();
+        assert.deepEqual(page.mounted, ['welcome'], 'not "Get set up", not the camera, not the AR card');
+        assert.equal(browser.cameraStarts, 0, 'the camera never started');
+        assert.equal(browser.history.where(), 'outside', 'one Back left the app');
+        assert.equal(errors.callCount(), 0, errors.calls.map((call) => call.arguments.join(' ')).join('\n'));
+      } finally {
+        browser.uninstall();
+      }
+    });
+  }
+
+  test('Forward onto the old entries ahead changes nothing, and Back still leaves', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {}).mock;
+    const browser = fakeBrowser();
+    try {
+      await cameraJourney(browser);
+      // The customer had gone Back to the camera screen when the page went away.
+      browser.history.index -= 2;
+      const page = await browser.reload();
+      assert.deepEqual([browser.history.state.screen, browser.history.state.idx], ['welcome', 1]);
+
+      browser.history.forward();
+      await browser.settle();
+      browser.history.forward();
+      await browser.settle();
+      assert.deepEqual(page.mounted, ['welcome'], 'the old door and result entries are not replayed');
+      assert.equal(page.screen(), 'welcome');
+      const states = browser.history.appStates();
+      assert.deepEqual(
+        states.map((state) => [state.screen, state.idx]),
+        [
+          ['welcome', 0],
+          ['welcome', 1],
+          ['welcome', 2],
+          ['welcome', 3],
+        ],
+      );
+      const session = browser.history.state.session;
+      assert.ok(states.slice(1).every((state) => state.session === session), 'each entry passed over now belongs to this session');
+
+      browser.history.back();
+      await browser.settle();
+      assert.deepEqual(page.mounted, ['welcome']);
+      assert.equal(browser.history.where(), 'outside');
+      assert.equal(browser.cameraStarts, 0);
+      assert.equal(errors.callCount(), 0, errors.calls.map((call) => call.arguments.join(' ')).join('\n'));
+    } finally {
+      browser.uninstall();
+    }
+  });
+
+  test('"Start again" gives the new session a mark of its own: Forward onto the ended journey\'s entries changes nothing', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {}).mock;
+    const browser = fakeBrowser();
+    try {
+      const page = await browser.open();
+      const oldSession = browser.history.state.session;
+      // This session's camera journey got as far as the door screen. Reaching it takes a decoded photo,
+      // which the fake browser has none of, so its entries are written the way the router writes them.
+      for (const [idx, screen] of [[1, 'capture'], [2, 'door']]) browser.history.pushState({ screen, idx, session: oldSession });
+      // Then the size is typed in instead, and that screen fails to mount (it can make no inputs): its
+      // crash card offers "Start again", which runs the same reset() as the done screen's.
+      page.doc.createElement = (tag) => {
+        if (tag === 'input') throw new Error('no inputs in this test');
+        return FakeDocument.prototype.createElement.call(page.doc, tag);
+      };
+      buttonLabelled(page, welcome.strings['welcome.manual']).click();
+      delete page.doc.createElement;
+      assert.deepEqual([page.screen(), browser.history.state.idx], ['result', 3]);
+
+      buttonLabelled(page, COMMON['common.startAgain']).click();
+      await browser.settle();
+      assert.deepEqual(page.mounted, ['welcome', 'result', 'welcome']);
+      assert.equal(browser.history.state.idx, 0, 'back on our first entry, so Back leaves the app');
+      const session = browser.history.state.session;
+      assert.equal(typeof session, 'string');
+      assert.notEqual(session, oldSession, 'the new session has a mark of its own');
+
+      // The ended journey's camera and door entries now lie ahead of the welcome screen.
+      for (let step = 0; step < 3; step += 1) {
+        browser.history.forward();
+        await browser.settle();
+      }
+      assert.deepEqual(page.mounted, ['welcome', 'result', 'welcome'], 'not the camera, not "Get set up"');
+      assert.equal(page.screen(), 'welcome');
+      assert.equal(browser.cameraStarts, 0, 'the camera never started');
+      const states = browser.history.appStates();
+      assert.deepEqual(
+        states.map((state) => [state.screen, state.idx]),
+        [
+          ['welcome', 0],
+          ['welcome', 1],
+          ['welcome', 2],
+          ['welcome', 3],
+        ],
+      );
+      assert.ok(states.every((state) => state.session === session), 'each entry passed over now belongs to the new session');
+      assert.deepEqual(
+        errors.calls.map((call) => call.arguments[0]),
+        ['[SecureMeasure] screen "result" failed to mount'],
+        'nothing went wrong but the crash this test set up',
+      );
+    } finally {
+      browser.uninstall();
+    }
+  });
+});
+
+describe('the router around a photo picker (js/app.js in a fake browser)', () => {
+  test('taking the picker note off again keeps the entry this session\'s own, so Back and Forward still lead to it', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {}).mock;
+    const browser = fakeBrowser();
+    try {
+      const page = await browser.open();
+      const session = browser.history.state.session;
+      buttonLabelled(page, welcome.strings['welcome.camera']).click();
+      await browser.settle();
+      assert.deepEqual(browser.history.state, { screen: 'capture', idx: 1, session });
+      // No camera in a test, so the screen also offers "Use your camera app instead" and "Choose a photo".
+      const pickers = page.doc.documentElement.querySelectorAll('input').filter((input) => input.type === 'file');
+      assert.equal(pickers.length, 2);
+
+      // The note goes on with the tap that opens a picker, and comes off with whichever of these shows
+      // the page came through.
+      for (const [n, closedBy] of ['change', 'cancel', 'visibilitychange', 'pointerdown', 'keydown'].entries()) {
+        const input = pickers[n % pickers.length];
+        page.doc.fire('click', clickOn(input));
+        const open = browser.history.state;
+        assert.equal(open.session, session, `the note keeps the session mark (${closedBy})`);
+        assert.equal(typeof open.picking, 'object', `the note is on while the picker is open (${closedBy})`);
+        page.doc.fire(closedBy, { type: closedBy, target: input });
+        assert.deepEqual(browser.history.state, { screen: 'capture', idx: 1, session }, `taken off by "${closedBy}", and nothing else`);
+      }
+
+      // The customer changes their mind: Back to the welcome screen, then Forward to the camera again.
+      browser.history.back();
+      await browser.settle();
+      assert.equal(page.screen(), 'welcome');
+      browser.history.forward();
+      await browser.settle();
+      assert.equal(page.screen(), 'capture', 'the camera screen, not the welcome screen an ended journey\'s entry leads to');
+      assert.deepEqual(page.mounted, ['welcome', 'capture', 'welcome', 'capture']);
+      assert.deepEqual(browser.history.state, { screen: 'capture', idx: 1, session });
+      assert.equal(errors.callCount(), 0, errors.calls.map((call) => call.arguments.join(' ')).join('\n'));
+    } finally {
+      browser.uninstall();
+    }
+  });
+});
+
+describe('the router around a typed size (js/app.js in a fake browser)', () => {
+  /** Type `value` into the input with `id`, as the customer does (an 'input' event). */
+  function typeInto(page, id, value) {
+    const input = page.doc.getElementById(id);
+    assert.ok(input, `no #${id} on the page`);
+    input.value = value;
+    for (const listener of [...(input.listeners.get('input') || [])]) listener({ type: 'input', target: input });
+  }
+
+  test('"Measure with my camera instead" after the quote\'s Edit: Forward to the quote, Edit again, and the typed size is still there to edit', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {}).mock;
+    const browser = fakeBrowser();
+    try {
+      const page = await browser.open();
+      buttonLabelled(page, welcome.strings['welcome.manual']).click();
+      await browser.settle();
+      assert.equal(page.screen(), 'result');
+      typeInto(page, 'sm-result-manual-width', '820');
+      typeInto(page, 'sm-result-manual-height', '2040');
+      buttonLabelled(page, result.strings['result.continue']).click();
+      await browser.settle();
+      assert.equal(page.screen(), 'quote');
+
+      buttonLabelled(page, quote.strings['quote.size.edit']).click();
+      await browser.settle();
+      assert.equal(page.screen(), 'result', "the quote's Edit");
+      buttonLabelled(page, result.strings['result.manual.useCamera']).click();
+      await browser.settle();
+      assert.equal(page.screen(), 'capture');
+
+      // The quote priced from the typed size is still ahead in the history.
+      browser.history.forward();
+      await browser.settle();
+      assert.equal(page.screen(), 'quote');
+      buttonLabelled(page, quote.strings['quote.size.edit']).click();
+      await browser.settle();
+
+      assert.equal(page.screen(), 'result', 'not "Get set up" or another measuring screen with nothing to show');
+      assert.equal(page.doc.getElementById('sm-result-manual-width')?.value, '820', 'the manual form, with the typed width');
+      assert.equal(page.doc.getElementById('sm-result-manual-height')?.value, '2040');
+      assert.equal(errors.callCount(), 0, errors.calls.map((call) => call.arguments.join(' ')).join('\n'));
+    } finally {
+      browser.uninstall();
+    }
+  });
+});
+
+describe('the welcome screen for each mix of ways in (js/screens/welcome.js in a fake browser)', () => {
+  const strings = buildStrings([welcome]);
+
+  /** Mount the welcome screen on a new page of `browser`, with `methods` and the rest as shipped. */
+  function mountWelcome(browser, methods, { allowManualOverride = true } = {}) {
+    // No tagline: the shipped one is the company's own words, and mentions a photo.
+    const config = deepMerge(SHIPPED_CONFIG, { brand: { tagline: '' }, measurement: { methods, allowManualOverride } });
+    const page = browser.newPage();
+    const root = page.doc.createElement('section');
+    page.doc.body.append(root);
+    const went = [];
+    const state = createInitialState(config);
+    const ctx = { config, ui, state, t: createTranslator(config, strings), go: (id) => went.push(id), busy: (fn) => fn(), toast() {}, emit() {} };
+    const cleanup = welcome.mount(root, ctx);
+    const style = (button, pattern) => [...button.classList].find((name) => pattern.test(name)).slice('sm-btn--'.length);
+    return {
+      root,
+      went,
+      state,
+      cleanup,
+      buttons: () =>
+        root
+          .querySelectorAll('.sm-btn')
+          .map((button) => `${button.querySelector('.sm-btn__label').textContent} [${style(button, /^sm-btn--(primary|secondary|ghost)$/)} ${style(button, /^sm-btn--(sm|md|lg)$/)}]`),
+      text: () => root.textContent,
+    };
+  }
+
+  test('with neither photo way on, typing in a size is the way in, and nothing promises a photo', () => {
+    // "AR is enough": on an iPhone, or any phone without ARCore, AR never appears.
+    for (const methods of [{ ar: true, camera: false, paper: false }, { ar: false, camera: false, paper: false }]) {
+      const browser = fakeBrowser();
+      try {
+        const screen = mountWelcome(browser, methods);
+        const label = JSON.stringify(methods);
+        assert.deepEqual(screen.buttons(), [`${strings['welcome.enterSize']} [primary lg]`], label);
+        const text = screen.text();
+        assert.ok(text.includes(strings['welcome.manualOnly.title']) && text.includes(strings['welcome.manualOnly.subtitle']), label);
+        assert.doesNotMatch(text, /photo|camera|snap|no paper|null/i, label);
+        assert.ok(!text.includes(strings['welcome.standardNote']), 'a typed-in size is matched to nothing');
+
+        screen.root.querySelector('.sm-btn').click();
+        assert.equal(screen.state.manualEntry, true);
+        assert.deepEqual(screen.went, ['result']);
+        screen.cleanup();
+      } finally {
+        browser.uninstall();
+      }
+    }
+  });
+
+  test('on a phone with AR, AR goes on top and typing in a size becomes the second button', async () => {
+    const browser = fakeBrowser({ xr: { isSessionSupported: async (mode) => mode === 'immersive-ar' } });
+    try {
+      const screen = mountWelcome(browser, { ar: true, camera: false, paper: false });
+      await browser.settle();
+      assert.deepEqual(screen.buttons(), [`${strings['welcome.ar']} [primary lg]`, `${strings['welcome.enterSize']} [secondary md]`]);
+      screen.cleanup();
+    } finally {
+      browser.uninstall();
+    }
+  });
+
+  test('once AR has been refused on this page, it is offered second, under the main way in, which keeps its look', async () => {
+    const browser = fakeBrowser({ xr: { isSessionSupported: async (mode) => mode === 'immersive-ar' } });
+    try {
+      // The phone said it could, then would not start a session (js/screens/ar.js).
+      noteArRefused();
+      const screen = mountWelcome(browser, { ar: true, camera: true, paper: true });
+      await browser.settle();
+      assert.deepEqual(screen.buttons(), [
+        `${strings['welcome.camera']} [primary lg]`,
+        `${strings['welcome.ar']} [secondary md]`,
+        `${strings['welcome.demo']} [secondary md]`,
+        `${strings['welcome.paper']} [ghost sm]`,
+        `${strings['welcome.manual']} [ghost sm]`,
+      ]);
+      screen.root.querySelectorAll('.sm-btn')[1].click();
+      assert.deepEqual(screen.went, ['ar']);
+      screen.cleanup();
+    } finally {
+      browser.uninstall();
+      resetArSupport();
+    }
+  });
+
+  test('every other mix keeps its copy and buttons, with no stray "null" where a note is left out', () => {
+    const demo = `${strings['welcome.demo']} [secondary md]`;
+    const manual = `${strings['welcome.manual']} [ghost sm]`;
+    const cases = [
+      {
+        methods: { ar: true, camera: true, paper: true },
+        title: 'welcome.title',
+        buttons: [`${strings['welcome.camera']} [primary lg]`, demo, `${strings['welcome.paper']} [ghost sm]`, manual],
+        notes: ['welcome.standardNote', 'welcome.privacy'],
+      },
+      {
+        methods: { ar: false, camera: true, paper: false },
+        title: 'welcome.title',
+        buttons: [`${strings['welcome.camera']} [primary lg]`, demo, manual],
+        notes: ['welcome.standardNote', 'welcome.privacy'],
+      },
+      {
+        methods: { ar: true, camera: false, paper: true },
+        title: 'welcome.paperOnly.title',
+        buttons: [`${strings['welcome.start']} [primary lg]`, demo, manual],
+        notes: ['welcome.privacy'],
+      },
+      {
+        // Manual sizes off as well: measurementMethods keeps paper on (js/theme.js).
+        methods: { ar: true, camera: false, paper: false },
+        allowManualOverride: false,
+        title: 'welcome.paperOnly.title',
+        buttons: [`${strings['welcome.start']} [primary lg]`, demo],
+        notes: ['welcome.privacy'],
+      },
+    ];
+    for (const { methods, allowManualOverride, title, buttons, notes } of cases) {
+      const browser = fakeBrowser();
+      try {
+        const screen = mountWelcome(browser, methods, { allowManualOverride });
+        const label = `${JSON.stringify(methods)}, manual ${allowManualOverride !== false}`;
+        assert.deepEqual(screen.buttons(), buttons, label);
+        const text = screen.text();
+        assert.ok(text.includes(strings[title]), label);
+        for (const key of ['welcome.standardNote', 'welcome.privacy']) assert.equal(text.includes(strings[key]), notes.includes(key), `${label}: ${key}`);
+        assert.doesNotMatch(text, /null/, label);
+        screen.cleanup();
+      } finally {
+        browser.uninstall();
+      }
+    }
   });
 });
 

@@ -351,6 +351,39 @@ export function orderQuad(points) {
   return keyed.map((_, i) => keyed[(start + i) % keyed.length].p);
 }
 
+/**
+ * Put a door opening's four corners into [TL, TR, BR, BL] order: orderQuad's clockwise cycle, started
+ * at the top-left corner of the OPENING rather than at the point nearest the photo's top-left.
+ *
+ * The two can differ for a door. Photographed 40-55 degrees off to one side and from below, with the
+ * phone rolled 15 degrees or more, the head can slope more than 45 degrees in the photo; its far end is
+ * then the corner with the smallest x + y, and orderQuad starts one corner round, which swaps width and
+ * height (an 820 x 2040 opening read as 0.40 high-to-wide). So the start comes from the outline's shape:
+ * the jambs are the pair of opposite sides nearer the photo's vertical (the phone is held upright, so
+ * they are far nearer it than the head and sill are, however the door is seen), and of the other pair
+ * the upper one is the head. For ordinary photos this is the same corner orderQuad picks.
+ *
+ * The same rule as cornersInOutlineOrder in js/screens/mark-common.js (the door screen's outline); used
+ * by measureDoor here and by the no-paper estimate (js/estimate.js), so all three agree on the corners.
+ *
+ * @param {Point[]} points four points in any order
+ * @returns {Quad} fresh points; anything but four points comes back as orderQuad gives it
+ */
+export function orderDoorQuad(points) {
+  const q = orderQuad(points);
+  if (q.length !== 4) return q;
+  // Side i runs from corner i to corner i + 1, clockwise: 0 and 2 are opposite, as are 1 and 3.
+  const upright = q.map((a, i) => {
+    const b = q[(i + 1) % 4];
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    return length > 0 ? Math.abs(b.y - a.y) / length : 0;
+  });
+  const across = upright[0] + upright[2] <= upright[1] + upright[3] ? [0, 2] : [1, 3];
+  const meanY = (i) => (q[i].y + q[(i + 1) % 4].y) / 2;
+  const head = meanY(across[0]) <= meanY(across[1]) ? across[0] : across[1];
+  return [...q.slice(head), ...q.slice(0, head)];
+}
+
 /** 'convex' | 'not_convex' | 'degenerate' for a quad given in drawing order. */
 function classifyQuad(q) {
   if (!q || q.length !== 4 || !q.every(isFinitePoint)) return 'degenerate';
@@ -946,7 +979,7 @@ const isFourPoints = (pts) => Array.isArray(pts) && pts.length === 4 && pts.ever
  *   gap between the two candidate answers when portrait vs landscape cannot be decided safely.
  * - sheetOnly is the independent cross-check. If the sheet-only homography puts a door corner beyond its
  *   horizon the lengths are meaningless: `valid` is false and the numbers are null.
- * - doorFitPx / sheetFitPx line up index by index with orderQuad(doorPx) / orderQuad(sheetPx).
+ * - doorFitPx / sheetFitPx line up index by index with orderDoorQuad(doorPx) / orderQuad(sheetPx).
  * - fit.orientationMargin: how decisively portrait vs landscape was chosen for the sheet (chi-square-like
  *   units, never negative; null for a square sheet). Under QUALITY_THRESHOLDS.orientationMinMargin the
  *   choice is unsafe: the door may really be the other candidate size, which differs by the sheet's
@@ -994,7 +1027,9 @@ function measure(input) {
   const sigmaDoor = positiveOr(input.sigmaDoorPx, 2.5);
   const plausible = { ...DEFAULT_PLAUSIBLE, ...(input.plausible || {}) };
 
-  const door = orderQuad(input.doorPx);
+  // The door by its own shape (head on top), so a steep, rolled view cannot swap width and height; the
+  // sheet's way round is worked out by the fit, so any start of its cycle will do.
+  const door = orderDoorQuad(input.doorPx);
   const sheet = orderQuad(input.sheetPx);
   const doorShape = classifyQuad(door);
   if (doorShape === 'not_convex') return fail('not_convex', 'The door corners do not form a simple four-sided shape.');

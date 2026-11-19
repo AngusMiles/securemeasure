@@ -18,7 +18,8 @@ import { toLuma } from './vision.js';
  *                                       sources, live video frames; iOS `<input capture>` strips EXIF; EXIF
  *                                       whose recorded pixel size has another shape, i.e. a cropped copy).
  *                                       Use it through photoFocal (js/estimate.js), which also checks the
- *                                       photo still has a whole camera frame's shape.
+ *                                       photo still has a whole camera frame's shape, and for a picked file
+ *                                       ('file') takes it only as a best guess.
  * @property {'live'|'frame'|'file'|'demo'} capture  how the photo was taken: ImageCapture.takePhoto() ('live'),
  *                                       a grabbed video frame ('frame'), a picked or camera-app file ('file'),
  *                                       or the bundled demo photo ('demo')
@@ -65,6 +66,8 @@ export async function loadPhoto(source, config, { isDemo = false, capture = 'fil
       // a picked file may have been cropped in a gallery app that kept the camera's EXIF. readJpegInfo drops
       // the focal when EXIF's own pixel size has another shape, and photoFocal (js/estimate.js) uses it only
       // for a whole-frame shape (4:3 or 3:2), so a crop falls back to the phone prior and its wider sigma.
+      // A crop that keeps the 4:3 shape passes both checks, so for capture 'file' photoFocal takes even a
+      // whole-frame figure only as a best guess; `capture` is what tells our own captures apart.
       focal35mm: decoded.focal35mm,
       capture: isDemo ? 'demo' : CAPTURE_KINDS.has(capture) ? capture : 'file',
       _luma: null,
@@ -155,6 +158,7 @@ export function setPhoto(state, photo) {
   if (previous && previous !== photo && previous.canvas) releaseCanvas(previous.canvas);
   state.photo = photo;
   state.sheet = { points: null, refined: false, detected: false };
+  // A new object, so the screens' extra door fields for the last photo (prior, byHand, chosen) go too.
   state.door = { points: null, detection: null };
   state.measure = null;
   state.size = null;

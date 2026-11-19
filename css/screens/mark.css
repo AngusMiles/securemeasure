@@ -340,6 +340,45 @@
   visibility: hidden;
 }
 
+/* ---------- Action bar on a short screen (door screen) ---------- */
+
+/* A phone on its side leaves the door screen about 300px of height. Three full-width rows (measure,
+   "Not this? Show the next outline", back) take about 180px of it, and the photo is left a strip
+   13-53px tall that the floating Fit and help buttons cover, so no corner can be seen or dragged. On a
+   short screen the bar is one row: the measure button keeps its label, and the other two shrink to
+   their icons. Their labels are only visually hidden, so screen readers still name the buttons. */
+@media (max-height: 500px) {
+  .sm-mark .sm-mark__doorbar {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .sm-mark .sm-mark__doorbar > .sm-btn {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+  }
+
+  .sm-mark .sm-mark__doorbar > .sm-mark__compact {
+    flex: none;
+    width: 48px;
+    padding: 0;
+  }
+
+  .sm-mark .sm-mark__doorbar > .sm-mark__compact .sm-btn__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
 /* ---------- Help sheet content (door screen) ---------- */
 
 .sm-mark.sm-mark--help {

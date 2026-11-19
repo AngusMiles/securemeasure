@@ -160,6 +160,53 @@ export function interruptedPhotoScreen(entry) {
   return entry.picking && typeof entry.picking === 'object' ? entry.screen : null;
 }
 
+/**
+ * A new token for one page load and one measuring session. The router writes it into every history
+ * entry it makes (see `session` in startApp), and makes a new one for each page load and each
+ * "Start again".
+ *
+ * @returns {string}
+ */
+export function newSessionToken() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * True when history entry `entry` was written by the session holding token `session`.
+ *
+ * Anything else names a screen of a journey that is gone: an entry from an earlier page load (a reload,
+ * or a tab the phone discarded and loaded again), from the session "Start again" ended, or from a version
+ * of the app from before entries carried a session. The browser keeps those entries around the one the
+ * page starts in, and Back and Forward still land on them.
+ *
+ * @param {unknown} entry   history.state
+ * @param {string} session  the current session's token (newSessionToken)
+ * @returns {boolean}
+ */
+export function isSessionEntry(entry, session) {
+  return Boolean(entry) && typeof entry === 'object' && typeof session === 'string' && entry.session === session;
+}
+
+/**
+ * The screen a Back or Forward press asks for when it lands on history entry `entry`.
+ *
+ * An entry of this session asks for the screen it names. An entry of a journey that is gone (see
+ * isSessionEntry) does not, because nothing is left behind that screen: followed, it would open a way in
+ * nobody chose (the paper method's "Get set up", the AR card on an iPhone), or start the live camera, or
+ * its permission prompt, while the customer is trying to leave. So Back asks for the welcome screen, and
+ * Forward for the screen already showing: a Forward press onto such an entry changes nothing.
+ *
+ * @param {unknown} entry      history.state of the entry landed on
+ * @param {string} session     the current session's token
+ * @param {boolean} goingBack  true for a Back move
+ * @param {string} showing     the id of the screen on show
+ * @returns {string} a screen id, for resolveScreenId
+ */
+export function requestedScreen(entry, session, goingBack, showing) {
+  if (isSessionEntry(entry, session)) return /** @type {{ screen: string }} */ (entry).screen;
+  return goingBack ? 'welcome' : showing;
+}
+
 const TOAST_ICONS = { info: 'info', success: 'check', error: 'alert' };
 const MAX_TOASTS = 3;
 /** How long to wait for the browser to report a history.go() before navigating without it. */
@@ -195,7 +242,15 @@ export function createInitialState(config) {
     photo: null,
     sheet: { points: null, refined: false, detected: false },
     // detection: findDoor()'s result for the current photo, or null until it has run (js/door-find.js).
+    // The screens add, for the same photo: `prior` (capture.js: the framing guide in photo px, for the
+    // door screen's search after a timeout), `byHand` (boolean[4]: which corners the customer placed) and
+    // `chosen` (an outline picked with "Show the next outline"), both written by door.js. A new photo
+    // (setPhoto) starts again from this shape, which clears them.
     door: { points: null, detection: null },
+    // true once capture.js's live camera has worked this session, false once it failed, null until then;
+    // result-standard.js offers "Retake photo" with the camera here only when true (null or false: the
+    // camera app). It describes the phone, not the photo, so setPhoto() leaves it alone.
+    liveCamera: null,
     measure: null,
     size: null,
     quoteInput: { productId: null, selections: {}, includeInstallation: null },
@@ -326,6 +381,12 @@ function startApp(config, els) {
   let travelling = null;
   /** The history idx of the entry the visible screen belongs to; tells a Back move from a Forward one. */
   let shownIdx = 0;
+  /**
+   * This page load's and this session's mark on every history entry it writes. A page load starts
+   * among the entries the last one left, and "Start again" leaves the old session's entries ahead of
+   * the welcome screen; the popstate handler never routes by an entry without this mark (requestedScreen).
+   */
+  let session = newSessionToken();
 
   function historyIndex() {
     const entry = history.state;
@@ -335,8 +396,8 @@ function startApp(config, els) {
   /** Sandboxed iframes and rapid-fire calls can make the History API throw; navigation must still happen. */
   function writeHistory(screen, idx, push) {
     try {
-      if (push) history.pushState({ screen, idx }, '');
-      else history.replaceState({ screen, idx }, '');
+      if (push) history.pushState({ screen, idx, session }, '');
+      else history.replaceState({ screen, idx, session }, '');
     } catch (error) {
       console.warn(`${LOG_PREFIX} history update failed`, error);
       return;
@@ -392,8 +453,13 @@ function startApp(config, els) {
   function setPickerNote(note) {
     const entry = history.state;
     if (!entry || typeof entry.screen !== 'string' || (!note && !entry.picking)) return;
+    // Everything else on the entry stays, its session mark above all: without it the entry would read
+    // as one an earlier page load left (isSessionEntry).
+    const next = { ...entry };
+    if (note) next.picking = note;
+    else delete next.picking;
     try {
-      history.replaceState(note ? { ...entry, picking: note } : { screen: entry.screen, idx: entry.idx }, '');
+      history.replaceState(next, '');
     } catch (error) {
       console.warn(`${LOG_PREFIX} history update failed`, error);
     }
@@ -710,6 +776,9 @@ function startApp(config, els) {
     // in flight, a photo still decoding) can then no longer write into the new session.
     state = createInitialState(config);
     ctx.state = state;
+    // The old session's entries stay in the history, ahead of the welcome screen; from now on Forward
+    // onto one changes nothing instead of replaying its screens (requestedScreen).
+    session = newSessionToken();
   }
 
   /** Drop the session, show the first screen in history entry `idx`, then step back to our first entry. */
@@ -751,18 +820,24 @@ function startApp(config, els) {
       startOver(idx);
       return;
     }
-    // A move we started ourselves ends on the screen it was started for, whatever the entry says.
-    const target = resolveScreen(bound ? bound.screen : entry.screen);
     const goingBack = idx < shownIdx;
-    if (target !== entry.screen) writeHistory(target, idx, false);
+    // An entry an earlier page load or session left is never followed by the screen it names.
+    const own = isSessionEntry(entry, session);
+    const showing = current ? current.id : 'welcome';
+    // A move we started ourselves ends on the screen it was started for, whatever the entry says.
+    const target = resolveScreen(bound ? bound.screen : requestedScreen(entry, session, goingBack, showing));
+    // Rewritten, the entry also takes this session's mark: it now holds a screen of this session.
+    if (target !== entry.screen || !own) writeHistory(target, idx, false);
     else trail[idx] = target;
     shownIdx = idx;
     if (!current || current.id !== target) {
       show(target);
-    } else if (!bound && goingBack && idx > 0) {
+    } else if (!bound && goingBack && (idx > 0 || !own)) {
       // Back landed on an entry that can no longer be entered and falls back to the screen already
       // showing (the result after a corner was moved, the manual-entry screen after switching to the
       // camera). A Back press must always go somewhere, so carry on to the entry before this one.
+      // The same goes for an old journey's entry under the welcome screen, all the way down: for the
+      // customer, Back on the welcome screen leaves the app, however many such entries lie between.
       travel(-1, null, null, trip && trip.next);
       return;
     }
@@ -827,6 +902,9 @@ function startApp(config, els) {
   // Start from the first screen: state does not survive a reload, and any incoming hash is ignored.
   // The one exception is a reload the customer never asked for, when the phone closed the page while
   // they were taking the photo: go back to that step, with their sheet choice, and say what happened.
+  // Either way the page keeps the history entry it loaded into, at its own idx: after a reload, or a
+  // tab the phone discarded, the entries around it are the last page load's, and with idx 0 here an
+  // older entry would look like one ahead of this one, and Back like Forward.
   const restored = restoreInterruptedPhoto();
   if (restored) {
     // The entries underneath are still the old session's, so Back from here leads to the first screen.
@@ -834,7 +912,7 @@ function startApp(config, els) {
     show(restored, { initial: true });
     toast(t('common.photoInterrupted', { choose: chooseLabel(restored) }), { duration: 12000 });
   } else {
-    writeHistory('welcome', 0, false);
+    writeHistory('welcome', historyIndex(), false);
     show('welcome', { initial: true });
   }
 }

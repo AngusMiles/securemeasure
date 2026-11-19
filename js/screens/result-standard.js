@@ -4,8 +4,9 @@
  *  - estimate: one photo, no paper. The door's corners give its height-to-width ratio, and that ratio
  *    is matched to the company's catalogue of standard sizes (js/estimate.js). A photo with no scale in
  *    it cannot give real millimetres, so this mode never shows any: it shows the nearest standard
- *    size, lets the customer pick between the few sizes that fit the photo, and says plainly that a
- *    check measure confirms it.
+ *    size, lets the customer pick between the few sizes that fit the photo (each labelled with its
+ *    height, 'Standard height', 'Tall' or 'Extra tall', when they differ in height by enough to see),
+ *    and says plainly that a check measure confirms it.
  *  - ar: the phone's AR camera measured the opening (js/screens/ar.js). Those are real millimetres,
  *    but only to within a few centimetres, so the measurement is shown as an "AR estimate" and, when it
  *    sits close to a standard size, the customer can choose that size instead.
@@ -20,7 +21,7 @@
  * Nothing touches the DOM at import time: the pure helpers are tested under Node (tests/result.test.mjs).
  */
 import { applyMeasurementRules, formatLength } from '../quote.js';
-import { planeToImageFor } from '../estimate.js';
+import { planeToImageFor, standardSizesFrom } from '../estimate.js';
 import { createPreview } from './result-preview.js';
 
 /** Default copy for the estimate and AR modes; any key can be overridden through config.text. */
@@ -43,8 +44,28 @@ export const strings = {
   'result.estimate.choices.hint': 'These standard sizes fit your photo best. Pick the one that looks right.',
   'result.estimate.mostLikely': 'Most likely',
   'result.estimate.alsoPossible': 'Also possible',
+  // Which of the company's heights each size on the list is (heightFamilies): the lowest heights in the
+  // catalogue, the next ones up that look taller, and anything above those. Shown only when the sizes on
+  // the list differ in height by that much (choiceHeightFamilies).
+  'result.estimate.height.standard': 'Standard height',
+  'result.estimate.height.tall': 'Tall',
+  'result.estimate.height.extraTall': 'Extra tall',
+  // A size's badge with its height ('Most likely · Standard height'). The no-break space keeps the dot
+  // from starting a line when the badge wraps on a narrow phone.
+  'result.estimate.badgeWithHeight': '{badge} · {height}',
+  // Unsure between sizes of about the same height: nothing the customer can check at a glance.
   'result.estimate.unsure':
     "We can't be sure between these sizes from one photo. Pick the one that looks most like your door. We confirm the exact size with a check measure.",
+  // Unsure between sizes of different heights, which the customer can tell apart by looking at the door:
+  // one question for each set of heights the list can hold, naming only the heights on it.
+  'result.estimate.unsureHeight.standardTall':
+    'Is your door a standard height or tall? Pick the one that matches. We confirm the exact size with a check measure.',
+  'result.estimate.unsureHeight.standardExtraTall':
+    'Is your door a standard height or extra tall? Pick the one that matches. We confirm the exact size with a check measure.',
+  'result.estimate.unsureHeight.tallExtraTall':
+    'Is your door tall or extra tall? Pick the one that matches. We confirm the exact size with a check measure.',
+  'result.estimate.unsureHeight.standardTallExtraTall':
+    'Is your door a standard height, tall or extra tall? Pick the one that matches. We confirm the exact size with a check measure.',
   'result.estimate.unsureOne':
     "We can't match your door to a standard size with confidence from this photo. Check the corners, or retake the photo standing square to the door.",
   'result.estimate.nonStandard':
@@ -54,6 +75,23 @@ export const strings = {
     "The corners don't quite make a rectangle. Tap Adjust corners and put each one exactly where the door meets the frame.",
   'result.estimate.issue.steep_angle':
     'The photo was taken on an angle, which makes the estimate less certain. Stand square to the door, hold your phone upright and retake it.',
+  // The same issue for a photo the customer picked (measure.focalSource '..._file'), where it means a lens or
+  // a crop the photo may really have would change the answer, or (seen 10+ deg from the side) take away a
+  // sure match; the ordinary downward tilt alone does not set it (estimateIssueKeys). One line for each
+  // thing that is unsure about the photo: with no EXIF ('prior_file': iOS's camera app strips it) the lens
+  // is unknown; with EXIF ('exif_file') the lens is named but the photo may since have been cropped or
+  // zoomed. Each in two forms: the camera on the
+  // Retake photo screen is a known lens, so it is offered when it has worked on this phone ('...file' and
+  // '...crop'); where it has not (camera blocked, an in-app browser), the camera app is the only way to
+  // retake the photo, so the '..._app' lines say how to take it there instead.
+  'result.estimate.issue.steep_angle_file':
+    "We can't tell which lens took this photo, and at this angle that matters. For a better estimate, tap Retake photo, stand square to the door and take it with the camera there.",
+  'result.estimate.issue.steep_angle_file_app':
+    "We can't tell which lens took this photo, and at this angle that matters. For a better estimate, take it again with your camera app: stand square to the door, hold your phone upright, use the 1x lens and don't zoom or crop.",
+  'result.estimate.issue.steep_angle_crop':
+    "We can't tell whether this photo was cropped or zoomed, and at this angle that matters. For a better estimate, tap Retake photo, stand square to the door and take it with the camera there.",
+  'result.estimate.issue.steep_angle_crop_app':
+    "We can't tell whether this photo was cropped or zoomed, and at this angle that matters. For a better estimate, take it again with your camera app: stand square to the door, hold your phone upright, use the 1x lens and don't zoom or crop.",
   'result.estimate.issue.door_small':
     'The door looks small in your photo. Step closer so it fills most of the frame, then retake it.',
   'result.estimate.issue.door_near_edge':
@@ -382,19 +420,175 @@ export function choiceBadgeKey(index) {
   return index === 0 ? 'result.estimate.mostLikely' : 'result.estimate.alsoPossible';
 }
 
+/* Height families ---------------------------------------------------- */
+
+/** The height families, lowest first: the catalogue's lowest heights, the next, and all the rest. */
+export const HEIGHT_FAMILIES = Object.freeze(['standard', 'tall', 'extraTall']);
+
+/**
+ * Catalogue heights less than this apart look the same on a door, so they are one family. The
+ * families are there to ask a question the customer can answer by looking at the door, without a
+ * tape: 2040 against 2340 mm (300 mm, about 15 %) is plain to see, but 2040 against 2100 (the
+ * Australian standard and its taller size, 60 mm or 3 %) or 2032 against 2134 (80 in and 7 ft, 102 mm
+ * or 5 %) is not, and labelling those 'Standard height' and 'Tall' would steer a customer whose door
+ * looks ordinary to the shorter size whatever its real height.
+ */
+export const HEIGHT_FAMILY_MERGE_MM = 150;
+
+/**
+ * A size's height counts as one of the catalogue's heights when it is within this of it (heightFamilyOf).
+ * Every size the estimate offers is a catalogue size, so this only keeps a label off a height that is
+ * not, where it would be a guess.
+ */
+export const HEIGHT_MATCH_MM = 20;
+
+/**
+ * The catalogue's height families, lowest first.
+ *
+ * Most of the doubt a no-paper photo leaves is between sizes of nearly the same shape: 820 x 2040,
+ * the most common Australian door, is within about 2 % of 920 x 2340 in height-to-width ratio, so it
+ * is almost never matched with confidence. Those sizes differ mostly in height, though, and whether a
+ * door is a standard height or 300 mm taller is something the customer can tell at a glance. So each
+ * size on the list says which of the company's heights it is, and the banner asks that question, when
+ * the sizes on the list differ in height by that much (choiceHeightFamilies).
+ *
+ * The families come from the company's own distinct heights (standardSizesFrom(config)), grouped so
+ * that heights which look the same are one family (HEIGHT_FAMILY_MERGE_MM): the lowest group is
+ * 'standard', the next 'tall', and every group above that 'extraTall'. So the Australian catalogue's
+ * 2040 and 2100 are both 'standard' and 2340 is 'tall'. A catalogue whose heights all look the same
+ * has no families, and the list then shows no height labels.
+ *
+ * Each height joins the group of the next one down when the two are less than HEIGHT_FAMILY_MERGE_MM
+ * apart, so heights in two different families are always at least that far apart: a label or a
+ * question never splits two sizes the customer cannot tell apart. A run of close heights (2040, 2100,
+ * 2160 ...) is therefore one family even where its ends differ by more, and its sizes go unlabelled
+ * rather than labelled by a difference nobody can see.
+ *
+ * @param {unknown} sizes  the catalogue, [{ widthMm, heightMm }]
+ * @returns {Array<{ id: 'standard' | 'tall' | 'extraTall', heightsMm: number[] }>}  [] for one height
+ */
+export function heightFamilies(sizes) {
+  const heights = [...new Set((Array.isArray(sizes) ? sizes : []).map((size) => Number(size?.heightMm)))]
+    .filter(isLength)
+    .sort((a, b) => a - b);
+  const groups = [];
+  for (const heightMm of heights) {
+    const group = groups[groups.length - 1];
+    if (group && heightMm - group[group.length - 1] < HEIGHT_FAMILY_MERGE_MM) group.push(heightMm);
+    else groups.push([heightMm]);
+  }
+  if (groups.length < 2) return [];
+  return [groups[0], groups[1], groups.slice(2).flat()]
+    .map((heightsMm, index) => ({ id: HEIGHT_FAMILIES[index], heightsMm }))
+    .filter((family) => family.heightsMm.length > 0);
+}
+
+/**
+ * The height family of a size on the list: the family of the nearest catalogue height, or null when
+ * the catalogue has one height (no families) or the height is not one of its heights, give or take
+ * HEIGHT_MATCH_MM (a label would then be a guess).
+ *
+ * @param {number} heightMm  a choice's height (estimateChoices: a catalogue height)
+ * @param {ReturnType<typeof heightFamilies>} families
+ * @returns {'standard' | 'tall' | 'extraTall' | null}
+ */
+export function heightFamilyOf(heightMm, families) {
+  const height = Number(heightMm);
+  if (!isLength(height) || !Array.isArray(families)) return null;
+  let best = null;
+  let bestGap = Infinity;
+  for (const family of families) {
+    for (const familyHeight of Array.isArray(family?.heightsMm) ? family.heightsMm : []) {
+      const gap = Math.abs(familyHeight - height);
+      if (gap < bestGap) {
+        best = family.id;
+        bestGap = gap;
+      }
+    }
+  }
+  return bestGap <= HEIGHT_MATCH_MM && HEIGHT_FAMILIES.includes(best) ? best : null;
+}
+
+/**
+ * The height label each size on the list shows (heightFamilyOf), or none at all when the sizes on
+ * offer are all of one family. A label is there to tell the sizes apart by something the customer can
+ * see; on a list of one height it would tell them apart by nothing, and the banner then asks no height
+ * question either (heightQuestionKey). The labels and the question always go together.
+ *
+ * @param {Array<{ heightMm: number }>} choices  estimateChoices(measure)
+ * @param {ReturnType<typeof heightFamilies>} families  heightFamilies(the catalogue)
+ * @returns {Array<'standard' | 'tall' | 'extraTall' | null>}  one per choice
+ */
+export function choiceHeightFamilies(choices, families) {
+  const each = (Array.isArray(choices) ? choices : []).map((choice) => heightFamilyOf(choice?.heightMm, families));
+  return heightQuestionKey(each) ? each : each.map(() => null);
+}
+
+/** The string key of a height family's label, or null for anything else. */
+export function heightFamilyKey(family) {
+  return HEIGHT_FAMILIES.includes(family) ? `result.estimate.height.${family}` : null;
+}
+
+/**
+ * The badge text on choice `index` of "Which is your door?": 'Most likely' or 'Also possible', with the
+ * size's height family when it has one ('Most likely · Standard height'). The badge is inside the
+ * option's <label>, so screen readers read the height as part of the radio button's name.
+ *
+ * The height label's spaces are no-break spaces: on a 320 px phone the badge wraps, and it should
+ * wrap after the dot ('Also possible ·' / 'Standard height'), never inside the height.
+ *
+ * @param {(key: string, vars?: object) => string} t  ctx.t
+ * @param {number} index  the choice's place in the list
+ * @param {string | null} [family]  the choice's entry in choiceHeightFamilies(choices, families)
+ * @returns {string}
+ */
+export function choiceBadgeText(t, index, family = null) {
+  const badge = t(choiceBadgeKey(index));
+  const heightKey = heightFamilyKey(family);
+  if (!heightKey) return badge;
+  return t('result.estimate.badgeWithHeight', { badge, height: t(heightKey).replace(/ /g, ' ') });
+}
+
+// The height question for each set of families a list can span, keyed by the families in
+// HEIGHT_FAMILIES order. Whole sentences rather than one assembled from parts, so each reads (and
+// translates through config.text) naturally, and names only the heights the customer can pick.
+const HEIGHT_QUESTIONS = Object.freeze({
+  'standard tall': 'result.estimate.unsureHeight.standardTall',
+  'standard extraTall': 'result.estimate.unsureHeight.standardExtraTall',
+  'tall extraTall': 'result.estimate.unsureHeight.tallExtraTall',
+  'standard tall extraTall': 'result.estimate.unsureHeight.standardTallExtraTall',
+});
+
+/**
+ * The banner asking which height the door is, for the height families of the sizes on offer; null
+ * when they are all one height (or have none), where asking would not help.
+ *
+ * @param {unknown} families  the family of each offered size (heightFamilyOf; null for none)
+ * @returns {string | null} a string key
+ */
+export function heightQuestionKey(families) {
+  const present = new Set(Array.isArray(families) ? families : []);
+  const spanned = HEIGHT_FAMILIES.filter((family) => present.has(family));
+  return spanned.length > 1 ? HEIGHT_QUESTIONS[spanned.join(' ')] : null;
+}
+
 /**
  * The warning banner the estimate shows, or null when it is confident. A door that matches no
- * standard size well is the bigger problem, so it wins over plain uncertainty; uncertainty is worded
- * for whether there is a list of sizes to choose from.
+ * standard size well is the bigger problem, so it wins over plain uncertainty. Uncertainty is worded
+ * for whether there is a list of sizes to choose from and, when there is, whether the sizes on it
+ * differ in height: that is a question the customer can answer by looking at the door, so it is asked
+ * plainly (heightFamilies explains why this is the usual case).
  *
  * @param {object} measure  the estimate measure
  * @param {number} choiceCount  estimateChoices(measure).length
+ * @param {Array<string | null>} [choiceFamilies]  the height family of each choice (choiceHeightFamilies)
  * @returns {string | null} a string key
  */
-export function estimateBannerKey(measure, choiceCount) {
+export function estimateBannerKey(measure, choiceCount, choiceFamilies = []) {
   if (measure?.nonStandard === true) return 'result.estimate.nonStandard';
   if (measure?.confident === true) return null;
-  return choiceCount > 1 ? 'result.estimate.unsure' : 'result.estimate.unsureOne';
+  if (!(choiceCount > 1)) return 'result.estimate.unsureOne';
+  return heightQuestionKey(choiceFamilies) ?? 'result.estimate.unsure';
 }
 
 /**
@@ -409,9 +603,36 @@ export function issueKeys(codes, known, prefix) {
   return known.filter((code) => present.has(code)).map((code) => `${prefix}${code}`);
 }
 
-/** The estimate's issue lines (string keys). */
-export function estimateIssueKeys(measure) {
-  return issueKeys(measure?.issues, ESTIMATE_ISSUES, 'result.estimate.issue.');
+// 'steep_angle' on a picked photo, by its focalSource and by whether the live camera can retake it
+// (see the strings above).
+const STEEP_ANGLE_FILE_KEYS = Object.freeze({
+  prior_file: { live: 'result.estimate.issue.steep_angle_file', app: 'result.estimate.issue.steep_angle_file_app' },
+  exif_file: { live: 'result.estimate.issue.steep_angle_crop', app: 'result.estimate.issue.steep_angle_crop_app' },
+});
+
+/**
+ * The estimate's issue lines (string keys).
+ *
+ * 'steep_angle' on a picked photo (focalSource 'exif_file' or 'prior_file', see photoFocal in
+ * js/estimate.js) gets its own line: there the lens or a crop is unknown, and it means one the photo may
+ * really have would change the answer, or (seen 10+ deg from the side) take away a sure match. (The
+ * ordinary downward tilt of a phone aimed at the door's middle does not set it: see estimateFromCorners.)
+ * Taking the photo with our own camera clears that unknown, but only when our camera works on this
+ * phone: a customer whose browser blocked it, or an in-app browser that has none, picked the photo
+ * because the camera app was the only way on, and Retake photo would only take them back there. So the camera here is offered only when it has gone
+ * live (`liveCamera`, from state.liveCamera, which js/screens/capture.js sets); otherwise, and when that
+ * is not known, the line says how to take a better photo with the camera app.
+ *
+ * @param {object | null | undefined} measure  the estimate measure
+ * @param {{ liveCamera?: boolean }} [options]  liveCamera: the capture screen's live camera has worked
+ * @returns {string[]}
+ */
+export function estimateIssueKeys(measure, { liveCamera = false } = {}) {
+  const picked = STEEP_ANGLE_FILE_KEYS[measure?.focalSource];
+  return issueKeys(measure?.issues, ESTIMATE_ISSUES, 'result.estimate.issue.').map((key) => {
+    if (!picked || key !== 'result.estimate.issue.steep_angle') return key;
+    return liveCamera === true ? picked.live : picked.app;
+  });
 }
 
 /** The AR measurement's warning lines (string keys). */
@@ -555,7 +776,7 @@ function createIssues(ctx, { title, lines }) {
     ui.card(
       // 'fair' is the warning tone: each line is something to fix. Whether the size itself can be trusted
       // is the banner's job, not this card's: an estimate with not_rectangular or door_near_edge is also
-      // not confident (js/estimate.js), so estimateBannerKey shows the unsure banner above it.
+      // not confident (js/estimate.js), so estimateBannerKey shows an unsure banner above it.
       { dataset: { level: 'fair' } },
       h('h2', { class: 'sm-result__issues-title', text: title }),
       h(
@@ -702,7 +923,12 @@ export function mountEstimate(root, ctx) {
     onRestore: () => flow.choose(offered[shown], { reveal: true }),
   });
 
-  const bannerKey = estimateBannerKey(measure, choices.length);
+  // Which of the company's heights each offered size is: shown on the list, and an unsure estimate whose
+  // sizes differ in height asks the customer which height their door is (heightFamilies explains why).
+  // Neither when the sizes on offer all look the same height (choiceHeightFamilies).
+  const choiceFamilies = choiceHeightFamilies(choices, heightFamilies(standardSizesFrom(config)));
+
+  const bannerKey = estimateBannerKey(measure, choices.length, choiceFamilies);
   const banner = bannerKey ? addClass(ui.banner(t(bannerKey), { tone: 'warning' }), 'sm-result__banner') : null;
 
   /* "Which is your door?": only worth asking when the photo fits more than one size */
@@ -713,7 +939,7 @@ export function mountEstimate(root, ctx) {
           options: choices.map((choice, index) => ({
             value: choice.key,
             title: t('result.size', vars(choice)),
-            badge: t(choiceBadgeKey(index)),
+            badge: choiceBadgeText(t, index, choiceFamilies[index]),
           })),
           value: state.size.source === 'manual' ? null : choices[shown].key,
           onChange: (key) => {
@@ -740,7 +966,7 @@ export function mountEstimate(root, ctx) {
 
   const issuesCard = createIssues(ctx, {
     title: t('result.estimate.issues.title'),
-    lines: estimateIssueKeys(measure).map((key) => t(key)),
+    lines: estimateIssueKeys(measure, { liveCamera: state.liveCamera === true }).map((key) => t(key)),
   });
 
   const preview = createPreview(ui, { caption: t('result.estimate.preview.caption') });

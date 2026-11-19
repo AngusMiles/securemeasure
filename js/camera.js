@@ -16,6 +16,7 @@
  * under Node. startCamera / stopCamera / capturePhoto use browser APIs only when called, so importing
  * this module under Node is safe.
  */
+import { readJpegInfo } from './photo.js';
 
 /**
  * @typedef {{ x: number, y: number }} Point
@@ -61,6 +62,8 @@ const MIN_PRIOR_HEIGHT_FRACTION = 0.1;
 
 /** JPEG quality of a grabbed video frame: high, because the customer marks corners on it. */
 const FRAME_JPEG_QUALITY = 0.92;
+/** How much of a still capturePhoto reads for its EXIF orientation and frame size (both sit at the start). */
+const STILL_HEAD_BYTES = 256 * 1024;
 /**
  * How long startCamera waits for video.play(). A live stream normally starts playing at once; a play()
  * that never settles must not leave the screen stuck on "starting" (the screen also listens for the
@@ -203,8 +206,7 @@ export function mapRectToFrame(rect, fromW, fromH, toW, toH) {
   if (!isRect(rect) || !isPositive(fromW) || !isPositive(fromH) || !isPositive(toW) || !isPositive(toH)) return null;
   const fromAspect = fromW / fromH;
   const toAspect = toW / toH;
-  const nearSquare = (aspect) => Math.abs(Math.log(aspect)) <= Math.log(1 + SQUARE_TOLERANCE);
-  if (!nearSquare(fromAspect) && !nearSquare(toAspect) && fromAspect > 1 !== toAspect > 1) return null;
+  if (turnedAgainst(fromW, fromH, toW, toH)) return null;
 
   // Where the whole `from` picture lies in `to` px.
   let region;
@@ -227,6 +229,23 @@ export function mapRectToFrame(rect, fromW, fromH, toW, toH) {
     width: rect.width * sx,
     height: rect.height * sy,
   };
+}
+
+/**
+ * Whether one picture is portrait and the other landscape. A picture within SQUARE_TOLERANCE of square
+ * is neither, so it is never turned against anything. Sizes must be positive numbers.
+ *
+ * @param {number} aW
+ * @param {number} aH
+ * @param {number} bW
+ * @param {number} bH
+ * @returns {boolean}
+ */
+function turnedAgainst(aW, aH, bW, bH) {
+  const nearSquare = (aspect) => Math.abs(Math.log(aspect)) <= Math.log(1 + SQUARE_TOLERANCE);
+  const a = aW / aH;
+  const b = bW / bH;
+  return !nearSquare(a) && !nearSquare(b) && a > 1 !== b > 1;
 }
 
 /**
@@ -371,12 +390,20 @@ function namedError(name, message) {
  * If the camera would not start (NotReadableError: often a stream that is still closing, or another app;
  * AbortError; OverconstrainedError) it is asked once more with only `facingMode`.
  *
+ * `signal` lets the caller drop a request it no longer wants while the browser is still deciding: a
+ * prompt the page can be used around (Firefox for Android's, on the address bar) can be left unanswered
+ * for ever, so the screen must be able to ask again without waiting for it. getUserMedia itself cannot
+ * be called off, so once it settles an aborted request stops its stream at once, never touches `video`
+ * (a newer request's stream may be on it by then) and rejects with an 'AbortError'.
+ *
  * @param {HTMLVideoElement} video
+ * @param {{ signal?: AbortSignal }} [options]
  * @returns {Promise<{ stream: MediaStream, track: MediaStreamTrack, playing: boolean }>}
  * @throws the getUserMedia error (classify it with cameraErrorKind), an 'InsecureContextError' on an http
- *   page, or a 'NotSupportedError' when this browser has no getUserMedia
+ *   page, a 'NotSupportedError' when this browser has no getUserMedia, or an 'AbortError' once `signal`
+ *   has aborted
  */
-export async function startCamera(video) {
+export async function startCamera(video, { signal } = {}) {
   const nav = globalThis.navigator;
   const devices = nav && nav.mediaDevices;
   if (!devices || typeof devices.getUserMedia !== 'function') {
@@ -385,13 +412,18 @@ export async function startCamera(video) {
     throw namedError('NotSupportedError', 'getUserMedia is not available');
   }
 
+  const dropped = () => Boolean(signal && signal.aborted);
   prepareVideo(video);
   let stream;
   try {
     stream = await devices.getUserMedia(cameraConstraints());
   } catch (error) {
-    if (!error || !RETRY_ERROR_NAMES.has(error.name)) throw error;
+    if (!error || !RETRY_ERROR_NAMES.has(error.name) || dropped()) throw error;
     stream = await devices.getUserMedia(plainConstraints());
+  }
+  if (dropped()) {
+    stopCamera(stream);
+    throw namedError('AbortError', 'the camera request was dropped');
   }
 
   const track = stream && typeof stream.getVideoTracks === 'function' ? stream.getVideoTracks()[0] : null;
@@ -464,6 +496,15 @@ export function stopCamera(stream) {
  * prior the caller noted belongs to the moment of the press. A video frame has no EXIF, so the estimate
  * assumes a typical phone lens.
  *
+ * The frame also stands in for a still that comes back turned against the live view (portrait when the
+ * video was landscape, or the other way round, once its EXIF orientation is applied). WebKit never sets
+ * the orientation of the connection its takePhoto() output uses, so on an iPhone or iPad held on its
+ * side the JPEG says the camera's default way up while the live frames follow the phone (seen in
+ * WebKit's AVVideoCaptureSource.mm); an Android camera that ignores JPEG_ORIENTATION does the same. Kept,
+ * that still would put the door on its side: the customer would mark a sideways door and the estimate
+ * would read its height-to-width ratio upside down. Which way to turn it back cannot be told from the
+ * file, whereas the frame is exactly what the customer saw.
+ *
  * The stream is left running; the caller stops it.
  *
  * @param {{ track: MediaStreamTrack | null, video: HTMLVideoElement, timeoutMs?: number }} options
@@ -477,7 +518,9 @@ export async function capturePhoto({ track, video, timeoutMs = 4000 } = {}) {
     if (typeof globalThis.ImageCapture === 'function' && track && track.readyState === 'live') {
       try {
         const blob = await withTimeout(takeStill(track), timeoutMs);
-        if (isUsableBlob(blob)) return { blob, capture: 'live' };
+        if (isUsableBlob(blob) && !(frame && (await stillTurnedAgainst(blob, frame.width, frame.height)))) {
+          return { blob, capture: 'live' };
+        }
       } catch {
         // Unsupported on this camera, the track ended, or too slow: the frame copied above still works.
       }
@@ -534,6 +577,31 @@ function rangeMaxSize(width, height) {
 /** @param {unknown} blob */
 function isUsableBlob(blob) {
   return Boolean(blob) && typeof blob === 'object' && typeof blob.size === 'number' && blob.size > 0;
+}
+
+/**
+ * Whether a still from takePhoto() shows the other way up from a video frame of frameW x frameH px, once
+ * its EXIF orientation is applied (as loadPhoto decodes it). A still whose header cannot be read (not a
+ * JPEG, cut short) gives no sign either way and counts as not turned.
+ *
+ * @param {Blob} blob
+ * @param {number} frameW
+ * @param {number} frameH
+ * @returns {Promise<boolean>}
+ */
+async function stillTurnedAgainst(blob, frameW, frameH) {
+  let info;
+  try {
+    info = readJpegInfo(new Uint8Array(await blob.slice(0, STILL_HEAD_BYTES).arrayBuffer()));
+  } catch {
+    return false;
+  }
+  if (!info || !isPositive(info.width) || !isPositive(info.height) || !isPositive(frameW) || !isPositive(frameH)) return false;
+  // EXIF orientations 5-8 turn the stored picture a quarter turn, which swaps its sides.
+  const quarterTurn = info.orientation >= 5 && info.orientation <= 8;
+  const shownW = quarterTurn ? info.height : info.width;
+  const shownH = quarterTurn ? info.width : info.height;
+  return turnedAgainst(shownW, shownH, frameW, frameH);
 }
 
 /**

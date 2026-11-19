@@ -26,7 +26,7 @@ import { applyMeasurementRules } from '../quote.js';
 import { nearestStandard, standardSizesFrom } from '../estimate.js';
 import { add, projectSegmentToCss, projectToCss, rayFromPoseMatrix } from '../xr-measure.js';
 import { createArFlow, outlineSegments, POINT_KEYS } from '../ar-flow.js';
-import { arSupported, isKnownInAppBrowser } from '../ar-support.js';
+import { arRefused, arSupported, isKnownInAppBrowser, noteArRefused, noteArStarted } from '../ar-support.js';
 
 /** Screen id. */
 export const id = 'ar';
@@ -611,8 +611,13 @@ export function mount(root, ctx) {
   let alive = true;
   /** true / false once known; null while arSupported() has not answered (the card assumes yes). */
   let supported = methods.ar === false || inApp ? false : null;
-  /** A session was refused (or failed to set up) on this visit: the other way on (cardAlternative) becomes the main one. */
-  let startFailed = false;
+  /**
+   * The last try was refused (or failed to set up) and no session has started since: the card says AR
+   * didn't start and the other way on (cardAlternative) becomes the main one. It starts from the
+   * page's record (arRefused), so coming back to this screen after a refusal does not put AR first
+   * again, and it is cleared as soon as a session is granted (beginSession).
+   */
+  let startFailed = arRefused();
   /** The session being started or running: see beginSession(). */
   let live = null;
   let startButton = null;
@@ -762,6 +767,8 @@ export function mount(root, ctx) {
         overlay.root.remove();
         if (!alive) return;
         startFailed = true;
+        // Remembered past this screen, so the welcome screen stops offering AR first (ar-support.js).
+        noteArRefused();
         renderCard();
         ctx.toast(t('ar.error.start'), { type: 'error', duration: ERROR_TOAST_MS });
         focusCardAction();
@@ -794,6 +801,12 @@ export function mount(root, ctx) {
     });
     flow.reset();
     session.addEventListener('end', () => onSessionEnd(s));
+    // Chrome granted the session, so AR did start this time: whatever refused it before (a dismissed
+    // prompt, a declined ARCore install, a setup that timed out) no longer stands, and the card must
+    // not say "AR didn't start" once this session ends. A setup failure below marks it again
+    // (endSession 'failed' -> onSessionEnd).
+    startFailed = false;
+    noteArStarted();
 
     // Show the overlay straight away, on "Find the floor" with only Cancel working, so the customer is
     // never left looking at a full-screen camera with no way out while the session is set up.
@@ -1166,7 +1179,10 @@ export function mount(root, ctx) {
       ctx.go('result');
       return;
     }
-    if (s.endReason === 'failed') startFailed = true;
+    if (s.endReason === 'failed') {
+      startFailed = true;
+      noteArRefused();
+    }
     renderCard();
     if (s.endReason === 'failed') {
       ctx.toast(t('ar.error.start'), { type: 'error', duration: ERROR_TOAST_MS });

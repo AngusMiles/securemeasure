@@ -154,6 +154,23 @@ export function manualAlternative(config) {
 }
 
 /**
+ * The manual-entry screen's "Measure with my camera instead" (or "... with a sheet of paper instead"):
+ * go to the alternative's screen and leave the state as it is. state.manualEntry stays on on purpose.
+ * A size typed here, and the quote priced from it, can still be ahead in the history (Get my price,
+ * then the quote's Edit, then this button), and the quote's Edit must find this form again. With
+ * manualEntry off the result screen could not be entered, so Edit would fall back to a measuring
+ * screen with nothing to show (the paper method's "Get set up"). setPhoto() and the AR finish turn
+ * manualEntry off as soon as there is a new measurement to show instead.
+ *
+ * @param {{ go: (id: string) => void }} ctx app context
+ * @param {{ target: string }} alternative what manualAlternative() returned
+ * @returns {void}
+ */
+export function measureInstead(ctx, alternative) {
+  ctx.go(alternative.target);
+}
+
+/**
  * Build the screen inside `root`.
  * @param {HTMLElement} root the empty <section> for this screen
  * @param {object} ctx app context (config, t, state, go, ui, ...)
@@ -547,14 +564,13 @@ function mountManualEntry(root, ctx) {
   getPrice.disabled = !form.getValues();
 
   const alternative = manualAlternative(config);
-  const measureInstead = alternative
+  // Not named measureInstead: a local of that name would shadow the module's measureInstead() inside
+  // the click handler, which would then call the button and throw (tests/result.test.mjs mounts this).
+  const measureInsteadButton = alternative
     ? ui.button(t(alternative.label), {
         variant: 'ghost',
         icon: alternative.icon,
-        onClick: () => {
-          state.manualEntry = false;
-          ctx.go(alternative.target);
-        },
+        onClick: () => measureInstead(ctx, alternative),
       })
     : null;
 
@@ -570,7 +586,7 @@ function mountManualEntry(root, ctx) {
     header,
     howTo,
     addClass(ui.card(null, form.el), 'sm-result__entry'),
-    ui.actionBar(getPrice, measureInstead),
+    ui.actionBar(getPrice, measureInsteadButton),
   );
   return undefined;
 }

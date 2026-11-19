@@ -7,6 +7,7 @@ import {
   applyHomography,
   invertHomography,
   orderQuad,
+  orderDoorQuad,
   isConvexQuad,
   quadArea,
   QUALITY_THRESHOLDS,
@@ -264,6 +265,36 @@ test('orderQuad handles rotated rectangles and camera views across the pose rang
   ]);
 });
 
+test('orderDoorQuad starts at the opening\'s top-left by its shape, even where orderQuad starts a corner round', () => {
+  const rand = mulberry32(11);
+  // Ordinary views: the same order as orderQuad.
+  for (const yawDeg of [-25, 0, 25]) for (const pitchDeg of [-15, 0, 15]) for (const rollDeg of [-8, 0, 8]) {
+    const scene = makeScene({ cam: { distanceMm: 2600, yawDeg, pitchDeg, rollDeg } });
+    const points = shuffled(scene.doorPx, rand);
+    assert.deepEqual(orderDoorQuad(points), orderQuad(points), `yaw ${yawDeg} pitch ${pitchDeg} roll ${rollDeg}`);
+  }
+  // 40-55 deg off to one side, from below, the phone rolled 15-20 deg: the head slopes past 45 deg, so its
+  // far end is the corner nearest the photo's top-left. Width and height must not swap.
+  let steep = 0;
+  for (const yawDeg of [40, 50, 55]) for (const pitchDeg of [15, 25, 35]) for (const rollDeg of [15, 20]) {
+    const label = `yaw ${yawDeg} pitch ${pitchDeg} roll ${rollDeg}`;
+    const scene = makeScene({ cam: { distanceMm: 2000, yawDeg, pitchDeg, rollDeg } });
+    const start = orderQuad(scene.doorPx)[0];
+    if (start.x !== scene.doorPx[0].x || start.y !== scene.doorPx[0].y) steep++;
+    for (let k = 0; k < 4; k++) {
+      const rotated = [...scene.doorPx.slice(k), ...scene.doorPx.slice(0, k)];
+      assert.deepEqual(orderDoorQuad(rotated), scene.doorPx, `${label}, rotated by ${k}`);
+      assert.deepEqual(orderDoorQuad([...rotated].reverse()), scene.doorPx, `${label}, rotated by ${k}, anticlockwise`);
+    }
+    const res = measureDoor({ ...input(scene), doorPx: shuffled(scene.doorPx, rand) });
+    assert.equal(res.ok, true, label);
+    assertClose(res.widthMm, 820, 0.01, `${label}: width`);
+    assertClose(res.heightMm, 2040, 0.01, `${label}: height`);
+    assertPointsClose(res.doorFitPx, scene.doorPx, 1e-6, `${label}: doorFitPx`);
+  }
+  assert.ok(steep > 0, 'some of these views do start orderQuad a corner round');
+});
+
 test('isConvexQuad accepts convex quads of either winding and rejects everything else', () => {
   const square = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
   assert.equal(isConvexQuad(square), true);
@@ -368,7 +399,7 @@ test('measureDoor returns consistent homographies and fitted corners', () => {
     assertPointsClose([applyHomography(res.imageToPlane, projectPoint(scene.P, q))], [q], 1e-6, 'imageToPlane');
   }
   // Fitted corners line up index by index with the ordered input corners.
-  assertPointsClose(res.doorFitPx, orderQuad(scene.doorPx), 1e-6, 'doorFitPx');
+  assertPointsClose(res.doorFitPx, orderDoorQuad(scene.doorPx), 1e-6, 'doorFitPx');
   assertPointsClose(res.sheetFitPx, orderQuad(scene.sheetPx), 1e-6, 'sheetFitPx');
   // The whole result survives JSON (no NaN / Infinity / undefined anywhere).
   assert.deepEqual(JSON.parse(JSON.stringify(res)), res);

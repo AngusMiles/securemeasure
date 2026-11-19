@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 
 import {
   DEFAULT_STANDARD_SIZES,
+  ESTIMATE_THRESHOLDS,
   PHONE_DEFAULT_F35,
   focalPxFrom35mm,
   isFullFrameAspect,
@@ -177,6 +178,68 @@ test('photoFocal: a believable EXIF 35 mm focal is used, anything else gets the 
   assert.ok(Number.isNaN(photoFocal(null).focalPx));
 });
 
+test("photoFocal: a picked file's EXIF is a best guess ('exif_file'); our own captures and the demo are trusted", () => {
+  const size = { width: 1536, height: 2048 };
+  const at = (f35) => focalPxFrom35mm(f35, 1536, 2048);
+  // takePhoto(), the demo's known lens, and (for compatibility) a photo object that does not say.
+  for (const capture of ['live', 'frame', 'demo', undefined]) {
+    assert.deepEqual(photoFocal({ ...size, focal35mm: 28, capture }), { focalPx: at(28), source: 'exif' }, String(capture));
+    assert.deepEqual(photoFocal({ ...size, focal35mm: null, capture }), { focalPx: at(26), source: 'prior' }, String(capture));
+  }
+  // A picked file: the same figure, as the centre of a guess, and the prior on a file is marked as such.
+  assert.deepEqual(photoFocal({ ...size, focal35mm: 28, capture: 'file' }), { focalPx: at(28), source: 'exif_file' });
+  assert.deepEqual(photoFocal({ ...size, focal35mm: null, capture: 'file' }), { focalPx: at(26), source: 'prior_file' });
+  assert.deepEqual(photoFocal({ width: 1600, height: 3000, focal35mm: 26, capture: 'file' }), { focalPx: focalPxFrom35mm(26, 1600, 3000), source: 'prior_file' }, 'a free crop still gets the prior');
+
+  // estimateFromCorners keeps the source, and a file's figure gets the prior's sigma, not the EXIF one.
+  const shot = doorShot({ widthMm: 820, heightMm: 2040, yawDeg: 12 });
+  const sigma = (focalSource) => estimateFromCorners({ ...shot, focalSource }).sigmaLnAspect;
+  for (const source of ['exif', 'prior', 'exif_file', 'prior_file']) assert.equal(estimateFromCorners({ ...shot, source }).focalSource, source);
+  assert.equal(estimateFromCorners({ ...shot, focalSource: 'exif_camera' }).focalSource, 'prior', 'anything else counts as the prior');
+  assert.equal(sigma('exif_file'), sigma('prior'));
+  assert.equal(sigma('prior_file'), sigma('prior'));
+  assert.ok(sigma('exif_file') > sigma('exif'));
+});
+
+test('a gallery crop that kept the 4:3 shape and its EXIF is not trusted as the camera\'s own focal', () => {
+  // A 3024 x 4032 frame at a true 26 mm, centre-cropped with the 'Original' aspect (still 4:3), so EXIF
+  // keeps 26 mm and its pixel size matches the crop (readJpegInfo keeps the focal) and the shape check
+  // passes. The real focal of the crop in its own pixels is then 1/crop of what 26 mm gives.
+  const frame = { width: 3024, height: 4032 };
+  const focalPx = focalPxFrom35mm(26, frame.width, frame.height);
+  for (const { widthMm, heightMm, crop: k, yawDeg, before } of [
+    { widthMm: 820, heightMm: 2040, crop: 0.6, yawDeg: 25, before: '770x2040' },
+    { widthMm: 920, heightMm: 2040, crop: 0.75, yawDeg: 20, before: '920x2100' },
+    { widthMm: 920, heightMm: 2040, crop: 0.6, yawDeg: 25, before: '870x2040' },
+  ]) {
+    const name = `${widthMm}x${heightMm}, crop ${k}, yaw ${yawDeg}`;
+    const H = cameraHomography({ imageWidth: frame.width, imageHeight: frame.height, focalPx, target: { x: widthMm / 2, y: heightMm / 2 }, distanceMm: 2800 / k, yawDeg, pitchDeg: 5 });
+    const crop = { width: Math.round(frame.width * k), height: Math.round(frame.height * k) };
+    assert.ok(isFullFrameAspect(crop.width, crop.height), `${name}: the crop still looks like a whole frame`);
+    const corners = cornersFromH(H, widthMm, heightMm).map((p) => ({ x: p.x - (frame.width - crop.width) / 2, y: p.y - (frame.height - crop.height) / 2 }));
+    const shot = { corners, imageWidth: crop.width, imageHeight: crop.height };
+
+    // What trusting the tag gave: a wrong size, confidently, with nothing to flag it.
+    const trusted = estimateFromCorners({ ...shot, focalPx: focalPxFrom35mm(26, crop.width, crop.height), focalSource: 'exif' });
+    assert.equal(label(trusted), before, name);
+    assert.equal(trusted.confident, true, name);
+    assert.deepEqual(trusted.issues, [], name);
+
+    // Picked from the library, the same figure is only a best guess: the lens decides, so not confident.
+    const focal = photoFocal({ ...crop, focal35mm: 26, capture: 'file' });
+    assert.equal(focal.source, 'exif_file', name);
+    const m = estimateFromCorners({ ...shot, ...focal });
+    assert.equal(label(m), before, `${name}: same corners, same focal`);
+    assert.deepEqual(m.issues, ['steep_angle'], name);
+    assert.equal(m.confident, false, `${name}: p ${m.candidates[0].p.toFixed(2)}`);
+
+    // The camera's own still (takePhoto) is the whole frame, so its EXIF is still trusted.
+    const live = photoFocal({ ...frame, focal35mm: 26, capture: 'live' });
+    assert.equal(live.source, 'exif', name);
+    assert.equal(label(estimateFromCorners({ corners: cornersFromH(H, widthMm, heightMm), imageWidth: frame.width, imageHeight: frame.height, ...live })), `${widthMm}x${heightMm}`, name);
+  }
+});
+
 test('photoFocal trusts EXIF only for a whole camera frame (4:3 or 3:2, either way up, within 2 %)', () => {
   for (const [width, height] of [[1536, 2048], [2048, 1536], [3024, 4032], [4080, 3072], [3024, 4000], [4000, 6000], [6000, 4000]]) {
     assert.ok(isFullFrameAspect(width, height), `${width}x${height}`);
@@ -216,17 +279,20 @@ test('a cropped gallery photo that kept its EXIF is not read with the crop-short
     assert.equal(trusted.confident, true, name);
     assert.deepEqual(trusted.issues, [], name);
 
-    // Now: the crop's shape sends it to the prior, which either is unsure or says the angle matters.
-    const focal = photoFocal({ ...crop, focal35mm: 26 });
-    assert.equal(focal.source, 'prior', name);
+    // Now: the crop's shape sends it to the prior, which is never confident here: either the match is
+    // unsure, or the angle makes the lens guess matter ('steep_angle').
+    const focal = photoFocal({ ...crop, focal35mm: 26, capture: 'file' });
+    assert.equal(focal.source, 'prior_file', name);
     const m = estimateFromCorners({ corners, imageWidth: crop.width, imageHeight: crop.height, ...focal });
-    assert.equal(m.focalSource, 'prior', name);
-    assert.ok(m.confident === false || m.issues.includes('steep_angle'), `${name}: ${label(m)} p ${m.candidates[0].p.toFixed(2)} ${m.issues}`);
+    assert.equal(m.focalSource, 'prior_file', name);
+    assert.equal(m.confident, false, `${name}: ${label(m)} p ${m.candidates[0].p.toFixed(2)} ${m.issues}`);
 
-    // The uncropped frame still uses its EXIF and finds the right size.
-    const whole = estimateFromCorners({ corners: full, imageWidth: frame.width, imageHeight: frame.height, ...photoFocal({ ...frame, focal35mm: 26 }) });
-    assert.equal(whole.focalSource, 'exif', name);
-    assert.equal(label(whole), `${widthMm}x${heightMm}`, name);
+    // The uncropped frame still uses its EXIF figure and finds the right size, from takePhoto() or picked.
+    for (const capture of ['live', 'file']) {
+      const whole = estimateFromCorners({ corners: full, imageWidth: frame.width, imageHeight: frame.height, ...photoFocal({ ...frame, focal35mm: 26, capture }) });
+      assert.equal(whole.focalSource, capture === 'live' ? 'exif' : 'exif_file', name);
+      assert.equal(label(whole), `${widthMm}x${heightMm}`, `${name}, ${capture}`);
+    }
   }
 });
 
@@ -308,6 +374,337 @@ test('the prior focal is less certain than EXIF, and an oblique prior-focal phot
   assert.ok(!estimateFromCorners({ ...doorShot({ widthMm: 820, heightMm: 2040, yawDeg: 30 }), focalSource: 'exif' }).issues.includes('steep_angle'));
 });
 
+/** What `confident` comes to from p and the other issues alone, leaving out the 'steep_angle' rule. */
+const confidentApartFromAngle = (m) =>
+  m.candidates[0].p >= ESTIMATE_THRESHOLDS.confidentP &&
+  !m.nonStandard &&
+  !m.issues.includes('not_rectangular') &&
+  !m.issues.includes('door_near_edge');
+
+test('a steep picked photo with the 26 mm prior is never confident, even when one size looks sure', () => {
+  // The research case: an 870 x 2100 door 35 deg off to the side on a 26 mm phone (3024 x 4032 frame),
+  // cropped to 1600 x 3000 in a gallery app and picked. The crop's shape rightly sends it to the prior,
+  // which is then 0.67x the real focal; off-axis that moves the ratio onto another size, at a high p.
+  const frame = { width: 3024, height: 4032 };
+  const crop = { width: 1600, height: 3000 };
+  const focalPx = focalPxFrom35mm(26, frame.width, frame.height);
+  const H = cameraHomography({ imageWidth: frame.width, imageHeight: frame.height, focalPx, target: { x: 435, y: 1050 }, distanceMm: 3200, yawDeg: 35 });
+  const corners = cornersFromH(H, 870, 2100).map((p) => ({ x: p.x - (frame.width - crop.width) / 2, y: p.y - (frame.height - crop.height) / 2 }));
+  const shot = { corners, imageWidth: crop.width, imageHeight: crop.height };
+
+  const prior = estimateFromCorners({ ...shot, ...photoFocal({ ...crop, focal35mm: 26, capture: 'file' }) });
+  assert.equal(prior.focalSource, 'prior_file');
+  assert.deepEqual(prior.issues, ['steep_angle']);
+  assert.equal(label(prior), '770x2040', 'a wrong size');
+  assert.ok(prior.candidates[0].p >= ESTIMATE_THRESHOLDS.confidentP, `that looks sure (p ${prior.candidates[0].p.toFixed(2)})`);
+  assert.equal(confidentApartFromAngle(prior), true, 'only the angle rule stops it');
+  assert.equal(prior.confident, false);
+
+  // The same corners with the lens's true focal as a trusted EXIF figure: the right size, no 'steep_angle'
+  // although the view is just as steep, and `confident` from p as usual (at 35 deg p is honestly below 0.8).
+  const exif = estimateFromCorners({ ...shot, focalPx, focalSource: 'exif' });
+  assert.equal(label(exif), '870x2100');
+  assert.ok(exif.viewTiltDeg > prior.viewTiltDeg + 5, `the guessed focal understates the angle (${prior.viewTiltDeg.toFixed(1)} vs ${exif.viewTiltDeg.toFixed(1)} deg)`);
+  assert.deepEqual(exif.issues, []);
+  assert.equal(exif.confident, confidentApartFromAngle(exif));
+});
+
+test('an iPhone camera-app photo on the 2x lens is not confidently the wrong size, though its angle reads small', () => {
+  // 'Use your camera app instead' on an iPhone: `<input capture>` strips EXIF, so the 26 mm prior is used,
+  // but the customer tapped 2x (52 mm) and stood 20 deg off to the side of an 820 x 2100 door, 5.2 m back.
+  const imageWidth = 1920;
+  const imageHeight = 2560;
+  const focalPx = focalPxFrom35mm(52, imageWidth, imageHeight);
+  const shot = doorShot({ widthMm: 820, heightMm: 2100, imageWidth, imageHeight, focalPx, distanceMm: 5200, yawDeg: 20 });
+  const truth = estimateFromCorners({ ...shot, focalSource: 'exif' });
+  assert.equal(label(truth), '820x2100');
+
+  const focal = photoFocal({ width: imageWidth, height: imageHeight, focal35mm: null, capture: 'file' });
+  assert.equal(focal.source, 'prior_file');
+  assert.ok(Math.abs(focal.focalPx / focalPx - 0.5) < 1e-9, 'the guess is half the real focal');
+  const m = estimateFromCorners({ ...shot, ...focal });
+  // Measured with that focal the view looks nearly square: the angle cannot tell whether the lens matters.
+  assert.ok(m.viewTiltDeg < 12 && m.viewTiltDeg < 0.6 * truth.viewTiltDeg, `tilt ${m.viewTiltDeg.toFixed(1)} vs ${truth.viewTiltDeg.toFixed(1)} deg`);
+  assert.equal(label(m), '770x2040', 'a wrong size');
+  assert.ok(m.candidates[0].p > 0.99, `that looks sure (p ${m.candidates[0].p.toFixed(3)})`);
+  assert.deepEqual(m.issues, ['steep_angle']);
+  assert.equal(m.confident, false);
+
+  // The whole catalogue, 10-30 deg either side, with exact corners: never confidently a wrong size.
+  const shots = [];
+  let flagged = 0;
+  for (const { widthMm, heightMm } of DEFAULT_STANDARD_SIZES) {
+    for (const yawDeg of [-30, -25, -20, -15, -10, 10, 15, 20, 25, 30]) {
+      const exact = doorShot({ widthMm, heightMm, imageWidth, imageHeight, focalPx, distanceMm: 5200, yawDeg });
+      const e = estimateFromCorners({ ...exact, ...focal });
+      if (e.issues.includes('steep_angle')) flagged++;
+      if (e.confident) assert.equal(label(e), `${widthMm}x${heightMm}`, `${widthMm}x${heightMm}, yaw ${yawDeg}: confident, so right`);
+      shots.push({ exact, truth: `${widthMm}x${heightMm}` });
+    }
+  }
+  assert.ok(flagged > 50, `the lens is flagged as deciding on most of the 100 shots (${flagged})`);
+
+  // With 3 px taps it is rarely confidently wrong: a tap or two can still pull the ratio onto the next size
+  // at a lens that does not change the answer. Counted over 40 seeds of 5 tapped versions of each shot, so
+  // the rate is what is checked and not one seed's luck: 56 of 1063 confident estimates are wrong (5.3 %;
+  // 0-5 a seed). Before the lens was asked, 67 % were (3374 of 5015); asking every lens from half to twice
+  // for a sure match, which also took the sure answer from most square-on photos, 2.1 % (16 of 748).
+  const sigmaPx = (3 * imageHeight) / 2048;
+  let confident = 0;
+  let wrong = 0;
+  for (let seed = 1; seed <= 40; seed++) {
+    const rand = rng(seed);
+    const gauss = () => Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+    for (const { exact, truth } of shots) {
+      for (let k = 0; k < 5; k++) {
+        const corners = exact.corners.map((p) => ({ x: p.x + sigmaPx * gauss(), y: p.y + sigmaPx * gauss() }));
+        const n = estimateFromCorners({ ...exact, corners, ...focal });
+        if (n.confident) {
+          confident++;
+          if (label(n) !== truth) wrong++;
+        }
+      }
+    }
+  }
+  assert.ok(confident > 500, `${confident} confident estimates`);
+  assert.ok(wrong <= 0.08 * confident, `${wrong} of ${confident} confident estimates wrong`);
+});
+
+test('a free-form gallery crop (prior 0.6-0.7x the real focal) is never confidently the wrong size', () => {
+  // A 26 mm, 3024 x 4032 photo cropped around the door to a shape that is no camera frame's, so the
+  // prior is used on the crop's diagonal: 0.62-0.67x the real focal.
+  const frame = { width: 3024, height: 4032 };
+  const focalPx = focalPxFrom35mm(26, frame.width, frame.height);
+  let n = 0;
+  for (const { widthMm, heightMm } of DEFAULT_STANDARD_SIZES) {
+    for (const [cw, ch] of [[0.5, 0.75], [0.45, 0.7], [0.6, 0.8]]) {
+      for (const yawDeg of [15, 20, 25, 30, 35]) {
+        for (const pitchDeg of [0, 6]) {
+          const H = cameraHomography({ imageWidth: frame.width, imageHeight: frame.height, focalPx, target: { x: widthMm / 2, y: heightMm / 2 }, distanceMm: 3200, yawDeg, pitchDeg });
+          const full = cornersFromH(H, widthMm, heightMm);
+          const crop = { width: Math.round(frame.width * cw), height: Math.round(frame.height * ch) };
+          const xs = full.map((p) => p.x);
+          const ys = full.map((p) => p.y);
+          const ox = (Math.min(...xs) + Math.max(...xs)) / 2 - crop.width / 2;
+          const oy = (Math.min(...ys) + Math.max(...ys)) / 2 - crop.height / 2;
+          const corners = full.map((p) => ({ x: p.x - ox, y: p.y - oy }));
+          if (corners.some((p) => p.x < 0.02 * crop.width || p.y < 0.02 * crop.height || p.x > 0.98 * crop.width || p.y > 0.98 * crop.height)) continue;
+          const focal = photoFocal({ ...crop, focal35mm: 26, capture: 'file' });
+          assert.equal(focal.source, 'prior_file');
+          const m = estimateFromCorners({ corners, imageWidth: crop.width, imageHeight: crop.height, ...focal });
+          n++;
+          if (m.confident) assert.equal(label(m), `${widthMm}x${heightMm}`, `${widthMm}x${heightMm}, crop ${crop.width}x${crop.height}, yaw ${yawDeg}, pitch ${pitchDeg}`);
+        }
+      }
+    }
+  }
+  assert.ok(n > 200, `${n} crops`);
+});
+
+test('a door square to the phone but off to one side of the photo is not said to be on an angle', () => {
+  // A portrait photo with no EXIF, the phone facing the wall squarely, the door in the lower right. The line
+  // of sight to the door is 18 deg off its normal, but its ratio is the same with every lens.
+  const imageWidth = 1920;
+  const imageHeight = 2560;
+  const f = focalPxFrom35mm(26, imageWidth, imageHeight);
+  for (const { widthMm, heightMm } of [{ widthMm: 870, heightMm: 2100 }, { widthMm: 920, heightMm: 2040 }]) {
+    // The door's centre 800 mm right of and 300 mm below the optical axis, 2.6 m away.
+    const cx = widthMm / 2 - 800;
+    const cy = heightMm / 2 - 300;
+    const corners = [[0, 0], [widthMm, 0], [widthMm, heightMm], [0, heightMm]].map(([x, y]) => ({
+      x: imageWidth / 2 + (f * (x - cx)) / 2600,
+      y: imageHeight / 2 + (f * (y - cy)) / 2600,
+    }));
+    for (const capture of ['frame', 'file']) {
+      const name = `${widthMm}x${heightMm}, ${capture}`;
+      const m = estimateFromCorners({ corners, imageWidth, imageHeight, ...photoFocal({ width: imageWidth, height: imageHeight, focal35mm: null, capture }) });
+      assert.ok(m.viewTiltDeg > 18, `${name}: line-of-sight tilt ${m.viewTiltDeg.toFixed(1)} deg`);
+      const K = intrinsics(m.focalPx, imageWidth, imageHeight);
+      for (const k of [0.5, 2]) assert.ok(Math.abs(rectifyRectangle(m.corners, { ...K, f: f * k }).aspectHW / m.aspectHW - 1) < 1e-9, `${name}: same ratio at ${k}x`);
+      assert.deepEqual(m.issues, [], name);
+      assert.equal(label(m), `${widthMm}x${heightMm}`, name);
+      assert.equal(m.confident, true, `${name}: p ${m.candidates[0].p.toFixed(2)}`);
+    }
+  }
+});
+
+test("a picked photo taken square on, tilted down at the door's middle as usual, is judged as our own camera's", () => {
+  // Nearly every photo is taken from chest height aimed at the opening's middle, so tilted down 6-10 deg. A
+  // longer lens or a crop reads that tilt as steeper, which moves the ratio a little (870 x 2040 from 2.6 m
+  // becomes 870 x 2100 on twice the focal), but only with the camera far higher than anyone holds a phone.
+  // So a square-on photo is not said to be on an angle, whether it came from the camera app or the library:
+  // an iPhone camera-app photo (no EXIF) is judged like a frame from our camera, an Android one (EXIF
+  // 26 mm) like takePhoto().
+  let sure = 0;
+  for (const [imageWidth, imageHeight] of [[1920, 2560], [3000, 4000]]) {
+    const focalPx = focalPxFrom35mm(26, imageWidth, imageHeight);
+    for (const { widthMm, heightMm } of DEFAULT_STANDARD_SIZES) {
+      for (const distanceMm of [2600, 3000]) {
+        for (const pitchDeg of [-6, -8, -10]) {
+          const target = { x: widthMm / 2, y: heightMm / 2 };
+          const H = cameraHomography({ imageWidth, imageHeight, focalPx, target, distanceMm, pitchDeg });
+          const shot = { corners: cornersFromH(H, widthMm, heightMm), imageWidth, imageHeight };
+          for (const [focal35mm, own, picked] of [[null, 'frame', 'prior_file'], [26, 'live', 'exif_file']]) {
+            const name = `${widthMm}x${heightMm}, ${imageWidth}x${imageHeight}, ${distanceMm} mm, pitch ${pitchDeg}, ${picked}`;
+            const photo = { width: imageWidth, height: imageHeight, focal35mm };
+            const ours = estimateFromCorners({ ...shot, ...photoFocal({ ...photo, capture: own }) });
+            const file = estimateFromCorners({ ...shot, ...photoFocal({ ...photo, capture: 'file' }) });
+            assert.equal(file.focalSource, picked, name);
+            assert.equal(label(file), label(ours), name);
+            if (!ours.confident) continue;
+            sure++;
+            assert.deepEqual(file.issues, [], `${name}: p ${file.candidates[0].p.toFixed(2)}`);
+            assert.equal(file.confident, true, `${name}: p ${file.candidates[0].p.toFixed(2)}`);
+          }
+        }
+      }
+    }
+  }
+  assert.ok(sure >= 100, `${sure} confident from our own camera`);
+
+  // The review's cases: 870 x 2040 and 920 x 2040 from 2.6 m, aimed at the middle (pitch -6 and -9 deg),
+  // and the test photo of this file (camera 1.4 m up, 2.6 m back), picked with and without EXIF.
+  const imageWidth = 1920;
+  const imageHeight = 2560;
+  const focalPx = focalPxFrom35mm(26, imageWidth, imageHeight);
+  for (const widthMm of [870, 920]) {
+    const shots = [-6, -9].map((pitchDeg) => {
+      const H = cameraHomography({ imageWidth, imageHeight, focalPx, target: { x: widthMm / 2, y: 1020 }, distanceMm: 2600, pitchDeg });
+      return { corners: cornersFromH(H, widthMm, 2040), imageWidth, imageHeight };
+    });
+    shots.push(doorShot({ widthMm, heightMm: 2040 }));
+    for (const shot of shots) {
+      for (const focal35mm of [null, 26]) {
+        const m = estimateFromCorners({ ...shot, ...photoFocal({ width: shot.imageWidth, height: shot.imageHeight, focal35mm, capture: 'file' }) });
+        const name = `${widthMm}x2040, ${m.focalSource}, tilt ${m.viewTiltDeg.toFixed(1)} deg`;
+        assert.equal(label(m), `${widthMm}x2040`, name);
+        assert.deepEqual(m.issues, [], name);
+        assert.equal(m.confident, true, `${name}: p ${m.candidates[0].p.toFixed(2)}`);
+      }
+    }
+  }
+});
+
+test('picked photos taken the usual way are about as often confident as our own camera\'s, and as rarely wrong', () => {
+  // 400 camera-app shots: phone 1.3-1.5 m up, aimed at the opening's middle from 2.2-3.2 m, up to 8 deg off
+  // to the side and 1.5 deg rolled, corners tapped (3 px at 2048). Before picked photos were asked only
+  // about the lenses that fit where a phone is held, 'prior_file' and 'exif_file' were each confident on 42
+  // and 'steep_angle' came with 220; from our own camera ('frame') 141 were confident.
+  const rand = rng(11);
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+  const between = (a, b) => a + (b - a) * rand();
+  const imageWidth = 1920;
+  const imageHeight = 2560;
+  const focalPx = focalPxFrom35mm(26, imageWidth, imageHeight);
+  const sigmaPx = (3 * imageHeight) / 2048;
+  const count = {};
+  for (const source of ['prior', 'prior_file', 'exif', 'exif_file']) count[source] = { confident: 0, wrong: 0, steep: 0 };
+  let n = 0;
+  while (n < 400) {
+    const { widthMm, heightMm } = DEFAULT_STANDARD_SIZES[Math.floor(rand() * DEFAULT_STANDARD_SIZES.length)];
+    const cameraMm = between(1300, 1500);
+    const distanceMm = between(2200, 3200);
+    const pitchDeg = (-Math.atan2(cameraMm - heightMm / 2, distanceMm) * 180) / Math.PI;
+    const target = { x: widthMm / 2, y: heightMm / 2 };
+    const H = cameraHomography({ imageWidth, imageHeight, focalPx, target, distanceMm, yawDeg: between(-8, 8), pitchDeg, rollDeg: between(-1.5, 1.5) });
+    const corners = cornersFromH(H, widthMm, heightMm).map((p) => ({ x: p.x + sigmaPx * gauss(), y: p.y + sigmaPx * gauss() }));
+    if (corners.some((p) => p.x < 0.02 * imageWidth || p.y < 0.02 * imageHeight || p.x > 0.98 * imageWidth || p.y > 0.98 * imageHeight)) continue;
+    n++;
+    for (const [focal35mm, capture] of [[null, 'frame'], [null, 'file'], [26, 'live'], [26, 'file']]) {
+      const m = estimateFromCorners({ corners, imageWidth, imageHeight, ...photoFocal({ width: imageWidth, height: imageHeight, focal35mm, capture }) });
+      const c = count[m.focalSource];
+      if (m.issues.includes('steep_angle')) c.steep++;
+      if (m.confident) {
+        c.confident++;
+        if (label(m) !== `${widthMm}x${heightMm}`) c.wrong++;
+      }
+    }
+  }
+  const summary = JSON.stringify(count);
+  // Measured: 'prior' 141 confident (1 wrong), 'prior_file' 136 (1), 'exif' 143 (1), 'exif_file' 138 (1).
+  assert.ok(count.prior.confident >= 120, summary);
+  assert.ok(count.prior_file.confident >= 0.85 * count.prior.confident, summary);
+  assert.ok(count.exif_file.confident >= 0.85 * count.exif.confident, summary);
+  assert.ok(count.prior_file.wrong <= count.prior.wrong && count.exif_file.wrong <= count.exif.wrong, summary);
+  assert.ok(count.prior_file.steep <= 0.1 * n && count.exif_file.steep <= 0.1 * n, summary);
+});
+
+test('a steep frame from the live camera is unsure; the same shot with its EXIF focal is judged on p as usual', () => {
+  // A 24 mm main camera (recent iPhone Pro) 25 deg off to the side of a 920 x 2040 door. As a grabbed video
+  // frame (no EXIF) the 26 mm prior is used; the size happens to come out right and sure, but at this angle
+  // a lens a little way off the guess (inside the live camera's +-25 % range) would make it 920 x 2100, so
+  // it is not a sure match.
+  const focalPx = focalPxFrom35mm(24, 1536, 2048);
+  const shot = doorShot({ widthMm: 920, heightMm: 2040, focalPx, yawDeg: 25 });
+  const frame = estimateFromCorners({ ...shot, ...photoFocal({ width: 1536, height: 2048, focal35mm: null, capture: 'frame' }) });
+  assert.equal(frame.focalSource, 'prior');
+  assert.deepEqual(frame.issues, ['steep_angle']);
+  assert.equal(label(frame), '920x2040');
+  assert.ok(frame.candidates[0].p >= ESTIMATE_THRESHOLDS.confidentP, `p ${frame.candidates[0].p.toFixed(2)}`);
+  assert.equal(frame.confident, false);
+
+  // takePhoto() with the 24 mm in its EXIF: the angle no longer rests on a lens guess.
+  const photo = estimateFromCorners({ ...shot, ...photoFocal({ width: 1536, height: 2048, focal35mm: 24, capture: 'live' }) });
+  assert.equal(photo.focalSource, 'exif');
+  assert.ok(photo.viewTiltDeg > 20, `tilt ${photo.viewTiltDeg.toFixed(1)} deg`);
+  assert.deepEqual(photo.issues, []);
+  assert.equal(label(photo), '920x2040');
+  assert.equal(photo.confident, true, `p ${photo.candidates[0].p.toFixed(2)}`);
+});
+
+test('a near-frontal prior-focal photo is unaffected by the angle rule, and a confident estimate is the right size', () => {
+  for (const f35 of [24, 26, 28]) {
+    for (const yawDeg of [-5, 0, 5]) {
+      const name = `${f35} mm, yaw ${yawDeg}`;
+      const shot = doorShot({ widthMm: 920, heightMm: 2040, focalPx: focalPxFrom35mm(f35, 1536, 2048), yawDeg, rollDeg: 0.6 });
+      const m = estimateFromCorners({ ...shot, ...photoFocal({ width: 1536, height: 2048, focal35mm: null, capture: 'frame' }) });
+      assert.equal(m.focalSource, 'prior', name);
+      assert.deepEqual(m.issues, [], name);
+      assert.equal(label(m), '920x2040', name);
+      assert.equal(m.confident, true, `${name}: p ${m.candidates[0].p.toFixed(2)}`);
+    }
+  }
+
+  // The whole catalogue, lenses from ultra-wide to 2x, angles to 35 deg, every way a photo arrives:
+  // 'steep_angle' never comes with the camera's own EXIF and always means not confident; wherever it is
+  // absent `confident` is the rule it was; and a confident estimate is always the right size. The live
+  // camera ('frame') is always the 1x main lens, so it is only tried with 24-28 mm.
+  let steep = 0;
+  let plain = 0;
+  let sure = 0;
+  for (const { widthMm, heightMm } of DEFAULT_STANDARD_SIZES) {
+    for (const f35 of [13, 24, 26, 28, 52]) {
+      for (const yawDeg of [-35, -20, -10, 0, 10, 20, 35]) {
+        const shot = doorShot({ widthMm, heightMm, focalPx: focalPxFrom35mm(f35, 1536, 2048), yawDeg, distanceMm: f35 > 30 ? 5200 : 2600 });
+        const photos = [
+          { focal35mm: null, capture: 'file' }, // iOS camera app, or a library photo without EXIF
+          { focal35mm: f35, capture: 'file' }, // Android camera app, or a library photo with EXIF
+          { focal35mm: f35, capture: 'live' }, // takePhoto()
+        ];
+        if (f35 >= 24 && f35 <= 28) photos.push({ focal35mm: null, capture: 'frame' });
+        for (const photo of photos) {
+          const name = `${widthMm}x${heightMm}, ${f35} mm, yaw ${yawDeg}, EXIF ${photo.focal35mm}, ${photo.capture}`;
+          const m = estimateFromCorners({ ...shot, ...photoFocal({ width: 1536, height: 2048, ...photo }) });
+          assert.equal(m.ok, true, name);
+          if (m.issues.includes('steep_angle')) {
+            steep++;
+            assert.notEqual(m.focalSource, 'exif', name);
+            assert.equal(m.confident, false, name);
+          } else {
+            plain++;
+            assert.equal(m.confident, confidentApartFromAngle(m), name);
+          }
+          if (m.confident) {
+            sure++;
+            assert.equal(label(m), `${widthMm}x${heightMm}`, `${name}: confident, so right (p ${m.candidates[0].p.toFixed(2)})`);
+          }
+        }
+      }
+    }
+  }
+  assert.ok(steep > 0 && plain > 0 && sure > 0, `all kinds covered (${steep} steep, ${plain} not, ${sure} confident)`);
+});
+
 test('a clean shot of a well-separated size is confident; a 1000 x 1900 door is non-standard', () => {
   const clean = estimateFromCorners({ ...doorShot({ widthMm: 920, heightMm: 2040 }), focalSource: 'exif' });
   assert.equal(label(clean.candidates[0]), '920x2040');
@@ -380,6 +777,39 @@ test('corners in any order describe the same opening', () => {
   for (const corners of [[br, bl, tl, tr], [tr, tl, bl, br], [bl, br, tr, tl]]) {
     const m = estimateFromCorners({ ...shot, corners, focalSource: 'exif' });
     assert.deepEqual(m, base);
+  }
+});
+
+test('a steep, rolled view whose head slopes past 45 deg is still read head first, in every handle order', () => {
+  // Seen well off to one side and from below with the phone rolled: TR is the corner nearest the photo's
+  // top-left, and starting there would read the opening a corner round (0.40 high-to-wide, non-standard).
+  const corners = [{ x: 536, y: 672 }, { x: 992, y: 173 }, { x: 1804, y: 2490 }, { x: 924, y: 2519 }];
+  const input = { imageWidth: 1920, imageHeight: 2560, focalPx: focalPxFrom35mm(PHONE_DEFAULT_F35, 1920, 2560), focalSource: 'prior' };
+  const [tl, tr, br, bl] = corners;
+  for (const order of [corners, [tr, br, bl, tl], [br, tl, bl, tr], [bl, br, tr, tl]]) {
+    const m = estimateFromCorners({ ...input, corners: order });
+    assert.equal(m.ok, true);
+    assert.ok(Math.abs(m.aspectHW - 2.49) < 0.01, `aspect ${m.aspectHW.toFixed(3)}`);
+    assert.equal(label(m.candidates[0]), '820x2040');
+    assert.equal(m.issues.includes('non_standard'), false);
+    // The result preview draws from these: the same corners, head first.
+    assert.deepEqual(m.corners, corners);
+    assert.deepEqual(m.planeToImage, planeToImageFor(corners, 820, 2040));
+  }
+});
+
+test('cornerSigmaPx: a known corner error replaces the tap sigma; anything else keeps the tap sigma', () => {
+  const shot = doorShot({ widthMm: 870, heightMm: 2040, yawDeg: 9 });
+  const base = estimateFromCorners({ ...shot, focalSource: 'exif' });
+  // The door screen's figure for corners still where detection put them: 9 px at 2048 px.
+  const detected = estimateFromCorners({ ...shot, focalSource: 'exif', cornerSigmaPx: 9 });
+  assert.ok(detected.sigmaLnAspect > base.sigmaLnAspect * 1.5, `${detected.sigmaLnAspect} vs ${base.sigmaLnAspect}`);
+  assert.ok(detected.candidates[0].p < base.candidates[0].p);
+  // The tap sigma given explicitly is the default exactly.
+  const tap = (ESTIMATE_THRESHOLDS.tapSigmaPxAt2048 * Math.max(shot.imageWidth, shot.imageHeight)) / 2048;
+  assert.deepEqual(estimateFromCorners({ ...shot, focalSource: 'exif', cornerSigmaPx: tap }), base);
+  for (const bad of [0, -3, NaN, Infinity, '9', null]) {
+    assert.deepEqual(estimateFromCorners({ ...shot, focalSource: 'exif', cornerSigmaPx: bad }), base, String(bad));
   }
 });
 

@@ -14,31 +14,39 @@
  *
  * Either way the handles start on the door that findDoor() found in the photo
  * (or a sensible fallback rectangle). The live-camera path runs findDoor()
- * before coming here; on the paper path this screen runs it after the first
- * paint, and moves the handles only if the customer has not started on them.
- * Detection is a starting position, never a measurement: the customer always
- * confirms the corners, and "Not this? Show the next outline" steps through the
- * other outlines it considered.
+ * before coming here; on the paper path, and whenever an earlier search ran out
+ * of time, this screen runs it after the first paint, and moves the handles onto
+ * what it found unless the customer has moved or selected one by then (and never
+ * while a finger is on the photo). Detection is a starting position, never a
+ * measurement: the customer always confirms the corners, "Not this? Show the next
+ * outline" steps through the other outlines it considered, and corners left where
+ * detection put them are measured with detection's error, not a hand's.
  */
 
 import { measureDoor } from '../geometry.js';
 import { applyMeasurementRules } from '../quote.js';
 import { getSheetMm } from '../photo.js';
-import { estimateFromCorners, photoFocal, standardSizesFrom } from '../estimate.js';
+import { ESTIMATE_THRESHOLDS, estimateFromCorners, photoFocal, standardSizesFrom } from '../estimate.js';
 import { findDoor, isConfident, startingQuad } from '../door-find.js';
 import {
   canEnterDoor,
   copyQuad,
+  cornersByHand,
   cornersInOutlineOrder,
   createMarkScreen,
   defaultDoorQuad,
   doorBannerKind,
+  doorCornerSigmaPx,
   doorCornersPlaced,
   doorOutlines,
   invalidateMeasurement,
+  isPhotoTarget,
   isQuad,
+  isSettledDetection,
+  markCornersByHand,
   nextOutlineIndex,
   outlineIndexOf,
+  pressGate,
   sameQuad,
   themeColor,
 } from './mark-common.js';
@@ -118,6 +126,15 @@ const FALLBACK_ACCENT = '#f59e0b';
 const FALLBACK_SUCCESS = '#16a34a';
 const FALLBACK_PRIMARY = '#0f172a';
 const ERROR_TOAST_MS = 6000;
+// Nothing waits on this screen's own search for the door: the customer can drag the handles meanwhile.
+// So it is cut off only when something has clearly gone wrong, not at findDoor's 4 s default, which a
+// budget phone busy with other work can need for the search itself. Starting the worker and fetching its
+// modules is given the same allowance (findDoor's loadTimeoutMs), within the same 15 s overall: as a
+// background search, a worker that has not started by then ends as a 'timeout' rather than freezing the
+// page with a main-thread search, and the next visit looks again.
+const BACKGROUND_SEARCH_TIMEOUT_MS = 15000;
+// Stage events that end a press on the photo (see pressGate).
+const RELEASE_EVENTS = ['pointerup', 'pointercancel', 'lostpointercapture'];
 
 // Static illustration, styled by classes in mark.css so it follows the skin.
 // It carries no text: the wording lives in `strings`. Built from parts so the
@@ -249,26 +266,42 @@ export function mount(root, ctx) {
 
   let disposed = false;
   let cancelSearch = null;
+  // Stops the background search once this screen has gone (a 'timeout': the next visit looks again).
+  let searchAbort = null;
+  let releaseTimer = 0;
   // What findDoor() made of this photo; null until it has looked (the paper path comes here without).
-  let detection = state.door.detection ?? null;
+  // A search that ran out of time has not looked, as far as this screen is concerned: it looks again
+  // (isSettledDetection), or the handles would stay on the fallback rectangle for good.
+  let detection = isSettledDetection(state.door.detection) ? state.door.detection : null;
   let searching = detection === null;
   // Kept inside the photo like the handles, so the handles on one can be recognised (outlineIndexOf).
   const bounds = { width: photo.width, height: photo.height };
   let outlines = doorOutlines(detection, bounds);
 
+  // Corners kept from an earlier visit (moved, a chosen outline, or measured), or none.
+  const saved = isQuad(state.door.points) ? copyQuad(state.door.points) : null;
+  // Which handles the customer put where they are themselves, by handle index. Kept with the corners
+  // (state.door.byHand), so a detected outline measured untouched is still the detector's when the
+  // customer comes back to adjust it: it is measured with detection's error, not a hand's (doorCornerSigmaPx).
+  let byHand = cornersByHand(saved ? state.door.byHand : null);
   // Measuring the untouched starting rectangle would give a confident-looking
   // but meaningless size, so require the corners to have been placed (see doorCornersPlaced).
-  let touched = isQuad(state.door.points);
-  // True from the first report of a handle moving, even one that ends back where it started: a
-  // late detection must never pull a handle out from under the customer's finger.
-  let handled = touched;
-  // An outline picked with "Not this? Show the next outline".
-  let chosen = false;
+  let touched = byHand.some(Boolean);
+  // True from the first report of a handle moving, and for an earlier visit's corners: a late detection
+  // never moves the handles once the customer has moved one, nor replaces an earlier visit's. A tap, a
+  // pan or a pinch that moved no handle does not count: the fallback rectangle is nobody's, and a detection
+  // dropped for it could not be got back with a single outline (there is no "next outline" to show). A
+  // handle held under a finger, or a selected one, is not moved either (pressGate, showSearchResult).
+  let handled = saved !== null;
+  // An outline picked with "Not this? Show the next outline", on this visit or an earlier one.
+  let chosen = saved !== null && state.door.chosen === true;
   // Where the handles were last put down, starting with what the editor is given. A press on a
   // handle that leaves it exactly there has placed nothing.
-  let committed = touched ? copyQuad(state.door.points) : startPoints(photo, detection);
+  let committed = saved ?? startPoints(photo, detection);
   // Which of `outlines` the handles were put on (-1: none, or the customer's own corners).
   let outline = outlineIndexOf(outlines, committed);
+  // Fingers on the photo right now; what the late search changes waits for them (see pressGate).
+  const gate = pressGate();
 
   const accent = themeColor('--sm-accent', config.brand?.colors?.accent || FALLBACK_ACCENT);
 
@@ -380,6 +413,29 @@ export function mount(root, ctx) {
   mark.tools.append(helpBtn);
   renderOutlineButton();
 
+  // On a short screen (a phone on its side) the bar is one row, with these two shrunk to their icons
+  // (see mark.css): three full-width rows would leave the photo almost no height.
+  mark.actionBar.classList.add('sm-mark__doorbar');
+  outlineBtn.classList.add('sm-mark__compact');
+  backBtn.classList.add('sm-mark__compact');
+
+  // Capture phase, so these see every press before the editor acts on it.
+  const stageListenerOptions = { capture: true, passive: true };
+  const onPress = (event) => {
+    if (!isPhotoTarget(event.target)) return;
+    gate.press(event.pointerId, event.isPrimary === true);
+  };
+  const onRelease = (event) => {
+    const run = gate.release(event.pointerId);
+    if (!run) return;
+    clearTimeout(releaseTimer);
+    // This listener runs before the editor's own pointerup: let it put the handle down first. Pressed
+    // again by then, the change waits for that press too.
+    releaseTimer = setTimeout(() => gate.whenReleased(run), 0);
+  };
+  mark.stage.addEventListener('pointerdown', onPress, stageListenerOptions);
+  for (const type of RELEASE_EVENTS) mark.stage.addEventListener(type, onRelease, stageListenerOptions);
+
   /** The banner for where things stand now (see doorBannerKind). */
   function bannerNow() {
     const kind = doorBannerKind({
@@ -409,34 +465,65 @@ export function mount(root, ctx) {
   }
 
   /**
-   * Look for the door in the photo (only when nobody has yet), then start the handles on it if the
-   * customer has not started on them: their own corners always win over a late suggestion.
+   * Look for the door in the photo (only when nobody has yet), then start the handles on it unless the
+   * customer has moved or selected one: their own corners always win over a late suggestion.
    */
   async function lookForDoor() {
     cancelSearch = null;
+    const search = new AbortController();
+    searchAbort = search;
     let result = null;
     try {
-      result = await findDoor(photo);
+      // The capture screen's framing guide, when it left one, keeps the search on the door the customer
+      // lined up, as it did for the search that ran out of time there.
+      const prior = isQuad(state.door.prior) ? copyQuad(state.door.prior) : null;
+      // In the background: the customer may be dragging a corner meanwhile, so a worker slow to start ends
+      // as a 'timeout' rather than a main-thread search freezing the page; and stopped if the screen goes.
+      result = await findDoor(photo, {
+        prior,
+        timeoutMs: BACKGROUND_SEARCH_TIMEOUT_MS,
+        loadTimeoutMs: BACKGROUND_SEARCH_TIMEOUT_MS,
+        background: true,
+        signal: search.signal,
+      });
     } catch {
       // findDoor never rejects; this is only belt and braces.
       result = null;
     }
     // Only for the photo it looked at, in the session it was run in: a reset or a retake replaced it.
+    // Never a search that ran out of time or was given up (this screen left, or the worker was slow to
+    // start), so the next visit looks again; it replaces one that did.
     const current = ctx.state === state && state.photo === photo;
-    if (current && result && typeof result === 'object' && !state.door.detection) state.door.detection = result;
+    if (current && isSettledDetection(result) && !isSettledDetection(state.door.detection)) state.door.detection = result;
     if (disposed) return;
 
+    // Nothing the search changes happens while a finger is on the photo: a handle held there must not be
+    // moved from under it, and the new banner and the outline button can change the height of the photo,
+    // which would slide the handle being dragged away from the fingertip (see pressGate). Once the finger
+    // is up, what that press did (moved a handle, selected one, or neither) decides.
+    gate.whenReleased(() => showSearchResult(result));
+  }
+
+  /**
+   * What the finished search changes: the handles, if the customer has not moved or selected one, then
+   * the banner, the outline button and the photo's room.
+   * @param {object | null} result What findDoor() answered.
+   */
+  function showSearchResult(result) {
+    if (disposed) return;
     searching = false;
     detection = result && typeof result === 'object' ? result : null;
     outlines = doorOutlines(detection, bounds);
     const editor = mark.editor;
-    if (!handled && !chosen && editor) {
+    let placedNow = false;
+    // A selected handle is the customer's too, whatever `handled` says: it is never moved or let go of.
+    if (!handled && !chosen && editor && editor.getActive() === null) {
       const start = startPoints(photo, detection);
       editor.setPoints(copyQuad(start));
       // The editor keeps every handle inside the photo; remember where it actually put them.
       committed = editor.getPoints() ?? start;
       outline = outlineIndexOf(outlines, start);
-      if (editor.getActive() !== null) editor.setActive(null);
+      placedNow = true;
     } else {
       outline = outlineIndexOf(outlines, editor ? editor.getPoints() : committed);
     }
@@ -444,6 +531,9 @@ export function mount(root, ctx) {
     renderOutlineButton();
     // The banner and the action bar may have changed height: give the photo its new room now.
     mark.flushLayout();
+    // The customer may have zoomed in to look before any handle moved: show the whole photo, where the
+    // handles now are. (Nothing happens when the view already shows it.)
+    if (placedNow) editor.resetView();
     mark.sync();
   }
 
@@ -456,8 +546,10 @@ export function mount(root, ctx) {
     chosen = true;
     editor.setPoints(copyQuad(outlines[outline]));
     committed = editor.getPoints() ?? copyQuad(outlines[outline]);
+    // Every handle is now where detection put it, none where the customer did.
+    byHand = cornersByHand(null);
     // A chosen outline counts as placed, here and when the customer comes back to adjust it.
-    state.door.points = copyQuad(committed);
+    keepCorners(committed);
     invalidateMeasurement(state);
     editor.setActive(null);
     renderBanner();
@@ -471,10 +563,38 @@ export function mount(root, ctx) {
   function onChange(points, meta) {
     handled = true;
     if (!meta.final || sameQuad(points, committed)) return;
+    byHand = markCornersByHand(byHand, committed, points);
     committed = points;
     touched = true;
-    state.door.points = points;
+    keepCorners(points);
     invalidateMeasurement(state);
+  }
+
+  /**
+   * Keep the corners for "Adjust corners" and Back / Forward, with where they came from: which handles
+   * the customer placed (byHand) and whether they picked the outline (chosen). The corners alone would
+   * not say, and a detected outline measured untouched would come back as the customer's own.
+   */
+  function keepCorners(points) {
+    state.door.points = copyQuad(points);
+    state.door.byHand = [...byHand];
+    state.door.chosen = chosen;
+  }
+
+  /**
+   * The corners' error to measure with (see doorCornerSigmaPx): `handSigmaPx` for each corner the customer
+   * placed, detection's for each one still where detection put it, as one figure for all four.
+   * @param {number} handSigmaPx A corner placed by hand's error, image px.
+   * @returns {number | null} null only for an unusable `handSigmaPx` with every corner by hand: the
+   *   measuring code's own default then applies.
+   */
+  function cornerSigmaPx(handSigmaPx) {
+    return doorCornerSigmaPx({ byHand, handSigmaPx, imageWidth: photo.width, imageHeight: photo.height });
+  }
+
+  /** A tap's corner error on this photo: what estimateFromCorners takes when it is given none. */
+  function tapSigmaPx() {
+    return (ESTIMATE_THRESHOLDS.tapSigmaPxAt2048 * Math.max(photo.width, photo.height)) / 2048;
   }
 
   function onTap() {
@@ -511,7 +631,8 @@ export function mount(root, ctx) {
         sheetMm: getSheetMm(state, config),
         imageSize: { width: photo.width, height: photo.height },
         sigmaSheetPx: state.sheet.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
-        sigmaDoorPx: m.sigmaDoorPx,
+        // m.sigmaDoorPx is for corners dragged into place; a detected one left as it was is as good as detection.
+        sigmaDoorPx: cornerSigmaPx(m.sigmaDoorPx),
         plausible: m.plausible,
       });
     } catch {
@@ -523,7 +644,7 @@ export function mount(root, ctx) {
       return;
     }
 
-    state.door.points = copyQuad(points);
+    keepCorners(points);
     state.measure = { ...r, method: 'paper' };
     state.size = {
       ...applyMeasurementRules(m, { widthMm: r.widthMm, heightMm: r.heightMm }),
@@ -554,7 +675,7 @@ export function mount(root, ctx) {
     let r;
     try {
       const focal = photoFocal(photo) ?? {};
-      r = estimateFromCorners({
+      const input = {
         // The outline the customer sees, in [TL, TR, BR, BL] order, whichever handle is on which corner.
         corners: cornersInOutlineOrder(points),
         imageWidth: photo.width,
@@ -563,7 +684,12 @@ export function mount(root, ctx) {
         // photoFocal names it `source`; estimateFromCorners takes it as `focalSource`.
         focalSource: focal.focalSource ?? focal.source,
         sizes: standardSizesFrom(config),
-      });
+      };
+      // Its own corner error is a tap's; a detected corner left as it was is as good as detection, so
+      // the estimate is not more sure of a size than the corners allow. Left out when all are by hand,
+      // so the estimate's own default applies.
+      if (!byHand.every(Boolean)) input.cornerSigmaPx = cornerSigmaPx(tapSigmaPx());
+      r = estimateFromCorners(input);
     } catch {
       r = { ok: false, error: 'degenerate' };
     }
@@ -574,7 +700,7 @@ export function mount(root, ctx) {
       return;
     }
 
-    state.door.points = copyQuad(points);
+    keepCorners(points);
     state.measure = r;
     state.size = {
       ...applyMeasurementRules(m, { widthMm: best.widthMm, heightMm: best.heightMm }),
@@ -595,6 +721,11 @@ export function mount(root, ctx) {
   return () => {
     disposed = true;
     if (cancelSearch) cancelSearch();
+    if (searchAbort) searchAbort.abort();
+    clearTimeout(releaseTimer);
+    gate.clear();
+    mark.stage.removeEventListener('pointerdown', onPress, stageListenerOptions);
+    for (const type of RELEASE_EVENTS) mark.stage.removeEventListener(type, onRelease, stageListenerOptions);
     mark.destroy();
     // Close the help sheet if it is still open, so nothing is left on <body>.
     try {

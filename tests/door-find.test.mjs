@@ -79,7 +79,7 @@ test('never throws or rejects, whatever it is given', async () => {
   }
   assert.equal((await findDoor(null)).reason, 'bad_input');
   // Unusable options are ignored rather than fatal.
-  for (const options of [null, { prior: 'nope' }, { prior: [{ x: NaN, y: 1 }, {}, null, 4] }, { timeoutMs: -1 }]) {
+  for (const options of [null, { prior: 'nope' }, { prior: [{ x: NaN, y: 1 }, {}, null, 4] }, { timeoutMs: -1 }, { loadTimeoutMs: 'soon' }]) {
     const r = await findDoor(photo, options);
     assert.equal(r.ok, true);
   }
@@ -146,8 +146,10 @@ test('prior: a guide near the door is used; a guide nowhere near it falls back t
 /**
  * Stand-in for a browser module Worker: answers through the real worker module, after a real structured
  * clone WITH transfer, so a transferred buffer is detached on the sending side exactly as in a browser.
+ * Like the real one it says { ready: true } once "loaded" (after `readyAfterMs`; null: never, as an old
+ * cached worker script would not), and holds a request until then.
  */
-function installWorker({ answer = 'ok', throwOnCreate = false } = {}) {
+function installWorker({ answer = 'ok', throwOnCreate = false, readyAfterMs = 0 } = {}) {
   const log = { created: [], posted: [], terminated: 0 };
   globalThis.Worker = class {
     constructor(url, options) {
@@ -156,6 +158,11 @@ function installWorker({ answer = 'ok', throwOnCreate = false } = {}) {
       this.onmessage = null;
       this.onerror = null;
       this.onmessageerror = null;
+      if (readyAfterMs !== null && answer !== 'error') {
+        setTimeout(() => {
+          if (this.onmessage) this.onmessage({ data: { ready: true } });
+        }, readyAfterMs);
+      }
     }
     postMessage(message, transfer) {
       const received = structuredClone(message, { transfer });
@@ -164,7 +171,7 @@ function installWorker({ answer = 'ok', throwOnCreate = false } = {}) {
         if (answer === 'ok' && this.onmessage) this.onmessage({ data: structuredClone(handleMessage(received)) });
         if (answer === 'wrong-id' && this.onmessage) this.onmessage({ data: { id: -1, result: { ok: false, reason: 'stale' } } });
         if (answer === 'error' && this.onerror) this.onerror({ preventDefault() {} });
-      }, 5);
+      }, (readyAfterMs ?? 0) + 5);
     }
     terminate() {
       log.terminated += 1;
@@ -203,6 +210,121 @@ test('worker path: no answer in time is a timeout (and the worker is stopped); a
   const stale = await findDoor(photo, { timeoutMs: 60 });
   assert.equal(stale.reason, 'timeout');
   assert.equal(log.terminated, 1);
+});
+
+test("worker path: the search's time limit starts once the worker is ready, not while its code loads", async () => {
+  const fallback = await findDoor(photo);
+  // Loading takes longer than the whole search may: still the worker's answer, not a timeout.
+  const log = installWorker({ readyAfterMs: 120 });
+  const r = await findDoor(photo, { timeoutMs: 60 });
+  assert.deepEqual(r, fallback);
+  assert.equal(log.posted.length, 1, 'the request is posted straight away (the worker holds it until loaded)');
+  assert.equal(log.terminated, 1);
+
+  // An old cached worker script that never says it is ready still answers, within the load allowance.
+  installWorker({ readyAfterMs: null });
+  assert.deepEqual(await findDoor(photo, { timeoutMs: 60 }), fallback);
+});
+
+test('worker path: a worker that has not started within the load allowance is given up for the main thread', async () => {
+  const log = installWorker({ answer: 'none', readyAfterMs: null });
+  const started = Date.now();
+  const r = await findDoor(photo, { timeoutMs: 10000, loadTimeoutMs: 50 });
+  assert.equal(r.ok, true, 'answered on the main thread');
+  assert.ok(maxErr(r.quad, truth) < TOL);
+  assert.equal(log.terminated, 1, 'the stalled worker is stopped');
+  assert.ok(Date.now() - started < 5000, 'without waiting for the search time limit');
+});
+
+test('worker path: a worker that starts late gets only what is left of the wait, not a whole search on top', async () => {
+  // The capture screen waits behind "Finding your door…". With its defaults (a 4 s search, 6 s to start) a
+  // worker ready at 5.9 s has until 6 s, not 9.9 s; here, scaled down, one ready at 350 ms of a 400 ms
+  // allowance has until 400 ms, not 350 + 350 ms. The door screen then looks again in the background.
+  const log = installWorker({ answer: 'none', readyAfterMs: 350 });
+  const started = Date.now();
+  const r = await findDoor(photo, { timeoutMs: 350, loadTimeoutMs: 400 });
+  const took = Date.now() - started;
+  assert.deepEqual(r, { ok: false, quad: null, confidence: 0, alternatives: [], reason: 'timeout' });
+  assert.ok(took < 600, `answered after ${took} ms`);
+  assert.equal(log.terminated, 1);
+});
+
+test('worker path, in the background: a worker that has not started in time is a timeout, not a main-thread search', async () => {
+  // The door screen's own search runs while the customer may be dragging a corner: a slow-to-start worker
+  // must not turn into a detection on the main thread, which freezes the page (a timeout is looked for
+  // again on the next visit).
+  const fallback = await findDoor(photo, { background: true });
+  assert.equal(fallback.ok, true, 'no Worker in this engine: the main thread still searches');
+  let log = installWorker({ answer: 'none', readyAfterMs: null });
+  const started = Date.now();
+  const r = await findDoor(photo, { timeoutMs: 10000, loadTimeoutMs: 50, background: true });
+  assert.deepEqual(r, { ok: false, quad: null, confidence: 0, alternatives: [], reason: 'timeout' }, 'not searched on the main thread');
+  assert.equal(log.terminated, 1, 'the stalled worker is stopped');
+  assert.ok(Date.now() - started < 5000, 'without waiting for the search time limit');
+
+  // A worker that starts in time still answers, and one that fails to load still means the main thread:
+  // the search would never get done otherwise.
+  log = installWorker({ readyAfterMs: 20 });
+  assert.deepEqual(await findDoor(photo, { loadTimeoutMs: 2000, background: true }), fallback);
+  assert.equal(log.terminated, 1);
+  installWorker({ answer: 'error' });
+  assert.deepEqual(await findDoor(photo, { background: true }), fallback);
+});
+
+test('signal: a search its caller gave up on stops the worker and never starts on the main thread', async () => {
+  // Aborted while the worker is still loading: a timeout straight away (it settled nothing), worker stopped.
+  let log = installWorker({ answer: 'none', readyAfterMs: null });
+  const leaving = new AbortController();
+  const started = Date.now();
+  const pending = findDoor(photo, { loadTimeoutMs: 2000, signal: leaving.signal });
+  setTimeout(() => leaving.abort(), 10);
+  assert.equal((await pending).reason, 'timeout', 'not searched on the main thread after the load allowance');
+  assert.ok(Date.now() - started < 1000, 'at the abort, not at the end of the load allowance');
+  assert.equal(log.terminated, 1);
+
+  // Already aborted: no worker is even made.
+  log = installWorker();
+  const gone = new AbortController();
+  gone.abort();
+  assert.equal((await findDoor(photo, { signal: gone.signal })).reason, 'timeout');
+  assert.equal(log.created.length, 0);
+
+  // No Worker in this engine, aborted while it yields before the main-thread search: never started.
+  delete globalThis.Worker;
+  const late = new AbortController();
+  const yielding = findDoor(photo, { signal: late.signal });
+  late.abort();
+  assert.equal((await yielding).reason, 'timeout');
+
+  // Not aborted: the answer as usual, and aborting after it answered changes nothing.
+  const kept = new AbortController();
+  const fallback = await findDoor(photo);
+  installWorker();
+  assert.deepEqual(await findDoor(photo, { signal: kept.signal }), fallback);
+  kept.abort();
+  assert.deepEqual(await findDoor(photo, { signal: { aborted: false } }), fallback, 'anything shaped like a signal');
+});
+
+test('worker module, in a worker scope: listens, then says it is ready, then answers each request', async () => {
+  // The real worker script's half of the start-up protocol (findDoor only starts the search's own time
+  // limit at { ready: true }; a worker that never said so would be given up at the load allowance).
+  const saved = ['self', 'WorkerGlobalScope'].map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  const posted = [];
+  globalThis.WorkerGlobalScope = class {};
+  globalThis.self = { postMessage: (message) => posted.push({ message, listening: typeof globalThis.self.onmessage === 'function' }) };
+  try {
+    await import('../js/door-detect-worker.js?scope=1');
+    assert.deepEqual(posted, [{ message: { ready: true }, listening: true }], 'ready once, and only after it listens');
+    const image = blankImage(320, 400);
+    globalThis.self.onmessage({ data: { id: 3, image, opts: {} } });
+    assert.equal(posted.length, 2);
+    assert.deepEqual(posted[1].message, { id: 3, result: runDetection(image, {}) });
+  } finally {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
 });
 
 test('worker path: a worker that fails to load or cannot be created falls back to the main thread', async () => {

@@ -1,14 +1,24 @@
 // When the app offers AR, from js/ar-support.js: arSupported() with a mocked navigator.xr and
-// isSecureContext (supported, unsupported, throwing, hanging past the timeout, cached), and the
-// in-app browser check.
+// isSecureContext (supported, unsupported, throwing, hanging past the timeout, cached, a page that may
+// not use fullscreen), the record of a refused session, and the in-app browser check.
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { arSupported, isKnownInAppBrowser, resetArSupport, SUPPORT_TIMEOUT_MS } from '../js/ar-support.js';
+import {
+  arRefused,
+  arSupported,
+  isKnownInAppBrowser,
+  noteArRefused,
+  noteArStarted,
+  resetArSupport,
+  SUPPORT_TIMEOUT_MS,
+} from '../js/ar-support.js';
 
 const saved = {
   navigator: Object.getOwnPropertyDescriptor(globalThis, 'navigator'),
   isSecureContext: Object.getOwnPropertyDescriptor(globalThis, 'isSecureContext'),
+  document: Object.getOwnPropertyDescriptor(globalThis, 'document'),
+  window: Object.getOwnPropertyDescriptor(globalThis, 'window'),
 };
 
 function restore(name) {
@@ -49,8 +59,36 @@ beforeEach(() => resetArSupport());
 afterEach(() => {
   restore('navigator');
   restore('isSecureContext');
+  restore('document');
+  restore('window');
   resetArSupport();
 });
+
+/**
+ * Put the page in a frame (or not) and set document.fullscreenEnabled (undefined leaves it out, as
+ * on browsers without the unprefixed Fullscreen API).
+ */
+function fakePage({ framed = false, fullscreenEnabled } = {}) {
+  const win = {};
+  win.parent = framed ? {} : win;
+  const doc = {};
+  if (fullscreenEnabled !== undefined) doc.fullscreenEnabled = fullscreenEnabled;
+  Object.defineProperty(globalThis, 'window', { value: win, configurable: true, writable: true });
+  Object.defineProperty(globalThis, 'document', { value: doc, configurable: true, writable: true });
+}
+
+/** Run `fn` with console.info captured; returns what was logged. */
+async function capturingInfo(fn) {
+  const logged = [];
+  const original = console.info;
+  console.info = (...args) => logged.push(args.join(' '));
+  try {
+    await fn();
+  } finally {
+    console.info = original;
+  }
+  return logged;
+}
 
 describe('arSupported', () => {
   test('true when a secure page has navigator.xr and immersive-ar is supported', async () => {
@@ -142,6 +180,76 @@ describe('arSupported', () => {
     // ...until the cache is dropped.
     resetArSupport();
     assert.equal(await arSupported(), false);
+  });
+
+  test('false when the page may not use fullscreen, which the AR overlay is built on', async () => {
+    // An iframe with allow="camera; xr-spatial-tracking" but no fullscreen: Chrome's
+    // isSessionSupported() still says true, yet every requestSession() with 'dom-overlay' is refused.
+    const xr = fakeXr(() => Promise.resolve(true));
+    fakeBrowser({ xr });
+    fakePage({ framed: true, fullscreenEnabled: false });
+    const logged = await capturingInfo(async () => {
+      assert.equal(await arSupported(), false, 'framed without fullscreen');
+    });
+    assert.equal(xr.calls.length, 0, 'no need to ask the browser');
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /allowfullscreen/, 'the console tells the embedder what to add');
+
+    // The same at the top level, from a Permissions-Policy header without fullscreen.
+    resetArSupport();
+    fakePage({ framed: false, fullscreenEnabled: false });
+    await capturingInfo(async () => {
+      assert.equal(await arSupported(), false, 'top level without fullscreen');
+    });
+  });
+
+  test('fullscreen allowed, or not reported, leaves the answer to the browser', async () => {
+    for (const [name, page] of [
+      ['framed with allow="fullscreen"', { framed: true, fullscreenEnabled: true }],
+      ['top level', { framed: false, fullscreenEnabled: true }],
+      ['no document.fullscreenEnabled', { framed: true }],
+    ]) {
+      resetArSupport();
+      const xr = fakeXr(() => Promise.resolve(true));
+      fakeBrowser({ xr });
+      fakePage(page);
+      const logged = await capturingInfo(async () => {
+        assert.equal(await arSupported(), true, name);
+      });
+      assert.deepEqual(xr.calls, ['immersive-ar'], name);
+      assert.deepEqual(logged, [], name);
+    }
+  });
+
+  test('no fullscreen hint on a browser without WebXR (an iPhone has no element fullscreen either)', async () => {
+    fakeBrowser({});
+    fakePage({ framed: false, fullscreenEnabled: false });
+    const logged = await capturingInfo(async () => {
+      assert.equal(await arSupported(), false);
+    });
+    assert.deepEqual(logged, []);
+  });
+});
+
+describe('arRefused', () => {
+  test('remembers a refused session past the screen that saw it, until a session starts', async () => {
+    // A phone Chrome says can do AR, which then refuses the session (not ARCore-certified, or the
+    // customer turned down the "Google Play Services for AR" install).
+    fakeBrowser({ xr: fakeXr(() => Promise.resolve(true)) });
+    assert.equal(arRefused(), false, 'nothing refused yet');
+    noteArRefused();
+    assert.equal(arRefused(), true);
+    // AR is still supported (it is offered second, not hidden): only the order changes.
+    assert.equal(await arSupported(), true);
+    assert.equal(arRefused(), true, 'a later support check does not forget it');
+    noteArRefused();
+    assert.equal(arRefused(), true);
+    // The customer tried again and allowed it: AR runs on this phone after all.
+    noteArStarted();
+    assert.equal(arRefused(), false);
+    noteArRefused();
+    resetArSupport();
+    assert.equal(arRefused(), false, 'reset forgets it too');
   });
 });
 

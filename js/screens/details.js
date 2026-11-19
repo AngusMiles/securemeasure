@@ -7,6 +7,8 @@
 import { validateCustomer, buildLeadPayload, submitLead, leadMode } from '../lead.js';
 import { applyMeasurementRules, calculateQuote, formatMoney, formatLength } from '../quote.js';
 import { photoToJpegDataUrl } from '../photo.js';
+// The AR result screen's own test for "a standard size is on offer", so the lead says what it showed.
+import { closestStandard } from './result-standard.js';
 
 /** Screen id, used for routing and the `sm-screen--details` class. */
 export const id = 'details';
@@ -364,15 +366,36 @@ export function isDemoDoor(state) {
 }
 
 /**
+ * True when state.photo is the photo behind the size being sent, so it may go with the enquiry: the
+ * size was read off it (paper or estimate), or the customer typed a size over a measurement of it.
+ * A photo left over from a way in the customer backed out of stays in state until a new photo
+ * replaces it, and must not be sent with a size it played no part in: an AR reading, or a size
+ * typed in with no measurement of that photo behind it.
+ *
+ * @param {object} state shared app state
+ * @returns {boolean}
+ */
+export function photoBacksSize(state) {
+  if (!state?.photo) return false;
+  const source = state.size?.source;
+  if (source === 'photo' || source === 'estimate') return true;
+  // setPhoto clears state.measure, so any measure that is not an AR reading was taken from this photo.
+  return source === 'manual' && Boolean(state.measure) && state.measure.method !== 'ar';
+}
+
+/**
  * The measurement block of the lead (buildLeadPayload's `measurement`), for each way the size can
  * have been got. Each carries only what means something for it, and only when state.measure is the
  * measurement the size came from (a stale one from an earlier try is never mixed in):
  *
  * - 'photo' (paper): the fit quality and the two sigmas.
- * - 'estimate': `standard: true`, `alternatives` (the other standard sizes the customer was offered,
- *   as listed in config.measurement.standardSizes) and `aspectHW`.
- * - 'ar': `standard` (whether the customer took the nearest standard size), `measured` (the AR
- *   reading of the opening, before the company's rules) and `warnings` (the AR self-check codes).
+ * - 'estimate': `standard: true`, `standardSize` (the standard size the customer is going ahead
+ *   with) and `alternatives` (the other ones they were offered), both as listed in
+ *   config.measurement.standardSizes; `aspectHW`; and what the result screen warned the customer
+ *   about: `nonStandard`, `confident` and the `issues` codes.
+ * - 'ar': `standard` (whether the customer took the nearest standard size), `standardOffered`
+ *   (whether one was close enough to offer them), `measured` (the AR reading of the opening, before
+ *   the company's rules) and `warnings` (the AR self-check codes).
  * - 'manual': the size alone.
  *
  * @param {object} state shared app state (state.size must be set)
@@ -389,14 +412,31 @@ export function leadMeasurement(state, config) {
     // A size matched from the photo is always one of the company's standard sizes.
     measurement.standard = true;
     if (measure?.method === 'estimate') {
-      measurement.alternatives = offeredAlternatives(state.size, measure, config);
+      const candidates = usableCandidates(measure);
+      const chosen = chosenCandidate(state.size, candidates, config);
+      // The catalogue size itself: state.size has the company's fitting allowance in it, the
+      // alternatives do not, and the email names the chosen size so the two can be told apart.
+      if (chosen >= 0) {
+        measurement.standardSize = { widthMm: candidates[chosen].widthMm, heightMm: candidates[chosen].heightMm };
+      }
+      measurement.alternatives = offeredAlternatives(candidates, chosen);
       measurement.aspectHW = measure.aspectHW;
+      // The customer was shown a warning banner for these (estimateBannerKey: not confident, or not a
+      // standard size at all), so the company hears it too: a priced standard size may really be a
+      // door wider than any it sells. Read the way the banner reads them.
+      measurement.nonStandard = measure.nonStandard === true;
+      measurement.confident = measure.confident === true;
+      const issues = Array.isArray(measure.issues) ? measure.issues : [];
+      measurement.issues = issues.filter((code) => typeof code === 'string');
     }
   } else if (source === 'ar') {
     measurement.standard = state.size.standard === true;
     if (measure?.method === 'ar') {
       measurement.measured = { widthMm: measure.widthMm, heightMm: measure.heightMm };
       measurement.warnings = Array.isArray(measure.warnings) ? [...measure.warnings] : [];
+      // standard: false means either "turned the standard size down" or "none was close enough to
+      // offer" (the result screen's 'may not be a standard size' banner); this tells them apart.
+      measurement.standardOffered = closestStandard(measure) !== null;
     }
   } else if (source === 'photo' && measure && (measure.method == null || measure.method === 'paper')) {
     // Fit quality and uncertainty only mean something for the paper method.
@@ -407,27 +447,35 @@ export function leadMeasurement(state, config) {
   return measurement;
 }
 
-/**
- * The standard sizes the result screen offered besides the one the customer is going ahead with,
- * best first, as listed in the company's catalogue (opening sizes, before its fitting allowance).
- * state.size has the company's rules applied, so each candidate is put through the same rules to
- * find the chosen one; failing that (no config), the candidate nearest the size is taken.
- */
-function offeredAlternatives(size, measure, config) {
+/** The estimate's candidate standard sizes that have a usable width and height, best first. */
+function usableCandidates(measure) {
   const usable = (c) => c && Number.isFinite(c.widthMm) && Number.isFinite(c.heightMm);
-  const candidates = (Array.isArray(measure.candidates) ? measure.candidates : []).filter(usable);
-  if (candidates.length === 0) return [];
+  return (Array.isArray(measure.candidates) ? measure.candidates : []).filter(usable);
+}
 
+/**
+ * Which of the candidates the customer is going ahead with, or -1 when there are none. state.size
+ * has the company's rules applied, so each candidate is put through the same rules to find the
+ * chosen one; failing that (no config), the candidate nearest the size is taken.
+ */
+function chosenCandidate(size, candidates, config) {
+  if (candidates.length === 0) return -1;
   const rules = config?.measurement;
-  let chosen = candidates.findIndex((c) => {
+  const chosen = candidates.findIndex((c) => {
     const ruled = applyMeasurementRules(rules, c);
     return ruled.widthMm === size.widthMm && ruled.heightMm === size.heightMm;
   });
-  if (chosen < 0) {
-    const gap = (c) => Math.abs(c.widthMm - size.widthMm) + Math.abs(c.heightMm - size.heightMm);
-    chosen = candidates.reduce((best, c, i) => (gap(c) < gap(candidates[best]) ? i : best), 0);
-  }
+  if (chosen >= 0) return chosen;
+  const gap = (c) => Math.abs(c.widthMm - size.widthMm) + Math.abs(c.heightMm - size.heightMm);
+  return candidates.reduce((best, c, i) => (gap(c) < gap(candidates[best]) ? i : best), 0);
+}
 
+/**
+ * The standard sizes the result screen offered besides the chosen one (`chosen`, an index into
+ * `candidates`), best first, as listed in the company's catalogue (opening sizes, before its
+ * fitting allowance).
+ */
+function offeredAlternatives(candidates, chosen) {
   // As the result screen offers them: the most likely size whatever its chance (a long catalogue can
   // leave even the best below OFFERED_MIN_P), the others only with a chance of at least OFFERED_MIN_P.
   return candidates
@@ -456,9 +504,20 @@ function effectiveInstallation(config, chosen) {
   return typeof chosen === 'boolean' ? chosen : Boolean(installation.default);
 }
 
-/** The photo is a nice-to-have for the company: never let it block the enquiry. */
-function leadPhoto(config, state) {
-  if (!config.lead?.includePhoto || !state.photo) return undefined;
+/**
+ * The photo to send with the enquiry (buildLeadPayload's `photoDataUrl`), as a JPEG data URL, or
+ * undefined when none may go: the company has not asked for photos, the photo is not the one the
+ * size came from (photoBacksSize), or it is the bundled demo image behind a size that is not the
+ * demo door's. Exported so the submit path's photo choice is tested, not only its parts.
+ * The photo is a nice-to-have for the company: never let it block the enquiry.
+ *
+ * @param {object} config merged app config
+ * @param {object} state shared app state
+ * @returns {string | undefined}
+ */
+export function leadPhoto(config, state) {
+  // Only the photo the size was measured from: never one left over from a way in the customer abandoned.
+  if (!config.lead?.includePhoto || !photoBacksSize(state)) return undefined;
   // The bundled demo image is not the customer's door: it only goes with an enquiry marked as a demo.
   if (state.photo.isDemo && !isDemoDoor(state)) return undefined;
   try {

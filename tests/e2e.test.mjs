@@ -1,5 +1,6 @@
-// End-to-end test of the real measuring pipeline under Node, with no DOM: a synthetic door photo goes
-// through exactly the calls the screens make, in the same order and with the same arguments.
+// End-to-end test of the real measuring pipeline under Node: a synthetic door photo goes through exactly
+// the calls the screens make, in the same order and with the same arguments. No DOM, except for the
+// no-paper door screen, which runs itself in a fake browser (tests/helpers/screen-dom.mjs).
 //
 // The paper method:
 //   sheet screen    detectSheet(photo.image, tap, { luma }) -> sheetDetectionOutcome
@@ -13,8 +14,9 @@
 //   capture screen  setPhoto, method 'estimate', findDoor(photo, { prior: priorFromGuide(...) })
 //                   (the welcome demo: the bundled photo's lens from js/demo.js demoPhotoFocal35mm,
 //                   useDemoPhoto, then findDoor(photo))
-//   door screen     startingQuad -> doorCornersPlaced -> estimateFromCorners({ ...photoFocal(photo),
-//                   sizes: standardSizesFrom(config) }) -> applyMeasurementRules(candidates[0])
+//   door screen     js/screens/door.js mounted on that state, "Find my door size" pressed untouched:
+//                   startingQuad -> doorCornersPlaced -> estimateFromCorners({ ...photoFocal(photo),
+//                   sizes: standardSizesFrom(config), cornerSigmaPx }) -> applyMeasurementRules(candidates[0])
 //   result screen   estimateChoices -> planeToImageFor(measure.corners, W, H) -> warpToRect
 //   quote screen    calculateQuote, as above
 //   details screen  leadMeasurement(state, config) -> buildLeadPayload -> buildMailtoUrl / submitLead
@@ -40,14 +42,8 @@ import { applyMeasurementRules, calculateQuote } from '../js/quote.js';
 import { buildLeadPayload, buildMailtoUrl, LEAD_MAIL_STRINGS, leadMode, submitLead, validateCustomer } from '../js/lead.js';
 import { deepMerge } from '../js/theme.js';
 import { getLuma, getSheetMm, setPhoto } from '../js/photo.js';
-import {
-  canEnterDoor,
-  cornersInOutlineOrder,
-  doorCornersPlaced,
-  doorOutlines,
-  outlineIndexOf,
-  sheetDetectionOutcome,
-} from '../js/screens/mark-common.js';
+import { canEnterDoor, sheetDetectionOutcome } from '../js/screens/mark-common.js';
+import * as door from '../js/screens/door.js';
 import { detectDoor } from '../js/door-detect.js';
 import { findDoor, isConfident, startingQuad } from '../js/door-find.js';
 import { estimateFromCorners, photoFocal, planeToImageFor, standardSizesFrom } from '../js/estimate.js';
@@ -61,6 +57,7 @@ import { isDemoDoor as detailsIsDemoDoor, leadMeasurement as detailsLeadMeasurem
 import liveConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
 import { SHIPPED_CONFIG as baseConfig } from './helpers/shipped-config.mjs';
+import { installFakeDom } from './helpers/screen-dom.mjs';
 import { mulberry32 } from './helpers/synth.mjs';
 
 const TRUE_WIDTH_MM = 820;
@@ -817,39 +814,35 @@ async function runEstimate(photo, config = baseConfig) {
     if (photo.focal35mm == null) photo.focal35mm = demoPhotoFocal35mm(demoPhotoUrl(config));
     useDemoPhoto(state, photo, 'estimate', config.measurement);
   } else {
-    // js/screens/capture.js usePhoto: setPhoto, the way in, then the door with the guide as the prior.
+    // js/screens/capture.js usePhoto: setPhoto, the way in, then the door with the guide as the prior
+    // (kept on state.door for the door screen's search after a timeout).
     setPhoto(state, photo);
     state.method = 'estimate';
     prior = guidePrior(photo);
+    if (prior) state.door.prior = prior.map((p) => ({ x: p.x, y: p.y }));
   }
   state.door.detection = await findDoor(photo, { prior });
 
-  // js/screens/door.js: where the handles start, and whether they count as placed without a drag.
+  // js/screens/door.js itself, in a fake browser (tests/helpers/screen-dom.mjs), not a copy of it: the
+  // handles start where detection put them and, untouched, "Find my door size" measures them, with
+  // detection's corner error rather than a tap's (tests/door-screen.test.mjs pins which).
   const { detection } = state.door;
-  const points = startingQuad(photo, detection);
-  const outlines = doorOutlines(detection, { width: photo.width, height: photo.height });
-  const placed = doorCornersPlaced({ confident: isConfident(detection), outline: outlineIndexOf(outlines, points) });
-
-  // js/screens/door.js measureEstimate.
-  const focal = photoFocal(photo);
-  const measure = estimateFromCorners({
-    corners: cornersInOutlineOrder(points),
-    imageWidth: photo.width,
-    imageHeight: photo.height,
-    focalPx: focal.focalPx,
-    focalSource: focal.source,
-    sizes: standardSizesFrom(config),
-  });
-  if (measure.ok) {
-    const best = measure.candidates[0];
-    state.door.points = points;
-    state.measure = measure;
-    state.size = {
-      ...applyMeasurementRules(config.measurement, { widthMm: best.widthMm, heightMm: best.heightMm }),
-      source: 'estimate',
-      standard: true,
-    };
+  const dom = installFakeDom();
+  let screen = null;
+  try {
+    screen = dom.mount(door, { state, config });
+    screen.press(screen.ctx.t('door.estimate.measure'));
+  } finally {
+    screen?.unmount();
+    dom.uninstall();
   }
+  // Handles that do not count as placed get "Drag the four corners onto your door opening first." instead.
+  const placed = !screen.toasts.some((toast) => toast.text === screen.ctx.t('door.error.untouched'));
+  // The corners it measured, kept for "Adjust corners"; where the handles started, if it measured nothing.
+  const points = state.door.points ?? startingQuad(photo, detection);
+  const focal = photoFocal(photo);
+  // A failed estimate leaves no measurement, only a message: keep that, for the test that fails on it.
+  const measure = state.measure ?? { ok: false, error: screen.toasts.map((toast) => toast.text).join(' / ') || 'not measured' };
   return { config, photo, state, prior, detection, points, placed, focal, measure, size: state.size };
 }
 
@@ -896,6 +889,22 @@ function assertEstimatesDemoDoor(run, truthDoorPx, label) {
   assert.ok(!measure.issues.includes('not_rectangular'), `${label}: issues ${measure.issues.join(', ')}`);
   const aspectError = Math.abs(measure.aspectHW / (TRUE_HEIGHT_MM / TRUE_WIDTH_MM) - 1);
   assert.ok(aspectError < 0.015, `${label}: height/width ${measure.aspectHW.toFixed(4)} is within 1.5% of the truth`);
+
+  // Measured untouched, so as sure as detection's corners (9 px at 2048 px, scaled with the photo), not as
+  // sure as tapped ones: the door screen's own choice (tests/door-screen.test.mjs has the other cases).
+  const remeasure = (extra) =>
+    estimateFromCorners({
+      corners: measure.corners,
+      imageWidth: photo.width,
+      imageHeight: photo.height,
+      focalPx: focal.focalPx,
+      focalSource: focal.source,
+      sizes: standardSizesFrom(run.config),
+      ...extra,
+    });
+  const detectedSigmaPx = (9 * Math.max(photo.width, photo.height)) / 2048;
+  assert.equal(measure.sigmaLnAspect, remeasure({ cornerSigmaPx: detectedSigmaPx }).sigmaLnAspect, `${label}: detection's corner error`);
+  assert.ok(measure.sigmaLnAspect > remeasure({}).sigmaLnAspect, `${label}: less sure than tapped corners`);
 
   // Only the company's own sizes, best first, at most 4.
   const catalogue = new Set(standardSizesFrom(run.config).map(sizeLabel));

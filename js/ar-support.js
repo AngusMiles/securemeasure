@@ -9,10 +9,12 @@
  * A yes here is still not a promise. Chrome registers ARCore on every Android 7+ phone and only asks
  * for "Google Play Services for AR" when a session starts, so isSessionSupported('immersive-ar') can
  * say true on a phone where requestSession() then fails. The AR screen therefore treats any rejection
- * as "use the photo instead", or whichever other way in the company offers (js/screens/ar.js).
+ * as "use the photo instead", or whichever other way in the company offers (js/screens/ar.js), and
+ * tells this module (noteArRefused), so the welcome screen stops putting AR first for the rest of the
+ * visit (arRefused) instead of sending the customer back to a way in that has just failed.
  *
- * Pure apart from reading `navigator` / `isSecureContext` when called. Nothing runs at import time,
- * so this module is safe to import under Node.
+ * Pure apart from reading `navigator` / `isSecureContext` / `document` when called. Nothing runs at
+ * import time, so this module is safe to import under Node.
  */
 
 /** How long to wait for isSessionSupported() before saying no. */
@@ -36,6 +38,22 @@ function askBrowser() {
     const nav = globalThis.navigator;
     const xr = nav && nav.xr;
     if (!xr || typeof xr.isSessionSupported !== 'function') return Promise.resolve(false);
+    // The AR screen needs the 'dom-overlay' feature, which Chrome builds on the Fullscreen API: it runs
+    // the fullscreen permissions-policy check before it grants the overlay, so a page that may not use
+    // fullscreen has every requestSession() rejected (NotSupportedError, FULLSCREEN_ERROR), however
+    // often the customer tries. isSessionSupported() does not check that and still says true. This is
+    // an iframe embed without allow="fullscreen" / allowfullscreen, or a Permissions-Policy header
+    // without fullscreen; document.fullscreenEnabled is false in exactly those cases. (Checked after
+    // navigator.xr, so the hint is not logged on iPhones, which have no element fullscreen or WebXR.)
+    const doc = globalThis.document;
+    if (doc && doc.fullscreenEnabled === false) {
+      console.info(
+        '[SecureMeasure] AR measuring is off: this page may not use fullscreen, which AR needs. ' +
+          'In an iframe, add allow="camera; xr-spatial-tracking; fullscreen" and allowfullscreen; ' +
+          'a Permissions-Policy header must allow fullscreen.',
+      );
+      return Promise.resolve(false);
+    }
     // A cross-origin iframe without allow="xr-spatial-tracking" gets a SecurityError here, thrown or
     // as a rejection depending on the browser: both mean no.
     return Promise.resolve(xr.isSessionSupported('immersive-ar')).then(
@@ -77,12 +95,44 @@ export function arSupported({ timeoutMs = SUPPORT_TIMEOUT_MS } = {}) {
 }
 
 /**
- * Forget the cached answer so the next arSupported() asks the browser again. For tests; the app
- * itself never needs it, because what a browser supports does not change while the page is open.
+ * True once an AR session has been refused (or failed to set up) on this page and none has run
+ * since. Module state, not screen state, because the screens are rebuilt on every visit: the AR card
+ * that saw the refusal is gone by the time the customer is back on the welcome screen.
+ */
+let refused = false;
+
+/**
+ * Record that requestSession() was refused or the granted session could not be set up. Until a
+ * session runs, arRefused() says so, and the welcome screen and the AR card put the other way in
+ * first. arSupported() is left alone: AR is still offered, second, because the cause may be a prompt
+ * the customer dismissed by mistake, which Chrome shows again on the next try.
+ */
+export function noteArRefused() {
+  refused = true;
+}
+
+/** Record that an AR session was granted: whatever refused AR before does not stand in its way now. */
+export function noteArStarted() {
+  refused = false;
+}
+
+/**
+ * True when AR was refused on this page (noteArRefused) and has not started since (noteArStarted).
+ * @returns {boolean}
+ */
+export function arRefused() {
+  return refused;
+}
+
+/**
+ * Forget the cached answer and any refusal, so the next arSupported() asks the browser again. For
+ * tests; the app itself never needs it, because what a browser supports does not change while the
+ * page is open.
  */
 export function resetArSupport() {
   query = null;
   answer = null;
+  refused = false;
 }
 
 /*

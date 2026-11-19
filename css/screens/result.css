@@ -204,6 +204,17 @@
   border-radius: var(--sm-radius-sm);
 }
 
+/* The badge also carries the size's height ('Also possible · Standard height'), which wraps onto two
+   lines on 320 px phones. A radius of half its one-line height (12 px text at line-height 1.3, plus
+   2 px padding top and bottom) is the same pill on one line and a rounded box on two, where the 999px
+   pill would cut into the text. The height label is kept on one line (choiceBadgeText); a reworded
+   one too long for the badge still breaks rather than spilling out of the card. */
+.sm-screen--result .sm-result__choices .sm-radiocard__badge {
+  max-width: 100%;
+  border-radius: calc(0.65em + 2px);
+  overflow-wrap: anywhere;
+}
+
 /* The two AR choices sit side by side when both fit, stacked on 320 px phones. */
 .sm-screen--result .sm-result__standard .sm-seg {
   flex: 1 1 140px;

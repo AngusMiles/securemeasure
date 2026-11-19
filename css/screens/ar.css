@@ -481,3 +481,33 @@
     height: 64px;
   }
 }
+
+/*
+ * A very narrow screen, which is mostly a normal phone with Android's page zoom turned up (a 360 px
+ * phone at 130 % is 277 CSS px). Undo and Cancel (about 90 px each, with their labels) and the 76 px
+ * Place button no longer fit side by side below about 290 px: the side buttons spill out of their
+ * columns over Place, and a tap on the edge of Place lands on Cancel. So Undo and Cancel get a row of
+ * their own, keeping their labels, and Place stays at the bottom in the middle, a whole row away
+ * from Cancel. (The DOM order, and so the focus order, stays Undo, Place, Cancel.)
+ */
+@media (max-width: 300px) {
+  .sm-ar-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      'undo cancel'
+      'place place';
+  }
+
+  .sm-ar-bar__undo {
+    grid-area: undo;
+  }
+
+  .sm-ar-bar__cancel {
+    grid-area: cancel;
+  }
+
+  .sm-ar-bar .sm-ar-place {
+    grid-area: place;
+    justify-self: center;
+  }
+}

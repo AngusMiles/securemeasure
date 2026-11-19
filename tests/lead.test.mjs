@@ -12,7 +12,7 @@ import {
   LEAD_ERROR_STRINGS,
   LEAD_MAIL_STRINGS,
 } from '../js/lead.js';
-import { leadMeasurement, isDemoDoor, strings as detailsStrings } from '../js/screens/details.js';
+import { leadMeasurement, isDemoDoor, photoBacksSize, leadPhoto, strings as detailsStrings } from '../js/screens/details.js';
 import { strings as quoteStrings } from '../js/screens/quote.js';
 import { strings as doneStrings } from '../js/screens/done.js';
 
@@ -866,6 +866,46 @@ describe('measurement sources: the lead payload', () => {
     assert.ok(!('standard' in messy.measurement), 'standard is only carried when it is set');
   });
 
+  test("an estimate carries the matched standard size and the result screen's warnings, cleaned", () => {
+    const payload = makePayload({
+      measurement: {
+        widthMm: 914,
+        heightMm: 2034,
+        source: 'estimate',
+        standard: true,
+        standardSize: { widthMm: 919.6, heightMm: 2040.2 },
+        nonStandard: true,
+        confident: false,
+        issues: ['non_standard', 42, '', null, 'steep_angle', ...Array.from({ length: 20 }, (_, i) => `code_${i}`)],
+      },
+    });
+    const { measurement } = payload;
+    assert.deepEqual(measurement.standardSize, { widthMm: 920, heightMm: 2040 });
+    assert.equal(measurement.nonStandard, true);
+    assert.equal(measurement.confident, false);
+    assert.deepEqual(measurement.issues.slice(0, 2), ['non_standard', 'steep_angle']);
+    assert.equal(measurement.issues.length, 12, 'a short, bounded list of codes');
+    assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload);
+
+    // Only booleans, and only when given: an estimate built without them never claims a confidence.
+    const vague = makePayload({
+      measurement: { widthMm: 814, heightMm: 2034, source: 'estimate', nonStandard: 'yes', confident: 1, issues: 'steep_angle', standardSize: { widthMm: 820 } },
+    }).measurement;
+    for (const key of ['nonStandard', 'confident', 'issues', 'standardSize']) assert.ok(!(key in vague), `no ${key}`);
+    // Never on another source.
+    const paper = makePayload({ measurement: { ...MEASUREMENT, nonStandard: true, confident: false, issues: ['x'], standardOffered: true } }).measurement;
+    for (const key of ['nonStandard', 'confident', 'issues', 'standardOffered']) assert.ok(!(key in paper), `paper has no ${key}`);
+  });
+
+  test('an AR reading says whether a standard size was offered, only as a boolean', () => {
+    const offered = (standardOffered) =>
+      makePayload({ measurement: { widthMm: 1174, heightMm: 2041, source: 'ar', standard: false, standardOffered } }).measurement;
+    assert.equal(offered(false).standardOffered, false);
+    assert.equal(offered(true).standardOffered, true);
+    assert.ok(!('standardOffered' in offered('no')));
+    assert.ok(!('standardOffered' in offered(undefined)));
+  });
+
   test('an AR reading carries standard, the raw reading and the AR warnings', () => {
     const payload = makePayload({
       measurement: {
@@ -1084,22 +1124,108 @@ describe('details screen: the measurement block it sends', () => {
       heightMm: 2034,
       source: 'estimate',
       standard: true,
+      // The catalogue size behind the 814 x 2034 the company's rules made of it.
+      standardSize: { widthMm: 820, heightMm: 2040 },
       // Catalogue sizes as listed; the fourth candidate (p 0.03) was never offered.
       alternatives: [
         { widthMm: 870, heightMm: 2100 },
         { widthMm: 820, heightMm: 2100 },
       ],
       aspectHW: ESTIMATE_MEASURE.aspectHW,
+      // What the result screen made of it: not confident (p 0.71), so the customer saw the "unsure" banner.
+      nonStandard: false,
+      confident: false,
+      issues: [],
     });
 
     // The customer picked "Also possible: 870 x 2100": that one is now the size, the most likely one an alternative.
     const picked = makeState({ size: { widthMm: 864, heightMm: 2094, source: 'estimate', standard: true }, measure: ESTIMATE_MEASURE });
+    assert.deepEqual(leadMeasurement(picked, config).standardSize, { widthMm: 870, heightMm: 2100 });
     assert.deepEqual(leadMeasurement(picked, config).alternatives, [
       { widthMm: 820, heightMm: 2040 },
       { widthMm: 820, heightMm: 2100 },
     ]);
     // Without the config the chosen size is still recognised, as the candidate nearest the size.
     assert.deepEqual(leadMeasurement(picked).alternatives, leadMeasurement(picked, config).alternatives);
+    assert.deepEqual(leadMeasurement(picked).standardSize, { widthMm: 870, heightMm: 2100 });
+  });
+
+  test('estimate: the warnings the customer was shown go with the lead, in the data and the email', () => {
+    // A 1200 x 2100 opening, wider than any size sold: estimateFromCorners still puts 920 x 2040 first
+    // with p about 1, but flags it as not a standard size, and the customer saw the nonStandard banner.
+    const wide = {
+      ...ESTIMATE_MEASURE,
+      aspectHW: 1.75,
+      candidates: [
+        { widthMm: 920, heightMm: 2040, p: 1, zAspect: -19.05 },
+        { widthMm: 920, heightMm: 2100, p: 0, zAspect: -20.1 },
+        { widthMm: 870, heightMm: 2040, p: 0, zAspect: -21.3 },
+      ],
+      nonStandard: true,
+      confident: false,
+      issues: ['non_standard'],
+    };
+    const mailConfig = makeConfig({ lead: { mailto: 'sales@testdoors.example' } });
+    const state = makeState({ size: { widthMm: 920, heightMm: 2040, source: 'estimate', standard: true }, measure: wide });
+    const payload = makePayload({ config: mailConfig, measurement: leadMeasurement(state, mailConfig) });
+    assert.deepEqual(payload.measurement, {
+      widthMm: 920,
+      heightMm: 2040,
+      source: 'estimate',
+      standard: true,
+      standardSize: { widthMm: 920, heightMm: 2040 },
+      alternatives: [],
+      aspectHW: 1.75,
+      nonStandard: true,
+      confident: false,
+      issues: ['non_standard'],
+    });
+    const body = parseMailto(buildMailtoUrl(mailConfig, payload)).params.body;
+    assert.ok(
+      body.includes('The app flagged: the door may not be a standard size, so this size could be some way out'),
+      body,
+    );
+    assert.ok(body.includes('Photo checks flagged: non_standard'));
+
+    // A likely size, but the door ran to the edge of the photo: the customer saw "can't match with
+    // confidence", and the lead is no longer byte-identical to a confident one.
+    const edge = { ...ESTIMATE_MEASURE, candidates: [{ widthMm: 820, heightMm: 2040, p: 0.97, zAspect: 0.1 }], confident: false, issues: ['door_near_edge'] };
+    const sure = { ...edge, confident: true, issues: [] };
+    const size = { widthMm: 820, heightMm: 2040, source: 'estimate', standard: true };
+    const edgeLead = makePayload({ config: mailConfig, measurement: leadMeasurement(makeState({ size, measure: edge }), mailConfig) });
+    const sureLead = makePayload({ config: mailConfig, measurement: leadMeasurement(makeState({ size, measure: sure }), mailConfig) });
+    assert.notDeepEqual(edgeLead.measurement, sureLead.measurement);
+    assert.equal(edgeLead.measurement.confident, false);
+    assert.deepEqual(edgeLead.measurement.issues, ['door_near_edge']);
+    const edgeBody = parseMailto(buildMailtoUrl(mailConfig, edgeLead)).params.body;
+    assert.ok(edgeBody.includes('The app flagged: it could not be sure which standard size this is'), edgeBody);
+    assert.ok(edgeBody.includes('Photo checks flagged: door_near_edge'));
+    const sureBody = parseMailto(buildMailtoUrl(mailConfig, sureLead)).params.body;
+    assert.ok(!sureBody.includes('flagged'), 'a confident estimate with no issues flags nothing');
+  });
+
+  test('estimate: with a fitting allowance, the email names the matched standard size and labels the others', () => {
+    const mailConfig = makeRulesConfig({ lead: { mailto: 'sales@testdoors.example' } });
+    const state = makeState({ size: { widthMm: 814, heightMm: 2034, source: 'estimate', standard: true }, measure: ESTIMATE_MEASURE });
+    const payload = makePayload({ config: mailConfig, measurement: leadMeasurement(state, mailConfig) });
+    const lines = parseMailto(buildMailtoUrl(mailConfig, payload)).params.body.split('\r\n');
+    const from = lines.findIndex((line) => line.startsWith('Door size:'));
+    assert.deepEqual(lines.slice(from, from + 6), [
+      'Door size: 814 mm wide x 2034 mm high',
+      'Measured: estimated from one photo, matched to the nearest standard size — needs a check measure',
+      'Matched standard size, before your fitting allowance: 820 x 2040 mm',
+      'Other standard sizes it could be, before your fitting allowance: 870 x 2100 mm, 820 x 2100 mm',
+      'The app flagged: it could not be sure which standard size this is',
+      'Product: Classic Security Door',
+    ]);
+
+    // No allowance: the door size is the catalogue size, so the lines stay as they were.
+    const plain = makeConfig({ lead: { mailto: 'sales@testdoors.example' } });
+    const plainState = makeState({ size: { widthMm: 820, heightMm: 2040, source: 'estimate', standard: true }, measure: ESTIMATE_MEASURE });
+    const plainBody = parseMailto(buildMailtoUrl(plain, makePayload({ config: plain, measurement: leadMeasurement(plainState, plain) }))).params.body;
+    assert.ok(plainBody.includes('Other standard sizes it could be: 870 x 2100 mm, 820 x 2100 mm'));
+    assert.ok(!plainBody.includes('Matched standard size'));
+    assert.ok(!plainBody.includes('before your fitting allowance'));
   });
 
   test('estimate: unlikely candidates are not passed on, and standard is always true', () => {
@@ -1124,12 +1250,35 @@ describe('details screen: the measurement block it sends', () => {
       heightMm: 2034,
       source: 'ar',
       standard: true,
+      standardOffered: true,
       measured: { widthMm: 823.38, heightMm: 2046.61 },
       warnings: ['base_not_level'],
     });
     const own = makeState({ size: { widthMm: 817, heightMm: 2041, source: 'ar', standard: false }, measure: AR_MEASURE });
     assert.equal(leadMeasurement(own, config).standard, false);
+    assert.equal(leadMeasurement(own, config).standardOffered, true, 'offered, and turned down');
     assert.notEqual(leadMeasurement(own, config).warnings, AR_MEASURE.warnings, 'a copy, not the measure itself');
+  });
+
+  test('AR: standard: false says whether a standard size was turned down or never on offer', () => {
+    // 1180 mm wide: the nearest standard size is 260 mm out, so the result screen offered none.
+    const wide = { ...AR_MEASURE, widthMm: 1180.4, heightMm: 2046.6, candidates: [{ widthMm: 920, heightMm: 2040, p: 1, zAspect: -9 }] };
+    const state = makeState({ size: { widthMm: 1174, heightMm: 2041, source: 'ar', standard: false }, measure: wide });
+    const measurement = leadMeasurement(state, config);
+    assert.equal(measurement.standard, false);
+    assert.equal(measurement.standardOffered, false);
+
+    const mailConfig = makeConfig({ lead: { mailto: 'sales@testdoors.example' } });
+    const readingLine = (m) =>
+      parseMailto(buildMailtoUrl(mailConfig, makePayload({ config: mailConfig, measurement: m })))
+        .params.body.split('\r\n')
+        .find((line) => line.startsWith('AR reading'));
+    assert.equal(readingLine(measurement), 'AR reading of the opening: 1180 mm wide x 2047 mm high (no standard size was close enough to offer)');
+    const own = leadMeasurement(makeState({ size: { widthMm: 817, heightMm: 2041, source: 'ar', standard: false }, measure: AR_MEASURE }), config);
+    assert.equal(
+      readingLine(own),
+      'AR reading of the opening: 823 mm wide x 2047 mm high (the customer kept this reading rather than the nearest standard size)',
+    );
   });
 
   test('manual: the typed size alone, whatever was measured before', () => {
@@ -1158,6 +1307,70 @@ describe('details screen: the measurement block it sends', () => {
     assert.equal(isDemoDoor({ size: size('estimate'), photo: null }), false);
   });
 
+  test('a photo goes with the enquiry only when the size was measured from it', () => {
+    const size = (source, extra = {}) => ({ widthMm: 814, heightMm: 2034, source, ...extra });
+    const libraryPicture = { isDemo: false };
+    // Read off the photo, by either photo way in.
+    assert.equal(photoBacksSize({ size: size('photo'), measure: PAPER_MEASURE, photo: libraryPicture }), true);
+    assert.equal(photoBacksSize({ size: size('estimate', { standard: true }), measure: ESTIMATE_MEASURE, photo: libraryPicture }), true);
+    // A size typed over a measurement of that photo: still the customer's door, as they photographed it.
+    assert.equal(photoBacksSize({ size: size('manual'), measure: ESTIMATE_MEASURE, photo: libraryPicture }), true);
+    assert.equal(photoBacksSize({ size: size('manual'), measure: PAPER_MEASURE, photo: libraryPicture }), true);
+
+    // "Choose a photo", the wrong picture, Back twice, then AR: ar.js leaves state.photo as it was, but
+    // the AR reading never used it, so the unrelated picture must not be uploaded with it.
+    assert.equal(photoBacksSize({ size: size('ar', { standard: false }), measure: AR_MEASURE, photo: libraryPicture }), false);
+    // The same, then a typed size over the AR reading, or straight from the welcome screen.
+    assert.equal(photoBacksSize({ size: size('manual'), measure: AR_MEASURE, photo: libraryPicture }), false);
+    assert.equal(photoBacksSize({ size: size('manual'), measure: null, photo: libraryPicture }), false);
+    assert.equal(photoBacksSize({ size: size('estimate'), measure: ESTIMATE_MEASURE, photo: null }), false, 'no photo');
+  });
+
+  test('the submit path sends a leftover library photo with an AR enquiry never, and the measured one always', () => {
+    // leadPhoto is what the details screen's submit hands buildLeadPayload. photoToJpegDataUrl needs a
+    // canvas, so document is stubbed for every case: without it a wrongly attempted encode would throw,
+    // be swallowed as "no photo" and hide the very leak this test is for.
+    const hadDocument = 'document' in globalThis;
+    const realDocument = globalThis.document;
+    let encodes = 0;
+    globalThis.document = {
+      createElement: () => ({
+        width: 0,
+        height: 0,
+        getContext: () => ({ fillRect() {}, drawImage() {} }),
+        toDataURL: () => {
+          encodes += 1;
+          return 'data:image/jpeg;base64,TElCUkFSWQ==';
+        },
+      }),
+    };
+    try {
+      const withPhotos = makeConfig({ lead: { includePhoto: true } });
+      const libraryPicture = { isDemo: false, width: 1536, height: 2048, canvas: {} };
+      const send = (state) =>
+        makePayload({ config: withPhotos, measurement: leadMeasurement(state, withPhotos), photoDataUrl: leadPhoto(withPhotos, state), demo: isDemoDoor(state) });
+
+      // "Choose a photo", the wrong picture, Back twice, then AR: the picture is still in state.photo.
+      const ar = { size: { widthMm: 814, heightMm: 2034, source: 'ar', standard: true }, measure: AR_MEASURE, photo: libraryPicture };
+      assert.equal(leadPhoto(withPhotos, ar), undefined);
+      assert.ok(!('photo' in send(ar)), 'the AR enquiry carries no photo');
+      // The same, with a size typed over the AR reading.
+      const typed = { size: { widthMm: 900, heightMm: 2100, source: 'manual' }, measure: AR_MEASURE, photo: libraryPicture };
+      assert.ok(!('photo' in send(typed)), 'a size typed over an AR reading carries no photo');
+      assert.equal(encodes, 0, 'the leftover photo is never even encoded');
+
+      // The photo the size was estimated from does go.
+      const estimate = { size: { widthMm: 814, heightMm: 2034, source: 'estimate', standard: true }, measure: ESTIMATE_MEASURE, photo: libraryPicture };
+      assert.equal(send(estimate).photo, 'data:image/jpeg;base64,TElCUkFSWQ==');
+      assert.equal(encodes, 1);
+      // And not when the company has not asked for photos.
+      assert.equal(leadPhoto(makeConfig(), estimate), undefined);
+    } finally {
+      if (hadDocument) globalThis.document = realDocument;
+      else delete globalThis.document;
+    }
+  });
+
   test('end to end: each way in gives the documented lead measurement', () => {
     const cases = [
       [
@@ -1171,16 +1384,28 @@ describe('details screen: the measurement block it sends', () => {
           heightMm: 2034,
           source: 'estimate',
           standard: true,
+          standardSize: { widthMm: 820, heightMm: 2040 },
           alternatives: [
             { widthMm: 870, heightMm: 2100 },
             { widthMm: 820, heightMm: 2100 },
           ],
           aspectHW: 2.4878,
+          nonStandard: false,
+          confident: false,
+          issues: [],
         },
       ],
       [
         makeState({ size: { widthMm: 814, heightMm: 2034, source: 'ar', standard: true }, measure: AR_MEASURE, isDemo: true }),
-        { widthMm: 814, heightMm: 2034, source: 'ar', standard: true, measured: { widthMm: 823, heightMm: 2047 }, warnings: ['base_not_level'] },
+        {
+          widthMm: 814,
+          heightMm: 2034,
+          source: 'ar',
+          standard: true,
+          standardOffered: true,
+          measured: { widthMm: 823, heightMm: 2047 },
+          warnings: ['base_not_level'],
+        },
       ],
       [makeState({ size: { widthMm: 900, heightMm: 2100, source: 'manual' }, measure: AR_MEASURE }), { widthMm: 900, heightMm: 2100, source: 'manual' }],
     ];

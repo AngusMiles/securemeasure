@@ -1,8 +1,10 @@
 /**
  * Module worker that runs the door detector off the main thread (started by js/door-find.js).
  *
- * Protocol: the page posts { id, image: { data, width, height }, opts } with `data` transferred (a copy of
- * the photo's RGBA pixels), and gets back { id, result } where `result` is a door-find Detection
+ * Protocol: once its imports have loaded, the worker posts { ready: true } (door-find starts the search's
+ * time limit then, so fetching and compiling this code is not counted against it). The page posts
+ * { id, image: { data, width, height }, opts } with `data` transferred (a copy of the photo's RGBA pixels),
+ * and gets back { id, result } where `result` is a door-find Detection
  * ({ ok, quad, confidence, alternatives, reason? }). One request per worker; door-find terminates it after.
  *
  * Importing this file outside a worker (e.g. from a Node test) only defines handleMessage.
@@ -27,4 +29,6 @@ if (typeof WorkerGlobalScope !== 'undefined' && typeof self !== 'undefined' && t
   self.onmessage = (event) => {
     self.postMessage(handleMessage(event.data));
   };
+  // Module code runs only after every import has loaded, so this says the detector is here and ready.
+  self.postMessage({ ready: true });
 }

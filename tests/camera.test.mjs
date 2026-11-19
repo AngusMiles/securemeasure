@@ -22,11 +22,11 @@ import {
   stopCamera,
   viewRectToSource,
 } from '../js/camera.js';
-import { mount as mountCaptureScreen } from '../js/screens/capture.js';
+import { mount as mountCaptureScreen, strings as captureStrings } from '../js/screens/capture.js';
 
 // ---- Global stubs ------------------------------------------------------------------------------
 
-const STUBBED = ['navigator', 'ImageCapture', 'document', 'isSecureContext', 'window'];
+const STUBBED = ['navigator', 'ImageCapture', 'document', 'isSecureContext', 'window', 'createImageBitmap'];
 const ORIGINAL = new Map(STUBBED.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
 const saved = [];
 
@@ -579,7 +579,59 @@ describe('capturePhoto', () => {
     assert.equal(result.blob, still);
     assert.equal(canvas.canvases.length, 0);
   });
+
+  // iOS 18.4+ (and an Android camera that ignores JPEG_ORIENTATION): the phone is on its side, the live
+  // frames follow it, the still keeps the camera's default way up.
+  for (const [label, still] of [
+    ['stored landscape, EXIF says turn it upright', jpegStill(4032, 3024, 6)],
+    ['stored portrait, no turn', jpegStill(3024, 4032, 1)],
+  ]) {
+    test(`a still turned against the live view (${label}): the frame from the press instead`, async () => {
+      const canvas = installCanvas();
+      const seen = installImageCapture({ capabilities: PHOTO_CAPABILITIES, takePhoto: () => Promise.resolve(still) });
+      const video = fakeVideo({ width: 1920, height: 1440 });
+      const result = await capturePhoto({ track: fakeTrack(), video });
+      assert.equal(seen.options.length, 1, 'the still was asked for');
+      assert.equal(result.capture, 'frame');
+      assert.notEqual(result.blob, still);
+      assert.deepEqual(canvas.draws, [{ source: video, x: 0, y: 0, w: 1920, h: 1440, canvasW: 1920, canvasH: 1440 }]);
+      assert.equal(canvas.encodes.length, 1);
+      assert.equal(canvas.canvases[0].width, 0, 'canvas released afterwards');
+    });
+  }
+
+  test('a still the same way up as the live view once its EXIF turn is applied is kept', async () => {
+    const canvas = installCanvas();
+    for (const [still, width, height] of [
+      [jpegStill(4032, 3024, 6), 1440, 1920], // portrait phone: stored landscape, shown portrait
+      [jpegStill(4032, 3024, 1), 1920, 1440], // landscape phone that turned its JPEG properly
+      [jpegStill(3024, 3024, 1), 1920, 1440], // a square still is neither way up
+    ]) {
+      installImageCapture({ capabilities: PHOTO_CAPABILITIES, takePhoto: () => Promise.resolve(still) });
+      const result = await capturePhoto({ track: fakeTrack(), video: fakeVideo({ width, height }) });
+      assert.equal(result.capture, 'live');
+      assert.equal(result.blob, still);
+    }
+    assert.equal(canvas.encodes.length, 0, 'no frame encoded');
+  });
 });
+
+/**
+ * The head of a JPEG stored `width` x `height` px with EXIF Orientation `orientation`: SOI, an APP1 Exif
+ * segment (big-endian TIFF, IFD0 holding only Orientation) and a baseline SOF0 frame header.
+ */
+function jpegStill(width, height, orientation) {
+  const tiff = [
+    0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08, // "MM", 42, IFD0 at offset 8
+    0x00, 0x01, // one entry
+    0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, orientation, 0x00, 0x00, // Orientation, SHORT
+    0x00, 0x00, 0x00, 0x00, // no next IFD
+  ];
+  const exif = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00, ...tiff]; // "Exif\0\0"
+  const app1 = [0xff, 0xe1, 0x00, exif.length + 2, ...exif];
+  const sof = [0xff, 0xc0, 0x00, 0x11, 0x08, height >> 8, height & 0xff, width >> 8, width & 0xff, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+  return new Blob([new Uint8Array([0xff, 0xd8, ...app1, ...sof, 0xff, 0xd9])], { type: 'image/jpeg' });
+}
 
 /** The phone moves on while takePhoto is out: another picture, and turned on its side. */
 function turnAway(video) {
@@ -686,6 +738,37 @@ describe('startCamera', () => {
     const error = await startCamera(fakeVideo()).then(() => null, (e) => e);
     assert.equal(calls.length, 1);
     assert.equal(cameraErrorKind(error), 'blocked');
+  });
+
+  test('dropped while the browser decides: the late stream is stopped, the video left alone, AbortError', async () => {
+    const track = fakeTrack();
+    let grant;
+    installMediaDevices(() => new Promise((resolve) => {
+      grant = resolve;
+    }));
+    const video = fakeVideo();
+    const request = new AbortController();
+    const started = startCamera(video, { signal: request.signal });
+    request.abort();
+    const newer = { id: 'a newer request' };
+    video.srcObject = newer;
+    grant(fakeStream([track]));
+    const error = await started.then(() => null, (e) => e);
+    assert.equal(error && error.name, 'AbortError');
+    assert.equal(track.stopped, 1, 'camera handed straight back');
+    assert.equal(video.srcObject, newer, 'the newer stream stays on the video');
+    assert.equal(video.plays, 0);
+  });
+
+  test('dropped, then refused with a retryable error: no second ask', async () => {
+    const request = new AbortController();
+    const calls = installMediaDevices(() => {
+      request.abort();
+      return Promise.reject(new DOMException('in use', 'NotReadableError'));
+    });
+    const error = await startCamera(fakeVideo(), { signal: request.signal }).then(() => null, (e) => e);
+    assert.equal(calls.length, 1);
+    assert.equal(error.name, 'NotReadableError');
   });
 
   test('getUserMedia is called before anything is awaited (the tap still counts as the gesture)', () => {
@@ -846,10 +929,12 @@ function fakeScreenDom() {
       el.setLoading = () => {};
       return el;
     },
-    fileButton(label) {
+    fileButton(label, { onFile } = {}) {
       const input = h('input', { type: 'file' });
       const el = h('label', { class: 'sm-btn', text: label }, input);
       el.input = input;
+      // What the kit calls with the file the customer picked.
+      el.onFile = onFile;
       return el;
     },
     actionBar: (...children) => h('div', { class: 'sm-actionbar' }, ...children),
@@ -865,28 +950,72 @@ function framedWindow() {
 }
 
 /** Mount the capture screen with `getUserMedia` as the camera; parts are found by their class. */
-function mountCapture({ getUserMedia, window: win } = {}) {
+function mountCapture({
+  getUserMedia,
+  window: win,
+  userAgent = 'test',
+  maxTouchPoints = 0,
+  t = (key) => key,
+  state = {},
+  config = {},
+} = {}) {
   const dom = fakeScreenDom();
   setGlobal('document', dom.doc);
-  setGlobal('navigator', { userAgent: 'test', maxTouchPoints: 0, mediaDevices: { getUserMedia } });
+  setGlobal('navigator', { userAgent, maxTouchPoints, mediaDevices: { getUserMedia } });
   if (win) setGlobal('window', win);
   const root = dom.h('section');
+  const went = [];
+  const toasts = [];
   const cleanup = mountCaptureScreen(root, {
     ui: dom.ui,
-    config: {},
-    state: {},
-    t: (key) => key,
-    go() {},
+    config,
+    state,
+    t,
+    go: (screenId) => went.push(screenId),
     busy: (fn) => fn(),
-    toast() {},
+    toast: (text) => toasts.push(text),
   });
   const part = (name) => root.find(`sm-capture__${name}`);
   const allow = part('card').children.find((el) => el.tagName === 'BUTTON');
-  const cameraApp = part('fallbacks').children[0];
-  return { doc: dom.doc, cleanup, part, allow, cameraApp, video: part('video') };
+  const [cameraApp, choose] = part('fallbacks').children;
+  return { doc: dom.doc, cleanup, part, allow, cameraApp, choose, video: part('video'), went, toasts };
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Lets pending promise callbacks run without a timer, for tests that mock setTimeout. */
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** A getUserMedia whose every call waits until the test answers it; `calls` holds each call's answers. */
+function heldGetUserMedia() {
+  const calls = [];
+  const getUserMedia = () =>
+    new Promise((resolve, reject) => {
+      calls.push({ resolve, reject });
+    });
+  return { calls, getUserMedia };
+}
+
+/** Run every `type` listener the screen put on a fake element (the fake DOM has no event dispatch). */
+function fire(el, type) {
+  for (const fn of [...(el.listeners[type] || [])]) fn({ type, preventDefault() {} });
+}
+
+/** Count the writes to an element's textContent from now on. */
+function countTextWrites(el) {
+  let value = el.textContent;
+  const writes = { count: 0 };
+  Object.defineProperty(el, 'textContent', {
+    configurable: true,
+    get: () => value,
+    set: (next) => {
+      writes.count += 1;
+      value = next;
+    },
+  });
+  return writes;
+}
+
+const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 
 describe('capture screen', () => {
   test('a refusal inside an iframe without allow="camera": no site-settings help and no Allow camera to fail again', async () => {
@@ -947,6 +1076,267 @@ describe('capture screen', () => {
       assert.equal(track.stopped, 1, 'camera released on leaving');
     });
   }
+
+  test('blocked on an iPhone or iPad: Safari gets its aA steps, the other browsers steps that fit them', async () => {
+    const cases = [
+      [`${IPHONE} Version/18.1 Mobile/15E148 Safari/604.1`, 0, 'capture.blocked.help.ios'],
+      // iPadOS Safari asks for desktop sites: a Mac with a touch screen.
+      ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15', 5, 'capture.blocked.help.ios'],
+      [`${IPHONE} CriOS/131.0.6778.73 Mobile/15E148 Safari/604.1`, 0, 'capture.blocked.help.iosbrowser:Chrome'],
+      [`${IPHONE} FxiOS/132.0 Mobile/15E148 Safari/605.1.15`, 0, 'capture.blocked.help.iosbrowser:Firefox'],
+      [`${IPHONE} Version/18.0 EdgiOS/131.2903.68 Mobile/15E148 Safari/605.1.15`, 0, 'capture.blocked.help.iosbrowser:Edge'],
+      [`${IPHONE} Version/18.0 Mobile/15E148 Safari/604.1 OPT/5.1.0`, 0, 'capture.blocked.help.iosbrowser:Opera'],
+      ['Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36', 5, 'capture.blocked.help.android'],
+    ];
+    for (const [userAgent, maxTouchPoints, help] of cases) {
+      const screen = mountCapture({
+        userAgent,
+        maxTouchPoints,
+        t: (key, vars) => (vars && vars.browser ? `${key}:${vars.browser}` : key),
+        getUserMedia: () => Promise.reject(new DOMException('denied', 'NotAllowedError')),
+      });
+      await settle();
+      assert.equal(screen.part('panel-title').textContent, 'capture.blocked.title', userAgent);
+      assert.equal(screen.part('panel-help').textContent, help, userAgent);
+      screen.cleanup();
+    }
+    // The other browsers' steps name the browser, and none of Safari's buttons.
+    assert.match(captureStrings['capture.blocked.help.iosbrowser'], /\{browser\}/);
+    assert.doesNotMatch(captureStrings['capture.blocked.help.iosbrowser'], /aA|Website Settings/);
+    assert.match(captureStrings['capture.blocked.help.ios'], /aA/);
+  });
+
+  test('a camera request that never settles: after the camera app, Allow camera asks again, and the late stream is stopped', async () => {
+    const held = heldGetUserMedia();
+    const screen = mountCapture({ getUserMedia: held.getUserMedia });
+    assert.equal(held.calls.length, 1);
+    assert.equal(screen.allow.attributes['aria-disabled'], 'true', 'waiting on the browser');
+    screen.allow.click();
+    assert.equal(held.calls.length, 1, 'no second ask while the prompt may be up');
+
+    // The prompt is left open (Firefox for Android): the customer tries their camera app, and comes back.
+    screen.cameraApp.click();
+    assert.equal(screen.part('panel-title').textContent, 'capture.paused.title');
+    assert.equal(screen.allow.attributes['aria-disabled'], 'false');
+    screen.allow.click();
+    assert.equal(held.calls.length, 2, 'Allow camera asks again');
+
+    const fresh = fakeTrack();
+    const freshStream = fakeStream([fresh]);
+    held.calls[1].resolve(freshStream);
+    await settle();
+    assert.equal(screen.part('panel').hidden, true, 'live');
+    assert.equal(screen.video.srcObject, freshStream);
+
+    // The first prompt is answered at last: that stream goes straight back, the viewfinder keeps the new one.
+    const late = fakeTrack();
+    held.calls[0].resolve(fakeStream([late]));
+    await settle();
+    assert.equal(late.stopped, 1);
+    assert.equal(fresh.stopped, 0);
+    assert.equal(screen.video.srcObject, freshStream);
+    assert.equal(screen.part('panel').hidden, true, 'still live');
+    screen.cleanup();
+    assert.equal(fresh.stopped, 1, 'camera released on leaving');
+  });
+
+  test('a request nothing ever answers: after a while Allow camera stops spinning and asks again', (context) => {
+    const START_PATIENCE_MS = 8000; // js/screens/capture.js
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const held = heldGetUserMedia();
+    const screen = mountCapture({ getUserMedia: held.getUserMedia });
+    assert.equal(screen.allow.attributes['aria-disabled'], 'true');
+    assert.equal(screen.part('panel-help').hidden, true);
+    context.mock.timers.tick(START_PATIENCE_MS - 1000);
+    screen.allow.click();
+    assert.equal(held.calls.length, 1, 'still giving the prompt its chance');
+
+    context.mock.timers.tick(1000);
+    assert.equal(screen.allow.attributes['aria-disabled'], 'false', 'Allow camera works again');
+    assert.equal(screen.part('panel-help').hidden, false);
+    assert.equal(screen.part('panel-help').textContent, 'capture.starting.slow');
+    screen.allow.click();
+    assert.equal(held.calls.length, 2, 'asked again');
+    assert.equal(screen.allow.attributes['aria-disabled'], 'true', 'waiting on the new request');
+    assert.equal(screen.part('panel-help').hidden, true);
+    screen.cleanup();
+  });
+
+  test('Choose a photo lets go of the camera before the picker opens; a cancelled picker brings it back', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const tracks = [];
+    const screen = mountCapture({
+      getUserMedia: () => {
+        const track = fakeTrack();
+        tracks.push(track);
+        return Promise.resolve(fakeStream([track]));
+      },
+    });
+    Object.assign(screen.video, { videoWidth: 1440, videoHeight: 1920 });
+    await flush();
+    assert.equal(screen.part('panel').hidden, true, 'live');
+
+    // iOS offers Take Photo beside the library: the native camera must not open over ours.
+    screen.choose.click();
+    assert.equal(tracks[0].stopped, 1, 'camera released first');
+    assert.equal(screen.part('panel-title').textContent, 'capture.paused.title');
+
+    fire(screen.choose.input, 'cancel');
+    context.mock.timers.tick(1000);
+    await flush();
+    assert.equal(tracks.length, 2, 'opened again');
+    assert.equal(screen.part('panel').hidden, true, 'live again');
+    screen.cleanup();
+  });
+
+  test('re-rendering an unchanged card leaves its words alone (the live region would read them again)', async () => {
+    const held = heldGetUserMedia();
+    const screen = mountCapture({ getUserMedia: held.getUserMedia });
+    const watch = () => ['panel-title', 'panel-text', 'panel-help'].map((name) => [name, countTextWrites(screen.part(name))]);
+    // 'starting': the video reports its size while play() is still out.
+    let writes = watch();
+    fire(screen.video, 'loadedmetadata');
+    fire(screen.video, 'resize');
+    for (const [name, seen] of writes) assert.equal(seen.count, 0, `starting: ${name}`);
+
+    held.calls[0].reject(new DOMException('denied', 'NotAllowedError'));
+    await settle();
+    assert.equal(screen.part('panel-title').textContent, 'capture.blocked.title');
+    // 'blocked': the phone turns.
+    writes = watch();
+    fire(screen.video, 'resize');
+    for (const [name, seen] of writes) assert.equal(seen.count, 0, `blocked: ${name}`);
+    screen.cleanup();
+  });
+
+  test('the camera going live is announced once the shutter works, and again when it is back after a pause', async () => {
+    const screen = mountCapture({ getUserMedia: () => Promise.resolve(fakeStream([fakeTrack()])) });
+    const status = screen.part('status');
+    assert.equal(status.attributes.role, 'status');
+    assert.equal(status.textContent, '', 'nothing to say while starting');
+    await settle();
+    assert.equal(screen.part('panel').hidden, true, 'live');
+    assert.equal(status.textContent, '', 'not before the shutter works');
+
+    Object.assign(screen.video, { videoWidth: 1440, videoHeight: 1920 });
+    fire(screen.video, 'loadedmetadata');
+    assert.equal(screen.part('shutter').disabled, false);
+    assert.equal(status.textContent, 'capture.ready');
+    // Never hidden: a live region has to stay in the accessibility tree for its changes to be read out.
+    for (let n = status; n; n = n.parent) assert.equal(n.hidden, false);
+
+    screen.cameraApp.click();
+    assert.equal(status.textContent, '', 'emptied while paused');
+    screen.allow.click();
+    await settle();
+    assert.equal(status.textContent, 'capture.ready', 'said again');
+    screen.cleanup();
+  });
+
+  test('says on the session whether the live camera worked: true once live, false once it failed, nothing while starting', async () => {
+    const working = {};
+    const live = mountCapture({ state: working, getUserMedia: () => Promise.resolve(fakeStream([fakeTrack()])) });
+    assert.equal('liveCamera' in working, false, "'starting' says nothing about it yet");
+    await settle();
+    assert.equal(live.part('panel').hidden, true, 'live');
+    assert.equal(working.liveCamera, true);
+    // Paused for the camera app: it still worked on this phone.
+    live.cameraApp.click();
+    assert.equal(live.part('panel-title').textContent, 'capture.paused.title');
+    assert.equal(working.liveCamera, true);
+    live.cleanup();
+
+    for (const error of [
+      new DOMException('denied', 'NotAllowedError'),
+      new DOMException('in use', 'NotReadableError'),
+      new DOMException('none', 'NotFoundError'),
+      new Error('something else'),
+    ]) {
+      const failing = { liveCamera: true };
+      const screen = mountCapture({ state: failing, getUserMedia: () => Promise.reject(error) });
+      await settle();
+      assert.equal(screen.part('panel').hidden, false, error.name);
+      assert.equal(failing.liveCamera, false, error.name);
+      screen.cleanup();
+    }
+  });
+
+  test('a photo from the shutter keeps the framing guide, in photo px, as state.door.prior for the door screen', async () => {
+    const VIDEO = { width: 1440, height: 1920 };
+    const VIEW = { width: 390, height: 600 };
+    // What loadPhoto needs of the browser: a canvas to grab the frame and draw the working copy on, and a
+    // bitmap decoder. getImageData hands back too few pixels for a search, so findDoor answers at once.
+    setGlobal('createImageBitmap', async () => ({ width: VIDEO.width, height: VIDEO.height, close() {} }));
+    const state = { photo: null, sheet: null, door: { points: null, detection: null }, measure: null, size: null };
+    const screen = mountCapture({
+      state,
+      config: { measurement: { maxWorkingSizePx: 2560 } },
+      getUserMedia: () => Promise.resolve(fakeStream([fakeTrack({ settings: VIDEO })])),
+    });
+    screen.doc.createElement = (tag) => {
+      assert.equal(tag, 'canvas');
+      return {
+        width: 0,
+        height: 0,
+        getContext: () => ({
+          fillRect() {},
+          drawImage() {},
+          getImageData: (_x, _y, w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(4) }),
+        }),
+        toBlob: (callback, type) => setTimeout(() => callback(new Blob(['frame'], { type })), 0),
+      };
+    };
+    Object.assign(screen.part('stage'), { clientWidth: VIEW.width, clientHeight: VIEW.height });
+    Object.assign(screen.video, { videoWidth: VIDEO.width, videoHeight: VIDEO.height });
+    await settle();
+    const shutter = screen.part('shutter');
+    assert.equal(shutter.disabled, false, 'ready to take the photo');
+
+    shutter.click();
+    for (let i = 0; i < 50 && screen.went.length === 0; i += 1) await settle();
+    assert.deepEqual(screen.went, ['door']);
+    assert.deepEqual(screen.toasts, []);
+    assert.equal(state.method, 'estimate');
+    assert.equal(state.photo.capture, 'frame');
+    assert.equal(state.photo.width, VIDEO.width);
+
+    const expected = priorFromGuide({
+      guide: guideRect(VIEW.width, VIEW.height),
+      viewW: VIEW.width,
+      viewH: VIEW.height,
+      videoW: VIDEO.width,
+      videoH: VIDEO.height,
+      photoW: VIDEO.width,
+      photoH: VIDEO.height,
+    });
+    assert.ok(Array.isArray(expected) && expected.length === 4, 'the guide maps into this photo');
+    assert.deepEqual(state.door.prior, expected);
+    // Plain { x, y } copies of their own: nothing else holds them.
+    for (const point of state.door.prior) assert.deepEqual(Object.keys(point), ['x', 'y']);
+    assert.ok(state.door.detection && typeof state.door.detection === 'object', 'the search ran and its answer was kept');
+    screen.cleanup();
+  });
+
+  test('a picked photo was never framed by the guide: no prior', async () => {
+    setGlobal('createImageBitmap', async () => ({ width: 1440, height: 1920, close() {} }));
+    const state = { photo: null, door: { points: null, detection: null } };
+    const screen = mountCapture({ state, getUserMedia: () => Promise.reject(new DOMException('denied', 'NotAllowedError')) });
+    screen.doc.createElement = () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({ fillRect() {}, drawImage() {}, getImageData: (_x, _y, w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(4) }) }),
+    });
+    await settle();
+    // ui.fileButton hands the picked file to the handler the screen gave it.
+    const picked = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], { type: 'image/jpeg' });
+    assert.equal(typeof screen.cameraApp.onFile, 'function', 'the screen gave the kit its file handler');
+    screen.cameraApp.onFile(picked);
+    for (let i = 0; i < 50 && screen.went.length === 0; i += 1) await settle();
+    assert.deepEqual(screen.went, ['door']);
+    assert.equal(state.photo.capture, 'file');
+    assert.equal('prior' in state.door, false);
+    screen.cleanup();
+  });
 });
 
 test('no stubbed global outlives its test', () => {

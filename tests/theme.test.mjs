@@ -383,6 +383,25 @@ describe('normaliseConfig', () => {
     assert.match(warningText(warnings), /keeping paper on/);
   });
 
+  test('warns when neither photo way is on, and leaves the methods as they are', (t) => {
+    const warnings = captureWarnings(t);
+    // "AR is enough": not on an iPhone, which can then only type in a size.
+    for (const methods of [{ ar: true, camera: false, paper: false }, { ar: false, camera: false, paper: false }]) {
+      const config = normaliseConfig(withMeasurement({ methods: { ...methods }, allowManualOverride: true }));
+      assert.deepEqual(config.measurement.methods, methods, 'a typed-in size is a way in: nothing is switched back on');
+    }
+    assert.equal(warnings.callCount(), 2);
+    assert.match(warningText(warnings), /neither camera nor paper on/);
+    assert.match(warningText(warnings), /only type in a door size/);
+    assert.doesNotMatch(warningText(warnings), /keeping paper on/);
+
+    // One photo way is enough for every phone.
+    for (const methods of [{ ar: false, camera: true, paper: false }, { ar: false, camera: false, paper: true }]) {
+      normaliseConfig(withMeasurement({ methods, allowManualOverride: true }));
+    }
+    assert.equal(warnings.callCount(), 2);
+  });
+
   test('drops unusable and repeated standard sizes, keeping the good ones in order', (t) => {
     const warnings = captureWarnings(t);
     const config = normaliseConfig(

@@ -5,9 +5,10 @@
  *   3. Try it with a demo photo,
  *   4. Measure exactly with a sheet of paper,
  *   5. I already know my door size.
- * The company switches any of the photo ways off with config.measurement.methods.
+ * The company switches any of the photo ways off with config.measurement.methods. With neither the
+ * camera nor the paper method on, typing in a size is the main way in, and the copy promises no photo.
  */
-import { arSupported } from '../ar-support.js';
+import { arRefused, arSupported } from '../ar-support.js';
 import { demoPhotoUrl, loadDemo } from '../demo.js';
 import { findDoor } from '../door-find.js';
 import { measurementMethods } from '../theme.js';
@@ -57,6 +58,17 @@ export const strings = {
   'welcome.need.phone.detail': 'One photo of the whole door does it.',
   'welcome.how.photo': 'Take a photo',
   'welcome.how.mark': 'Mark the corners',
+  // The copy for a company that offers neither photo way (methods.camera and methods.paper both false):
+  // most phones, every iPhone among them, can then only type in a size, so the screen promises no photo.
+  'welcome.manualOnly.title': 'Get your door price in a minute',
+  'welcome.manualOnly.subtitle': 'Enter your door size for an instant price. No home visit needed to get started.',
+  'welcome.need.tapeMeasure': 'A tape measure',
+  'welcome.need.tapeMeasure.detail': 'To measure the door opening, where the door meets the frame.',
+  'welcome.need.size': 'The width and height',
+  'welcome.need.size.detail': 'In millimetres. If you already know your door size, you are all set.',
+  'welcome.how.measure': 'Measure your door',
+  'welcome.how.enter': 'Enter the size',
+  'welcome.enterSize': 'Enter my door size',
 };
 
 const SVG_OPEN =
@@ -115,17 +127,28 @@ export function mount(root, ctx) {
   // Without the camera method the photo way most customers see is the paper one, and the no-paper
   // promise ("no tape measure, no paper") would not be true: the screen keeps the paper method's copy.
   const paperCopy = !methods.camera && methods.paper;
+  // With neither photo way on, a typed-in size is the way in on most phones: AR, where the company
+  // offers it, only ever appears on some Android phones (see showAr below). The screen then promises
+  // no photo, and typing in a size is the main button. (measurementMethods keeps paper on when manual
+  // sizes are off too, so this screen always has the manual button.)
+  const manualCopy = !methods.camera && !methods.paper;
+  const copyKey = (key) => (manualCopy ? `welcome.manualOnly.${key}` : paperCopy ? `welcome.paperOnly.${key}` : `welcome.${key}`);
 
   const header = ui.screenHeader({
     eyebrow: brand.tagline || undefined,
-    title: t(paperCopy ? 'welcome.paperOnly.title' : 'welcome.title'),
-    subtitle: t(paperCopy ? 'welcome.paperOnly.subtitle' : 'welcome.subtitle'),
+    title: t(copyKey('title')),
+    subtitle: t(copyKey('subtitle')),
   });
 
   // ---- What you'll need ----------------------------------------------------------------------
 
   const paper = defaultReferenceLabel(measurement) || t('welcome.need.paper.fallback');
-  const needs = paperCopy
+  const needs = manualCopy
+    ? [
+        { glyph: ui.icon('tape', 22), title: t('welcome.need.tapeMeasure'), detail: t('welcome.need.tapeMeasure.detail') },
+        { glyph: ui.icon('edit', 22), title: t('welcome.need.size'), detail: t('welcome.need.size.detail') },
+      ]
+    : paperCopy
     ? [
         { glyph: ui.icon('paper', 22), title: t('welcome.need.paper', { paper }), detail: t('welcome.need.paper.detail') },
         { glyph: ui.icon('tape', 22), title: t('welcome.need.tape'), detail: t('welcome.need.tape.detail') },
@@ -164,7 +187,13 @@ export function mount(root, ctx) {
 
   // ---- How it works --------------------------------------------------------------------------
 
-  const howSteps = paperCopy
+  const howSteps = manualCopy
+    ? [
+        { glyph: ui.icon('ruler', 22), label: t('welcome.how.measure') },
+        { glyph: ui.icon('edit', 22), label: t('welcome.how.enter') },
+        { glyph: ui.svgFromString(ICON_PRICE), label: t('welcome.how.price') },
+      ]
+    : paperCopy
     ? [
         { glyph: ui.icon('camera', 22), label: t('welcome.how.photo') },
         { glyph: ui.icon('ruler', 22), label: t('welcome.how.mark') },
@@ -201,16 +230,15 @@ export function mount(root, ctx) {
   // ---- The small print -----------------------------------------------------------------------
 
   // A photo with no scale in it cannot give raw millimetres, and AR is an estimate too: say up front
-  // what the customer gets, so the result screen holds no surprise.
-  const standardNote = paperCopy
+  // what the customer gets, so the result screen holds no surprise. A typed-in size is matched to
+  // nothing and there is no photo to keep private, so neither note belongs on the manual-entry copy.
+  const standardNote =
+    paperCopy || manualCopy
+      ? null
+      : h('p', { class: 'sm-welcome__note sm-welcome__note--standard' }, ui.icon('info', 18), h('span', { text: t('welcome.standardNote') }));
+  const privacy = manualCopy
     ? null
-    : h('p', { class: 'sm-welcome__note sm-welcome__note--standard' }, ui.icon('info', 18), h('span', { text: t('welcome.standardNote') }));
-  const privacy = h(
-    'p',
-    { class: 'sm-welcome__note sm-welcome__note--privacy' },
-    ui.icon('lock', 18),
-    h('span', { text: t('welcome.privacy') }),
-  );
+    : h('p', { class: 'sm-welcome__note sm-welcome__note--privacy' }, ui.icon('lock', 18), h('span', { text: t('welcome.privacy') }));
 
   // ---- The ways in ---------------------------------------------------------------------------
 
@@ -258,11 +286,14 @@ export function mount(root, ctx) {
     demoMethod && demoPhotoUrl(config)
       ? ui.button(t('welcome.demo'), { variant: 'secondary', icon: 'image', onClick: startDemo })
       : null;
-  // A company that turns manual sizes off wants photo-backed measurements only.
+  // A company that turns manual sizes off wants photo-backed measurements only. With no photo way on
+  // offer, typing in a size is the way in, so it is the main button, worded for it.
   const manualButton =
-    measurement.allowManualOverride !== false
-      ? ui.button(t('welcome.manual'), { variant: 'ghost', size: 'sm', onClick: startManual })
-      : null;
+    measurement.allowManualOverride === false
+      ? null
+      : manualCopy
+      ? ui.button(t('welcome.enterSize'), { variant: 'primary', size: 'lg', iconEnd: 'arrow-right', onClick: startManual })
+      : ui.button(t('welcome.manual'), { variant: 'ghost', size: 'sm', onClick: startManual });
 
   const bar = ui.actionBar(
     cameraButton,
@@ -273,7 +304,8 @@ export function mount(root, ctx) {
   );
   bar.classList.add('sm-welcome__actions');
 
-  root.append(header, needsCard, how, standardNote, privacy, bar);
+  // Element.append() writes a null as the text "null", so the notes left out are dropped first.
+  root.append(...[header, needsCard, how, standardNote, privacy, bar].filter(Boolean));
 
   // ---- AR, on the phones that have it --------------------------------------------------------
 
@@ -281,8 +313,24 @@ export function mount(root, ctx) {
   // when the answer comes in. It goes on top: the bar is pinned to the bottom of the screen and grows
   // upwards, so no button the customer may be reaching for moves. The button that was the main one
   // becomes a plain one in place (the same element, so keyboard focus stays where it was).
+  // Once AR has been refused on this page (arRefused: the phone said yes, then would not start a session),
+  // it goes second instead, under the main way in, which keeps its look: the customer has just been sent
+  // back from AR, and AR stays on offer only because the refusal may have been a prompt dismissed by
+  // mistake.
   function showAr() {
     if (!alive || bar.querySelector('.sm-welcome__ar')) return;
+    if (arRefused()) {
+      const retry = ui.button(t('welcome.ar'), { variant: 'secondary', size: 'md', onClick: () => ctx.go('ar') });
+      retry.classList.add('sm-welcome__ar');
+      const glyph = ui.svgFromString(ICON_AR);
+      // Drawn at the size the kit uses for this button's size, like any other icon on it.
+      glyph.setAttribute('width', String(ICON_PX.md));
+      glyph.setAttribute('height', String(ICON_PX.md));
+      retry.prepend(glyph);
+      const main = cameraButton || paperPrimary || (manualCopy ? manualButton : null);
+      bar.insertBefore(retry, main && main.parentNode === bar ? main.nextSibling : bar.firstChild);
+      return;
+    }
     const arButton = ui.button(t('welcome.ar'), { variant: 'primary', size: 'lg', onClick: () => ctx.go('ar') });
     arButton.classList.add('sm-welcome__ar');
     arButton.prepend(ui.svgFromString(ICON_AR));
@@ -297,6 +345,9 @@ export function mount(root, ctx) {
       bar.insertBefore(paperAlternative, manualButton && manualButton.parentNode === bar ? manualButton : null);
       paperPrimary.remove();
       if (hadFocus) paperAlternative.focus({ preventScroll: true });
+    } else if (manualCopy && manualButton) {
+      // Typing in a size stays the screen's way in (its copy says so), just no longer the main button.
+      restyle(manualButton, 'secondary', 'md');
     }
   }
 

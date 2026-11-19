@@ -1,11 +1,14 @@
 // The AR measuring flow, js/ar-flow.js, driven with synthetic geometry: a phone held at 1.5 m in a
 // WebXR 'local' frame (+Y up, metres), an 820 x 2040 mm opening standing in a vertical plane 1.8 m
-// ahead, floor hit-test results that face up, and reticle rays aimed at each corner.
-import { test, describe } from 'node:test';
+// ahead, floor hit-test results that face up, and reticle rays aimed at each corner. At the end, the
+// AR screen's pre-session card mounted on a fake DOM and a fake navigator.xr, for what it offers
+// after a refused session.
+import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { add, normalize, scale, sub } from '../js/xr-measure.js';
 import { createArFlow, outlineSegments, HINT_KEYS, AIM_REASONS, STEPS } from '../js/ar-flow.js';
+import { arRefused, resetArSupport } from '../js/ar-support.js';
 import {
   strings as arStrings,
   isBlunder,
@@ -15,6 +18,7 @@ import {
   cardCopyKey,
   createHintSpeaker,
   HINT_ANNOUNCE_MS,
+  mount as mountArScreen,
 } from '../js/screens/ar.js';
 
 const EYE = [0, 1.5, 0];
@@ -499,5 +503,339 @@ describe('the AR screen', () => {
     assert.equal(measure.candidates[0].heightMm, 2040);
     for (const key of ['minWidthMm', 'minHeightMm', 'sillHeightMm']) assert.ok(Number.isFinite(measure[key]), key);
     assert.deepEqual(measure.warnings, []);
+  });
+});
+
+// ---- The pre-session card, mounted -------------------------------------------------------------
+
+/** Just enough of a DOM element to mount the AR screen under Node. */
+class FakeElement {
+  constructor(tag) {
+    this.tag = tag;
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = {};
+    this.listeners = {};
+    this.hidden = false;
+    this.disabled = false;
+    this.style = {};
+    this.textContent = '';
+    const names = new Set();
+    this.classList = {
+      add: (...list) => list.forEach((name) => names.add(name)),
+      remove: (...list) => list.forEach((name) => names.delete(name)),
+      toggle: (name, on = !names.has(name)) => {
+        if (on) names.add(name);
+        else names.delete(name);
+        return on;
+      },
+      contains: (name) => names.has(name),
+    };
+  }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+
+  getAttribute(name) {
+    return name in this.attributes ? this.attributes[name] : null;
+  }
+
+  addEventListener(type, fn) {
+    (this.listeners[type] ||= []).push(fn);
+  }
+
+  append(...kids) {
+    for (const kid of kids.flat(Infinity)) {
+      if (!kid) continue;
+      kid.remove();
+      kid.parentNode = this;
+      this.children.push(kid);
+    }
+  }
+
+  appendChild(kid) {
+    this.append(kid);
+    return kid;
+  }
+
+  prepend(...kids) {
+    const rest = this.children;
+    this.children = [];
+    this.append(...kids);
+    this.children.push(...rest.filter((kid) => !this.children.includes(kid)));
+  }
+
+  replaceChildren(...kids) {
+    for (const kid of this.children) kid.parentNode = null;
+    this.children = [];
+    this.append(...kids);
+  }
+
+  remove() {
+    if (!this.parentNode) return;
+    this.parentNode.children = this.parentNode.children.filter((kid) => kid !== this);
+    this.parentNode = null;
+  }
+
+  focus() {}
+
+  click() {
+    for (const fn of this.listeners.click || []) fn({ type: 'click' });
+  }
+
+  *descendants() {
+    for (const kid of this.children) {
+      yield kid;
+      yield* kid.descendants();
+    }
+  }
+
+  /** Only the two selector shapes the screen uses: a tag name, or '.class'. */
+  querySelector(selector) {
+    for (const el of this.descendants()) {
+      if (selector.startsWith('.') ? el.classList.contains(selector.slice(1)) : el.tag === selector) return el;
+    }
+    return null;
+  }
+}
+
+function fakeH(tag, props = {}, ...kids) {
+  const el = new FakeElement(tag);
+  for (const name of String(props.class || '').split(/\s+/).filter(Boolean)) el.classList.add(name);
+  if (props.text !== undefined) el.textContent = String(props.text);
+  if (props.hidden) el.hidden = true;
+  for (const [name, value] of Object.entries(props.attrs || {})) el.setAttribute(name, value);
+  for (const [type, fn] of Object.entries(props.on || {})) el.addEventListener(type, fn);
+  el.append(...kids);
+  return el;
+}
+
+/** The parts of the ui kit the AR screen uses. A button remembers its variant for the assertions. */
+const fakeUi = {
+  h: fakeH,
+  icon: () => fakeH('svg'),
+  svgFromString: () => fakeH('svg'),
+  card: (props, ...kids) => fakeH('div', props, ...kids),
+  screenHeader: () => fakeH('header'),
+  actionBar: () => fakeH('div', { class: 'test-bar' }),
+  banner(text) {
+    const el = fakeH('div', { class: 'test-banner' });
+    el.update = (next) => {
+      el.textContent = next || '';
+      el.hidden = !next;
+    };
+    el.update(text);
+    return el;
+  },
+  button(label, { variant = 'primary', onClick } = {}) {
+    const el = fakeH('button', { text: label });
+    el.variant = variant;
+    if (onClick) el.addEventListener('click', onClick);
+    el.setLoading = (on) => {
+      el.loading = Boolean(on);
+    };
+    return el;
+  },
+  fmtMm: (mm) => String(Math.round(mm)),
+};
+
+/** A granted session. Its frames never run: these tests only look at the card around it. */
+class FakeSession {
+  constructor() {
+    this.listeners = {};
+    this.enabledFeatures = ['hit-test', 'dom-overlay'];
+    this.visibilityState = 'visible';
+    this.renderState = {};
+    this.over = false;
+  }
+
+  addEventListener(type, fn) {
+    (this.listeners[type] ||= []).push(fn);
+  }
+
+  updateRenderState() {}
+
+  async requestReferenceSpace() {
+    return { addEventListener() {} };
+  }
+
+  async requestHitTestSource() {
+    return { cancel() {} };
+  }
+
+  requestAnimationFrame() {
+    return 1;
+  }
+
+  /** The session ends: asked for by the page, or by the phone itself (system Back, an app switch). */
+  fireEnd() {
+    if (this.over) return;
+    this.over = true;
+    for (const fn of this.listeners.end || []) fn({ session: this });
+  }
+
+  async end() {
+    this.fireEnd();
+  }
+}
+
+const ANDROID_CHROME = 'Mozilla/5.0 (Linux; Android 12; SM-A125F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
+const PHONE_GLOBALS = ['navigator', 'isSecureContext', 'document', 'XRWebGLLayer'];
+const savedGlobals = Object.fromEntries(PHONE_GLOBALS.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+
+function defineGlobal(name, value) {
+  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+}
+
+/**
+ * An Android Chrome phone that says it can do AR (isSessionSupported true). `refuse` is how many of
+ * the next requestSession() calls are refused, as on a phone that is not ARCore-certified or whose
+ * owner turned down "Google Play Services for AR"; `webgl: false` makes a granted session fail to
+ * set up.
+ */
+function fakeArPhone() {
+  const phone = { refuse: 0, webgl: true, sessions: [], body: new FakeElement('body') };
+  defineGlobal('navigator', {
+    userAgent: ANDROID_CHROME,
+    xr: {
+      isSessionSupported: async () => true,
+      requestSession: async () => {
+        if (phone.refuse > 0) {
+          phone.refuse -= 1;
+          throw Object.assign(new Error('The specified session configuration is not supported.'), { name: 'NotSupportedError' });
+        }
+        const session = new FakeSession();
+        phone.sessions.push(session);
+        return session;
+      },
+    },
+  });
+  defineGlobal('isSecureContext', true);
+  defineGlobal('document', {
+    body: phone.body,
+    createElement(tag) {
+      const el = new FakeElement(tag);
+      el.getContext = () => (phone.webgl ? { makeXRCompatible: async () => {}, getExtension: () => null } : null);
+      return el;
+    },
+  });
+  defineGlobal('XRWebGLLayer', class {});
+  return phone;
+}
+
+/** Mount the AR screen; ctx.t returns the string key itself, so the card reads as keys. */
+function mountCard() {
+  const root = new FakeElement('section');
+  const toasts = [];
+  const ctx = {
+    ui: fakeUi,
+    config: { measurement: {} },
+    t: (key) => key,
+    toast: (message) => toasts.push(message),
+    go() {},
+    state: {},
+    emit() {},
+  };
+  const cleanup = mountArScreen(root, ctx);
+  const bar = root.querySelector('.test-bar');
+  const banner = root.querySelector('.test-banner');
+  return {
+    toasts,
+    cleanup,
+    /** The banner (null when hidden) and the card's buttons in order, as 'label:variant'. */
+    card: () => ({ banner: banner.hidden ? null : banner.textContent, buttons: bar.children.map((b) => `${b.textContent}:${b.variant}`) }),
+    press: (label) => bar.children.find((b) => b.textContent === label).click(),
+  };
+}
+
+/** Let every pending promise in the screen settle. */
+async function settle() {
+  for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+const AR_FIRST = ['ar.start:primary', 'ar.photo:secondary'];
+const PHOTO_FIRST = ['ar.photo:primary', 'ar.start:secondary'];
+
+describe('the AR card after a refused session', () => {
+  beforeEach(() => resetArSupport());
+  afterEach(() => {
+    for (const name of PHONE_GLOBALS) {
+      if (savedGlobals[name]) Object.defineProperty(globalThis, name, savedGlobals[name]);
+      else delete globalThis[name];
+    }
+    resetArSupport();
+  });
+
+  test('a refusal puts the photo first and is remembered when the customer comes back', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const phone = fakeArPhone();
+    phone.refuse = 2;
+    let screen = mountCard();
+    await settle();
+    assert.deepEqual(screen.card(), { banner: null, buttons: AR_FIRST });
+
+    screen.press('ar.start');
+    await settle();
+    assert.deepEqual(screen.card(), { banner: 'ar.failed', buttons: PHOTO_FIRST });
+    assert.deepEqual(screen.toasts, ['ar.error.start']);
+    assert.equal(arRefused(), true, 'the welcome screen can see the refusal');
+
+    // Header Back to the welcome screen, then AR again: the photo stays first.
+    screen.cleanup();
+    screen = mountCard();
+    await settle();
+    assert.deepEqual(screen.card(), { banner: 'ar.failed', buttons: PHOTO_FIRST });
+    screen.press('ar.start');
+    await settle();
+    assert.deepEqual(screen.card(), { banner: 'ar.failed', buttons: PHOTO_FIRST });
+    assert.equal(arRefused(), true);
+    screen.cleanup();
+  });
+
+  test('a refused try, then one that runs: once it ends the card does not say AR didn’t start', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    for (const ending of ['cancel', 'system']) {
+      resetArSupport();
+      const phone = fakeArPhone();
+      phone.refuse = 1;
+      const screen = mountCard();
+      await settle();
+      screen.press('ar.start');
+      await settle();
+      assert.deepEqual(screen.card(), { banner: 'ar.failed', buttons: PHOTO_FIRST }, ending);
+
+      // The customer allows it this time, and the session runs.
+      screen.press('ar.start');
+      await settle();
+      assert.equal(phone.sessions.length, 1, ending);
+      assert.ok(phone.body.querySelector('.sm-ar-overlay').classList.contains('is-live'), `${ending}: overlay live`);
+      assert.equal(arRefused(), false, `${ending}: AR has run on this phone`);
+
+      if (ending === 'cancel') phone.body.querySelector('.sm-ar-bar__cancel').click();
+      else phone.sessions[0].fireEnd();
+      await settle();
+      assert.equal(phone.body.querySelector('.sm-ar-overlay'), null, `${ending}: overlay gone`);
+      assert.deepEqual(screen.card(), { banner: null, buttons: AR_FIRST }, ending);
+      const expectedToasts = ending === 'cancel' ? ['ar.error.start'] : ['ar.error.start', 'ar.error.ended'];
+      assert.deepEqual(screen.toasts, expectedToasts, ending);
+      screen.cleanup();
+    }
+  });
+
+  test('a granted session that cannot be set up counts as refused', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const phone = fakeArPhone();
+    phone.webgl = false;
+    const screen = mountCard();
+    await settle();
+    screen.press('ar.start');
+    await settle();
+    assert.equal(phone.sessions.length, 1);
+    assert.equal(phone.sessions[0].over, true, 'the session was ended');
+    assert.deepEqual(screen.card(), { banner: 'ar.failed', buttons: PHOTO_FIRST });
+    assert.deepEqual(screen.toasts, ['ar.error.start']);
+    assert.equal(arRefused(), true);
+    screen.cleanup();
   });
 });

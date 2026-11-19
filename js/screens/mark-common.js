@@ -3,7 +3,8 @@
  * (banner, photo stage, action bar), the floating nudge pad and Fit button,
  * hold-to-repeat, and the QuadEditor lifecycle. It also holds the door screen's
  * small decisions (what its banner says, when its corners count as placed, the
- * "next outline" cycle), as pure functions so they are tested in Node.
+ * "next outline" cycle, which corners the customer placed and how far off to take
+ * them to be, which detection to keep), as pure functions so they are tested in Node.
  *
  * This module holds no user-visible copy. Each screen passes its own
  * translated labels in, so every string stays under that screen's `strings`.
@@ -36,6 +37,10 @@ const PAD_CLEARANCE_PX = 28;
 // The pad as a strip is four 44 px arrows tall. A stage shorter than this (a
 // phone on its side) cannot hold it below the chips, so the pad stays a cross.
 const PAD_STRIP_MIN_STAGE_PX = 260;
+// How far a door corner the detector placed is from the true corner, 1 sigma per axis, on a photo whose
+// long side is DETECTION_BENCH_LONG_SIDE_PX (see doorCornerSigmaPx).
+const DETECTED_DOOR_SIGMA_PX = 9;
+const DETECTION_BENCH_LONG_SIDE_PX = 2048;
 // Where the nudge pad may float, in order of preference: bottom-left,
 // bottom-right, then half-way up either side (see mark.css).
 const PAD_PLACEMENTS = [
@@ -338,6 +343,154 @@ export function doorCornersPlaced({ moved = false, chosen = false, confident = f
 }
 
 /**
+ * Is this findDoor() result the photo's answer, to be kept in state.door.detection and not looked for
+ * again? Anything detection settled on is, found or not ('no_lines', 'no_candidate', and 'error', which
+ * would only come back the same). A search that ran out of time ('timeout') settled nothing: the phone
+ * decided it, not the photo. (findDoor only times the search once its worker has started; a worker that
+ * is slow to start is given up for the main thread instead, so there a timeout means a slow search on a
+ * busy or budget phone. A background search (`background: true`, the door screen's own) whose worker is
+ * slow to start also ends as a 'timeout', rather than freezing the page with a main-thread search, and so
+ * does a search its screen aborted when it went.) The door screen then treats it as no search yet, and
+ * looks again in the background, with a longer time limit.
+ * @param {unknown} detection
+ * @returns {boolean}
+ */
+export function isSettledDetection(detection) {
+  if (!detection || typeof detection !== 'object') return false;
+  return !(detection.ok !== true && detection.reason === 'timeout');
+}
+
+/**
+ * Which of the four door handles the customer put where they are themselves (dragged or nudged), by
+ * handle index, read from what state.door.byHand holds: anything but four entries is none of them.
+ * @param {unknown} saved
+ * @returns {boolean[]} Four booleans (a fresh array).
+ */
+export function cornersByHand(saved) {
+  return Array.isArray(saved) && saved.length === 4 ? saved.map((v) => v === true) : [false, false, false, false];
+}
+
+/**
+ * cornersByHand after the handles went from `before` to `after` (both in handle order): a handle that
+ * moved is now where the customer put it, and one that already was stays theirs. Anything but two quads
+ * changes nothing.
+ * @param {unknown} byHand
+ * @param {unknown} before
+ * @param {unknown} after
+ * @returns {boolean[]}
+ */
+export function markCornersByHand(byHand, before, after) {
+  const known = cornersByHand(byHand);
+  if (!isQuad(before) || !isQuad(after)) return known;
+  return known.map((mine, i) => mine || before[i].x !== after[i].x || before[i].y !== after[i].y);
+}
+
+/**
+ * How far off to take the door corners to be when measuring from them (1 sigma per axis, image px),
+ * which sets the "Accurate to about ±N mm", the quality grade and, for the no-paper estimate, how sure
+ * it is of a size. Where each corner came from decides its own error:
+ *  - put in place by the customer: `handSigmaPx`, their aim with the magnifier
+ *    (config.measurement.sigmaDoorPx on the paper path, a tap's on the estimate);
+ *  - still where detection put it (the detected outline, or one picked with "Not this? Show the next
+ *    outline"): detection's own error. bench.json puts a detected corner a median 7.8 px, and at the
+ *    90th percentile 19.2 px, from the true corner on a 2048 px photo. For a 2-D Gaussian those are 1.18
+ *    and 2.15 sigma per axis, so 9 px (scaled with the photo) covers the tail, not just the median.
+ *    Taken as hand-placed (2.5 px), an untouched detection reads "Good measurement, accurate to about
+ *    ±8 mm" while being commonly 10-50 mm out. Never less than `handSigmaPx`.
+ * measureDoor and the estimate take one sigma for all four corners and weigh them alike, so the four
+ * are given as their RMS: with the corners weighed alike, the error of the width and height they give
+ * is, taken over which corner is the less sure one, that of four corners at the RMS error, not at the
+ * worst. Three corners placed by hand and one left where detection put it (2.5, 2.5, 2.5 and 11.25 px
+ * on a 2560 px photo) measure like four at 6 px through measureDoor (Monte Carlo), about ±20 mm; the
+ * worst corner's 11.25 px for all four read ±34 mm and graded a careful customer's measurement poor.
+ * @param {{ byHand?: unknown, handSigmaPx?: number, imageWidth?: number, imageHeight?: number }} input
+ *   byHand: cornersByHand; imageWidth / imageHeight: the photo the corners are in.
+ * @returns {number | null} null when every corner is by hand and no usable `handSigmaPx` was given (the
+ *   measuring code's own default then applies). With no usable `handSigmaPx` and any corner still where
+ *   detection put it, detection's error: a hand's cannot be weighed in without knowing it.
+ */
+export function doorCornerSigmaPx({ byHand, handSigmaPx, imageWidth, imageHeight } = {}) {
+  const hand = Number.isFinite(handSigmaPx) && handSigmaPx > 0 ? handSigmaPx : null;
+  const mine = cornersByHand(byHand);
+  if (mine.every(Boolean)) return hand;
+  const width = Number(imageWidth);
+  const height = Number(imageHeight);
+  const longSide = Math.max(Number.isFinite(width) ? width : 0, Number.isFinite(height) ? height : 0);
+  const scale = longSide > 0 ? longSide / DETECTION_BENCH_LONG_SIDE_PX : 1;
+  const detected = DETECTED_DOOR_SIGMA_PX * scale;
+  if (hand === null) return detected;
+  const sigmas = mine.map((byCustomer) => (byCustomer ? hand : Math.max(hand, detected)));
+  return Math.sqrt(sigmas.reduce((sum, sigma) => sum + sigma * sigma, 0) / sigmas.length);
+}
+
+/**
+ * Is this event target the photo itself, rather than one of the controls floating over it (help, Fit,
+ * the nudge pad)? A press on the photo holds back what the door screen's late search for the door
+ * changes until the finger lifts (see pressGate): the handle under it, and anything that would resize
+ * the photo under it. A press on a floating control is not on a handle.
+ * @param {unknown} target An event's target.
+ * @returns {boolean} True for anything that cannot say (no closest()): taking it for the photo only
+ *   holds a late suggestion back until the press ends.
+ */
+export function isPhotoTarget(target) {
+  if (!target || typeof target.closest !== 'function') return true;
+  return !target.closest('.sm-mark__float');
+}
+
+/**
+ * Holds back a change that would resize the photo while a finger is on it. A banner that wraps to
+ * another line, or a button that appears in the action bar, shrinks the photo stage; the editor then
+ * refits the photo and keeps the dragged handle's image position, so on screen the handle slides away
+ * from the fingertip and follows it at that offset until release. Pointers are reported as they go down
+ * on the photo and come up (or are cancelled, or lose their capture); a change asked for meanwhile runs
+ * once the last one is up. Only the latest is kept, as it redraws from the screen's current state. The
+ * door screen holds its late detection back the same way, handles and all, so that when it lands it can
+ * tell what the press did: moved a handle, selected one, or neither (a tap, a pan, a pinch).
+ * @returns {{
+ *   press: (pointerId: number, isPrimary?: boolean) => void,
+ *   release: (pointerId: number) => (() => void) | null,
+ *   whenReleased: (fn: () => void) => void,
+ *   readonly pressed: boolean,
+ *   clear: () => void,
+ * }} release() hands back the held-back change once the last pointer is up (null otherwise), for the
+ *   caller to run when it suits: after the editor has let go of the handle.
+ */
+export function pressGate() {
+  const down = new Set();
+  let pending = null;
+  return {
+    press(pointerId, isPrimary = false) {
+      // The first finger of a new gesture means no other is down: forget any whose release was lost.
+      if (isPrimary === true) down.clear();
+      down.add(pointerId);
+    },
+    release(pointerId) {
+      down.delete(pointerId);
+      if (down.size > 0 || !pending) return null;
+      const run = pending;
+      pending = null;
+      return run;
+    },
+    whenReleased(fn) {
+      if (typeof fn !== 'function') return;
+      if (down.size > 0) {
+        pending = fn;
+        return;
+      }
+      pending = null;
+      fn();
+    },
+    get pressed() {
+      return down.size > 0;
+    },
+    clear() {
+      down.clear();
+      pending = null;
+    },
+  };
+}
+
+/**
  * What the door screen's banner should say:
  *  - 'searching': findDoor() is still looking at the photo;
  *  - 'outline': the customer is stepping through the outlines ("Outline 2 of 3");
@@ -361,18 +514,32 @@ export function doorBannerKind({ searching = false, confident = false, chosen = 
  * The corners as the outline the customer sees, in [TL, TR, BR, BL] order. The editor joins its
  * handles so the outline never crosses itself (see outlineOrder), whichever handle ended up on
  * which corner; the standard-size estimate needs that outline's corners in reading order, or it
- * would take the door's height for its width. Clockwise on screen, starting from the corner
- * nearest the photo's top-left.
+ * would take the door's height for its width. Clockwise on screen, starting from the top-left
+ * corner of the opening.
+ *
+ * Which corner that is comes from the outline's shape, not from where the corners sit in the photo.
+ * The jambs are the pair of opposite sides nearer the photo's vertical (the phone is held upright, so
+ * they are far nearer it than the head and the sill are, however the door is seen); of the other pair,
+ * the upper one is the head, and clockwise it starts at the top-left corner. The corner nearest the
+ * photo's top-left (smallest x + y) is not always it: photographed well off to one side and from below,
+ * with the phone rolled a little, the head can slope more than 45 degrees, its far end is then nearer
+ * the photo's top-left, and every placement of the handles would be read a corner round (an
+ * 820 x 2040 opening read as 0.40 high-to-wide, matching no standard size). measureDoor and
+ * estimateFromCorners order the corners again by the same rule (orderDoorQuad in js/geometry.js).
  * @param {Point[]} points Four points (handle order).
  * @returns {Point[]} Detached copies, reordered; the input unchanged (copied) if it is not a quad.
  */
 export function cornersInOutlineOrder(points) {
   if (!isQuad(points)) return Array.isArray(points) ? copyQuad(points.filter(Boolean)) : [];
   const ordered = outlineOrder(points).map((i) => ({ x: points[i].x, y: points[i].y }));
-  let first = 0;
-  for (let i = 1; i < ordered.length; i += 1) {
-    if (ordered[i].x + ordered[i].y < ordered[first].x + ordered[first].y) first = i;
-  }
+  // Side i runs from corner i to corner i + 1, clockwise: 0 and 2 are opposite, as are 1 and 3.
+  const sides = ordered.map((a, i) => {
+    const b = ordered[(i + 1) % ordered.length];
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    return { upright: length > 0 ? Math.abs(b.y - a.y) / length : 0, middleY: (a.y + b.y) / 2 };
+  });
+  const across = sides[0].upright + sides[2].upright <= sides[1].upright + sides[3].upright ? [0, 2] : [1, 3];
+  const first = sides[across[0]].middleY <= sides[across[1]].middleY ? across[0] : across[1];
   return [...ordered.slice(first), ...ordered.slice(0, first)];
 }
 
