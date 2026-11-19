@@ -50,6 +50,19 @@ export const SHIPPED_CONFIG = deepFreeze({
   },
 
   measurement: {
+    methods: { ar: true, camera: true, paper: true },
+    standardSizes: [
+      { widthMm: 720, heightMm: 2040 },
+      { widthMm: 770, heightMm: 2040 },
+      { widthMm: 820, heightMm: 2040 },
+      { widthMm: 870, heightMm: 2040 },
+      { widthMm: 920, heightMm: 2040 },
+      { widthMm: 820, heightMm: 2100 },
+      { widthMm: 870, heightMm: 2100 },
+      { widthMm: 920, heightMm: 2100 },
+      { widthMm: 820, heightMm: 2340 },
+      { widthMm: 920, heightMm: 2340 },
+    ],
     references: [
       { id: 'a4', label: 'A4 paper', widthMm: 210, heightMm: 297, recommended: true },
       { id: 'letter', label: 'US Letter', widthMm: 215.9, heightMm: 279.4 },
@@ -162,7 +175,7 @@ export const SHIPPED_CONFIG = deepFreeze({
     installation: { enabled: true, label: 'Professional installation', price: 180, default: true, optional: true },
     quoteValidDays: 30,
     disclaimer:
-      'This price is an estimate based on the measurements from your photo. We confirm the exact size and final price with a free check measure at your home before anything is made.',
+      'This price is an estimate based on the size you gave us. We confirm the exact size and final price with a free check measure at your home before anything is made.',
   },
 
   lead: {

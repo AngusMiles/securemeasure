@@ -20,6 +20,9 @@ export const strings = {
   'done.referenceLabel': 'Your reference',
   'done.summaryHeading': 'Your enquiry',
   'done.summarySize': 'Size',
+  // Under the size when it was not measured exactly (the no-paper photo estimate, or AR).
+  'done.sizeEstimate': 'Standard size estimate',
+  'done.sizeAr': 'AR estimate',
   'done.sizeValue': '{width} wide × {height} high',
   'done.summaryProduct': 'Door',
   'done.optionAdded': 'Added',
@@ -34,6 +37,8 @@ export const strings = {
   'done.nextHeading': 'What happens next',
   'done.next1': 'We call you to book a free check measure.',
   'done.next2': 'We confirm your final price.',
+  // Used instead of done.next2 when the size is an estimate (no-paper photo or AR), which the check measure replaces.
+  'done.next2Estimate': 'We measure your door exactly and confirm your final price.',
   'done.next3': 'We make and fit your door.',
   // Used instead of done.next3 when the enquiry does not include installation.
   'done.next3Supply': 'We make your door.',
@@ -157,10 +162,13 @@ export function mount(root, ctx) {
     const rows = [];
     const size = payload.measurement;
     if (size) {
+      const noteKey = Object.prototype.hasOwnProperty.call(SIZE_NOTES, size.source) ? SIZE_NOTES[size.source] : null;
+      const sizeNote = noteKey ? t(noteKey) : null;
       rows.push(
         summaryRow(
           t('done.summarySize'),
           t('done.sizeValue', { width: noBreak(formatLength(size.widthMm)), height: noBreak(formatLength(size.heightMm)) }),
+          { note: sizeNote },
         ),
       );
     }
@@ -197,6 +205,8 @@ export function mount(root, ctx) {
   function buildNextSteps() {
     // Fitting is only promised when the enquiry includes installation, as the summary above says.
     const lastStep = installationIncluded(config, payload) ? 'done.next3' : 'done.next3Supply';
+    // An estimated size is not the size the door is made to: say that the check measure settles it.
+    const middleStep = isEstimate(payload) ? 'done.next2Estimate' : 'done.next2';
     return ui.card(
       { class: 'sm-done-next' },
       ui.h('h2', { class: 'sm-done-heading' }, t('done.nextHeading')),
@@ -204,10 +214,19 @@ export function mount(root, ctx) {
         'ol',
         // Safari drops list semantics once list-style is none; the role restores them.
         { class: 'sm-done-next__list', attrs: { role: 'list' } },
-        ['done.next1', 'done.next2', lastStep].map((key) => ui.h('li', null, ui.h('span', null, t(key)))),
+        ['done.next1', middleStep, lastStep].map((key) => ui.h('li', null, ui.h('span', null, t(key)))),
       ),
     );
   }
+}
+
+/** The note under the summary's size, by payload.measurement.source. Paper and typed sizes need none. */
+const SIZE_NOTES = { estimate: 'done.sizeEstimate', ar: 'done.sizeAr' };
+
+/** True when the enquiry's size is an estimate (the no-paper photo or AR) rather than a measurement or a typed size. */
+function isEstimate(payload) {
+  const source = payload?.measurement?.source;
+  return source === 'estimate' || source === 'ar';
 }
 
 /** True when the company set this wording through config.text. */

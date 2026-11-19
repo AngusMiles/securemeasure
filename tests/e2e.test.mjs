@@ -1,12 +1,23 @@
 // End-to-end test of the real measuring pipeline under Node, with no DOM: a synthetic door photo goes
 // through exactly the calls the screens make, in the same order and with the same arguments.
 //
+// The paper method:
 //   sheet screen    detectSheet(photo.image, tap, { luma }) -> sheetDetectionOutcome
 //                   (refineQuad(photo.image, corners) for "Snap to edges")
 //   door screen     measureDoor({ ...config sigmas }) -> applyMeasurementRules
 //   result screen   warpToRect(photo.image, measure.planeToImage, ...)
 //   quote screen    calculateQuote(config, { ...size, productId, selections, includeInstallation })
 //   details screen  validateCustomer -> buildLeadPayload -> submitLead
+//
+// The no-paper estimate (the "no-paper photo estimate" group below):
+//   capture screen  setPhoto, method 'estimate', findDoor(photo, { prior: priorFromGuide(...) })
+//                   (the welcome demo: the bundled photo's lens from js/demo.js demoPhotoFocal35mm,
+//                   useDemoPhoto, then findDoor(photo))
+//   door screen     startingQuad -> doorCornersPlaced -> estimateFromCorners({ ...photoFocal(photo),
+//                   sizes: standardSizesFrom(config) }) -> applyMeasurementRules(candidates[0])
+//   result screen   estimateChoices -> planeToImageFor(measure.corners, W, H) -> warpToRect
+//   quote screen    calculateQuote, as above
+//   details screen  leadMeasurement(state, config) -> buildLeadPayload -> buildMailtoUrl / submitLead
 //
 // The photos come from tools/scene.mjs, which knows where every corner really is. The scenes are rendered
 // in the canvas pixel convention (DEMO_SCENE's pixelOrigin: 'corner'), the frame js/vision.js and the
@@ -26,10 +37,27 @@ import { DEMO_SCENE, decodePng, renderScene, sceneTruth, truthToJson } from '../
 import { detectSheet, refineQuad, warpToRect } from '../js/vision.js';
 import { applyHomography, measureDoor } from '../js/geometry.js';
 import { applyMeasurementRules, calculateQuote } from '../js/quote.js';
-import { buildLeadPayload, leadMode, submitLead, validateCustomer } from '../js/lead.js';
+import { buildLeadPayload, buildMailtoUrl, LEAD_MAIL_STRINGS, leadMode, submitLead, validateCustomer } from '../js/lead.js';
 import { deepMerge } from '../js/theme.js';
-import { getLuma, getSheetMm } from '../js/photo.js';
-import { sheetDetectionOutcome } from '../js/screens/mark-common.js';
+import { getLuma, getSheetMm, setPhoto } from '../js/photo.js';
+import {
+  canEnterDoor,
+  cornersInOutlineOrder,
+  doorCornersPlaced,
+  doorOutlines,
+  outlineIndexOf,
+  sheetDetectionOutcome,
+} from '../js/screens/mark-common.js';
+import { detectDoor } from '../js/door-detect.js';
+import { findDoor, isConfident, startingQuad } from '../js/door-find.js';
+import { estimateFromCorners, photoFocal, planeToImageFor, standardSizesFrom } from '../js/estimate.js';
+import { guideRect, priorFromGuide } from '../js/camera.js';
+import { demoPhotoFocal35mm, demoPhotoUrl, useDemoPhoto } from '../js/demo.js';
+import { createInitialState } from '../js/app.js';
+import { PREVIEW_MARGIN_MM, canPreview } from '../js/screens/result-preview.js';
+import { estimateBannerKey, estimateChoices, measuredPayload } from '../js/screens/result-standard.js';
+import { resultMode } from '../js/screens/result.js';
+import { isDemoDoor as detailsIsDemoDoor, leadMeasurement as detailsLeadMeasurement } from '../js/screens/details.js';
 import liveConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
 import { SHIPPED_CONFIG as baseConfig } from './helpers/shipped-config.mjs';
@@ -53,7 +81,7 @@ const NOISY_SHEET_TOL_PX = 0.5;
 // up to about half a pixel.
 const PALE_SHEET_TOL_PX = 0.75;
 
-const PREVIEW_MARGIN_MM = 60; // js/screens/result.js
+// PREVIEW_MARGIN_MM (60 mm of frame round the opening) comes from js/screens/result-preview.js.
 const PREVIEW_WIDTH_PX = 560;
 
 const PAPER_RGB = hexToRgb(DEMO_SCENE.sheet.color);
@@ -189,18 +217,11 @@ const flatten = (photo, result) =>
     outWidth: PREVIEW_WIDTH_PX,
   });
 
-/** js/screens/details.js: the measurement block of the enquiry. */
-const leadMeasurement = (size, result) => ({
-  widthMm: size.widthMm,
-  heightMm: size.heightMm,
-  source: size.source,
-  quality: result.quality.level,
-  sigmaWidthMm: result.sigmaWidthMm,
-  sigmaHeightMm: result.sigmaHeightMm,
-});
+/** js/screens/details.js: the measurement block of the enquiry (the paper measure has no `method`). */
+const leadMeasurement = (size, result) => detailsLeadMeasurement({ size, measure: result });
 
 /** js/screens/details.js: is the size being sent the bundled demo door's, not the customer's own? */
-const isDemoDoor = (size, photo) => size.source !== 'manual' && photo.isDemo === true;
+const isDemoDoor = (size, photo) => detailsIsDemoDoor({ size, photo });
 
 /**
  * Photograph a scene and take it as far as a size, the way a customer would: one tap in the middle of
@@ -703,7 +724,8 @@ describe('bundled demo photo (assets/demo-door.png)', () => {
   /** The demo photo as "Try it with a demo photo" loads it, taken as far as a size with the true door corners. */
   function runDemoPhoto(config) {
     const photo = asPhoto(decodePng(pngBytes), { isDemo: true });
-    // js/screens/welcome.js: the demo photo is always measured with its own A4 sheet, whatever is selected.
+    // js/demo.js (selectDemoReference): the paper demo photo is always measured with its own A4 sheet,
+    // whatever is selected.
     const state = { referenceId: 'custom', customReference: { widthMm: 210, heightMm: 297 } };
     const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
     const marked = markedSheet(config, state, photo, sheet);
@@ -748,6 +770,317 @@ describe('bundled demo photo (assets/demo-door.png)', () => {
     } finally {
       delete globalThis.location;
     }
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* The no-paper photo estimate                                                                            */
+/* ------------------------------------------------------------------------------------------------------ */
+
+// No sheet in the sums: the four corners and the lens give the opening's height-to-width ratio, which is
+// matched to the company's standard sizes (an estimate the result screen says needs a check measure).
+// Neither the rendered scene nor the committed PNG carries EXIF. The scene, taken as a grabbed video frame,
+// gets the 26 mm phone prior; it was shot with a longer lens (DEMO_CAMERA focalPx 2100, about 35 mm), so
+// this also shows a near-frontal photo barely depends on the guess. The bundled demo photo is different:
+// js/demo.js loadDemo knows the lens it was rendered with (demoPhotoFocal35mm) and sets it on the photo,
+// so its estimate uses that focal length ('exif'), as the app does.
+
+/** The corner the detector may be off by (its sill edge sits on a shadow band; see tests/door-detect.test.mjs). */
+const DETECT_TOL_PX = 8;
+
+/** What loadPhoto (js/photo.js) hands the no-paper path: no EXIF focal (PNG, video frame), and how it was taken. */
+const asEstimatePhoto = (image, { isDemo = false, capture = 'frame' } = {}) => ({
+  ...asPhoto(image, { isDemo }),
+  focal35mm: null,
+  capture: isDemo ? 'demo' : capture,
+});
+
+/** The capture screen's viewfinder on a 375 px wide phone, over a 1536 x 2048 portrait video stream. */
+const PHONE_VIEW = Object.freeze({ viewW: 375, viewH: 620, videoW: 1536, videoH: 2048 });
+
+/** js/screens/capture.js: the guide the customer framed the door in, as a detection prior in photo px. */
+const guidePrior = (photo) =>
+  priorFromGuide({ guide: guideRect(PHONE_VIEW.viewW, PHONE_VIEW.viewH), ...PHONE_VIEW, photoW: photo.width, photoH: photo.height });
+
+/**
+ * A photo taken as far as a standard size, the way the screens do it, in the app's own initial state:
+ * the capture screen (or, for the bundled demo photo, the welcome screen's demo) makes it the session's
+ * photo and finds the door in it; the door screen starts the handles there and, the detection being
+ * confident, "Find my door size" measures them untouched.
+ */
+async function runEstimate(photo, config = baseConfig) {
+  const state = createInitialState(config);
+  let prior = null;
+  if (photo.isDemo) {
+    // js/screens/welcome.js startDemo -> js/demo.js loadDemo (which adds the bundled photo's known lens)
+    // -> useDemoPhoto, then findDoor(photo).
+    if (photo.focal35mm == null) photo.focal35mm = demoPhotoFocal35mm(demoPhotoUrl(config));
+    useDemoPhoto(state, photo, 'estimate', config.measurement);
+  } else {
+    // js/screens/capture.js usePhoto: setPhoto, the way in, then the door with the guide as the prior.
+    setPhoto(state, photo);
+    state.method = 'estimate';
+    prior = guidePrior(photo);
+  }
+  state.door.detection = await findDoor(photo, { prior });
+
+  // js/screens/door.js: where the handles start, and whether they count as placed without a drag.
+  const { detection } = state.door;
+  const points = startingQuad(photo, detection);
+  const outlines = doorOutlines(detection, { width: photo.width, height: photo.height });
+  const placed = doorCornersPlaced({ confident: isConfident(detection), outline: outlineIndexOf(outlines, points) });
+
+  // js/screens/door.js measureEstimate.
+  const focal = photoFocal(photo);
+  const measure = estimateFromCorners({
+    corners: cornersInOutlineOrder(points),
+    imageWidth: photo.width,
+    imageHeight: photo.height,
+    focalPx: focal.focalPx,
+    focalSource: focal.source,
+    sizes: standardSizesFrom(config),
+  });
+  if (measure.ok) {
+    const best = measure.candidates[0];
+    state.door.points = points;
+    state.measure = measure;
+    state.size = {
+      ...applyMeasurementRules(config.measurement, { widthMm: best.widthMm, heightMm: best.heightMm }),
+      source: 'estimate',
+      standard: true,
+    };
+  }
+  return { config, photo, state, prior, detection, points, placed, focal, measure, size: state.size };
+}
+
+/** js/screens/quote.js + details.js: the enquiry for the estimated size, first product at its default options. */
+function estimateEnquiry(run, config = run.config) {
+  const { state } = run;
+  const product = config.pricing.products[0];
+  const quote = calculateQuote(config, { widthMm: state.size.widthMm, heightMm: state.size.heightMm, productId: product.id });
+  const payload = buildLeadPayload({
+    config,
+    customer: CUSTOMER,
+    measurement: detailsLeadMeasurement(state, config),
+    quote,
+    selections: quote.selections,
+    includeInstallation: quote.includeInstallation,
+    product,
+    photoDataUrl: null,
+    demo: detailsIsDemoDoor(state),
+    now: new Date('2026-03-04T05:06:07Z'),
+  });
+  return { product, quote, payload };
+}
+
+/** The pre-filled email for an enquiry (lead.mailto), as the customer's mail app opens it. */
+function mailFor(config, payload) {
+  const url = new URL(buildMailtoUrl(config, payload));
+  return { url, subject: url.searchParams.get('subject'), body: url.searchParams.get('body') };
+}
+
+const sizeLabel = (size) => `${size.widthMm}x${size.heightMm}`;
+
+function assertEstimatesDemoDoor(run, truthDoorPx, label) {
+  const { measure, state, focal, photo } = run;
+  // The bundled demo photo's lens is known to the app (js/demo.js); any other photo without EXIF gets the prior.
+  const lens = photo.isDemo ? 'exif' : 'prior';
+  assert.equal(focal.source, lens, `${label}: ${photo.isDemo ? "the bundled demo photo's known lens" : 'no EXIF, so the 26 mm phone prior'}`);
+  assert.equal(measure.ok, true, `${label}: estimateFromCorners succeeded (${measure.error})`);
+  assert.equal(measure.method, 'estimate');
+  assert.equal(measure.focalSource, lens);
+  assert.equal(sizeLabel(measure.candidates[0]), '820x2040', `${label}: candidates ${measure.candidates.map(sizeLabel).join(', ')}`);
+  assert.equal(measure.widthMm, TRUE_WIDTH_MM);
+  assert.equal(measure.heightMm, TRUE_HEIGHT_MM);
+  assert.equal(measure.nonStandard, false);
+  assert.ok(!measure.issues.includes('not_rectangular'), `${label}: issues ${measure.issues.join(', ')}`);
+  const aspectError = Math.abs(measure.aspectHW / (TRUE_HEIGHT_MM / TRUE_WIDTH_MM) - 1);
+  assert.ok(aspectError < 0.015, `${label}: height/width ${measure.aspectHW.toFixed(4)} is within 1.5% of the truth`);
+
+  // Only the company's own sizes, best first, at most 4.
+  const catalogue = new Set(standardSizesFrom(run.config).map(sizeLabel));
+  assert.ok(measure.candidates.length >= 1 && measure.candidates.length <= 4);
+  for (const candidate of measure.candidates) assert.ok(catalogue.has(sizeLabel(candidate)), `${sizeLabel(candidate)} is in the catalogue`);
+  for (let i = 1; i < measure.candidates.length; i++) assert.ok(measure.candidates[i - 1].p >= measure.candidates[i].p, 'best first');
+
+  // The corners it measured are the detected door, put in [TL, TR, BR, BL] order.
+  assert.ok(maxCornerError(measure.corners, truthDoorPx) < DETECT_TOL_PX, `${label}: worst corner ${maxCornerError(measure.corners, truthDoorPx).toFixed(2)} px`);
+
+  // js/screens/door.js: the size every later screen works from, with the company's rules applied.
+  assert.deepEqual(state.size, { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM, source: 'estimate', standard: true });
+  assert.equal(state.method, 'estimate');
+}
+
+describe('no-paper photo estimate: the demo scene from the live camera to a price and an enquiry', () => {
+  let run;
+  let truth;
+  before(async () => {
+    const demo = getDemoRun();
+    truth = demo.truth;
+    // The same render as the paper groups, as a grabbed video frame: no EXIF, framed in the guide.
+    run = await runEstimate(asEstimatePhoto(demo.photo.image, { capture: 'frame' }));
+  });
+
+  test('the capture guide and the photo find the door confidently, near its true corners', () => {
+    const { prior, detection, photo, state } = run;
+    assert.ok(Array.isArray(prior) && prior.length === 4, 'a live capture passes the guide as the prior');
+    assert.equal(detection.ok, true, `findDoor found a door (${detection.reason})`);
+    assert.ok(isConfident(detection), `confidence ${detection.confidence.toFixed(3)} is above "we found your door"`);
+    assert.ok(maxCornerError(detection.quad, truth.doorPx) < DETECT_TOL_PX, `worst corner ${maxCornerError(detection.quad, truth.doorPx).toFixed(2)} px`);
+
+    // findDoor runs detectDoor (in a worker in the browser); the raw detector sees the same opening.
+    const raw = detectDoor(photo.image);
+    assert.equal(raw.ok, true);
+    assert.ok(maxCornerError(raw.quad, detection.quad) < 1, 'findDoor reports the detector’s own outline');
+
+    // js/screens/door.js: entered on the photo alone, and a confident detection counts as placed.
+    assert.equal(canEnterDoor(state), true);
+    assert.equal(run.placed, true, 'the handles on a confident detection may be measured untouched');
+  });
+
+  test('the estimate matches the opening to 820 x 2040 mm with the 26 mm prior and the shipped catalogue', (t) => {
+    const { measure } = run;
+    t.diagnostic(
+      `${measure.candidates.map((c) => `${sizeLabel(c)} p=${c.p.toFixed(2)}`).join(', ')}; ` +
+        `aspect ${measure.aspectHW.toFixed(4)}, tilt ${measure.viewTiltDeg.toFixed(1)} deg, confident ${measure.confident}`,
+    );
+    assertEstimatesDemoDoor(run, truth.doorPx, 'demo scene');
+  });
+
+  test('the result screen offers that size first, and its flattened preview shows the door where the estimate puts it', () => {
+    const { state, measure, photo } = run;
+    assert.equal(resultMode(state), 'estimate');
+    const choices = estimateChoices(measure);
+    assert.ok(choices.length >= 1 && choices.length <= 3);
+    assert.equal(sizeLabel(choices[0]), '820x2040');
+    // The size the door screen announced is the one the result screen starts on: nothing to send again.
+    assert.deepEqual(measuredPayload(state), { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM, source: 'estimate', standard: true });
+    if (!measure.confident) assert.ok(estimateBannerKey(measure, choices.length), 'an unsure estimate says so');
+
+    const plane = { planeToImage: planeToImageFor(measure.corners, choices[0].widthMm, choices[0].heightMm), ...choices[0] };
+    assert.ok(canPreview(photo.image, plane));
+    plane.planeToImage.forEach((v, i) => assert.ok(Math.abs(v - measure.planeToImage[i]) <= 1e-9 * Math.max(1, Math.abs(v)), 'same mapping the estimate carries'));
+
+    const preview = warpToRect(photo.image, plane.planeToImage, {
+      widthMm: plane.widthMm,
+      heightMm: plane.heightMm,
+      marginMm: PREVIEW_MARGIN_MM,
+      outWidth: PREVIEW_WIDTH_PX,
+    });
+    const at = (xMm, yMm) => previewColourAt(preview, plane, xMm, yMm);
+    const midY = TRUE_HEIGHT_MM / 2;
+    // The paper is in the photo (it is the paper groups' render) but plays no part here: it simply lands
+    // where it is on the door because the estimated size is the true one.
+    assertColour(at(410, 700), PAPER_RGB, 'sheet centre is paper white');
+    assertColour(at(57, midY), DOOR_RGB, 'left stile is the door colour');
+    assertColour(at(20, midY), DOOR_RGB, '20 mm inside the left edge');
+    assertColour(at(-20, midY), ARCHITRAVE_RGB, '20 mm outside the left edge');
+    assertColour(at(TRUE_WIDTH_MM - 20, 600), DOOR_RGB, '20 mm inside the right edge');
+    assertColour(at(TRUE_WIDTH_MM + 20, 600), ARCHITRAVE_RGB, '20 mm outside the right edge');
+    assertColour(at(410, 20), DOOR_RGB, '20 mm inside the top edge');
+    assertColour(at(410, -20), ARCHITRAVE_RGB, '20 mm outside the top edge');
+  });
+
+  test('the size prices instantly, and the enquiry carries it as a standard-size estimate with no plus-or-minus', async () => {
+    const { config, state, measure } = run;
+    const { product, quote, payload } = estimateEnquiry(run);
+    assertQuoteAddsUp(quote, config, product.id);
+    assert.equal(quote.sizeCategory, 'standard');
+    assert.equal(quote.total, expectedStandardTotal(config, product, {}, config.pricing.installation.default));
+
+    assert.equal(payload.demo, false, "the customer's own door");
+    assert.equal(payload.measurement.source, 'estimate');
+    assert.equal(payload.measurement.standard, true);
+    assert.equal(payload.measurement.widthMm, state.size.widthMm);
+    assert.equal(payload.measurement.heightMm, state.size.heightMm);
+    // The other sizes the result screen offered, as the company lists them.
+    assert.deepEqual(
+      payload.measurement.alternatives,
+      estimateChoices(measure)
+        .slice(1)
+        .map(({ widthMm, heightMm }) => ({ widthMm, heightMm })),
+    );
+    assert.ok(Math.abs(payload.measurement.aspectHW - measure.aspectHW) < 1e-4);
+    for (const key of ['quality', 'qualityIssues', 'sigmaWidthMm', 'sigmaHeightMm']) {
+      assert.ok(!(key in payload.measurement), `no ${key}: the estimate has no millimetre scale of its own`);
+    }
+    assert.deepEqual(payload.product, { id: product.id, name: product.name });
+    assert.equal(payload.quote.total, quote.total);
+    assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload, 'payload survives JSON unchanged');
+    assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'demo' });
+  });
+
+  test('the email says it is an estimate that needs a check measure, and lists the other sizes it could be', () => {
+    const config = deepMerge(baseConfig, { lead: { mailto: 'sales@doors.example' } });
+    const { payload } = estimateEnquiry(run, config);
+    const { url, subject, body } = mailFor(config, payload);
+    assert.equal(url.protocol, 'mailto:');
+    assert.equal(url.pathname, 'sales@doors.example');
+    assert.ok(subject.includes(payload.reference));
+    assert.ok(subject.includes('(820 x 2040 mm)'), `subject: ${subject}`);
+    assert.ok(!subject.includes('[DEMO]'), "the customer's own door is not tagged as a demo");
+    const lines = [`Door size: ${TRUE_WIDTH_MM} mm wide x ${TRUE_HEIGHT_MM} mm high`, LEAD_MAIL_STRINGS['lead.mail.measuredEstimate']];
+    if (payload.measurement.alternatives.length > 0) {
+      const sizes = payload.measurement.alternatives.map((s) => `${s.widthMm} x ${s.heightMm} mm`).join(', ');
+      lines.push(`Other standard sizes it could be: ${sizes}`);
+    }
+    for (const line of [...lines, `Product: ${config.pricing.products[0].name}`, CUSTOMER.name, CUSTOMER.notes]) {
+      assert.ok(body.includes(line), `email body mentions "${line}"`);
+    }
+    assert.ok(!body.includes('+/-'), 'no accuracy figure that nobody measured');
+    assert.ok(!body.includes('confidence'), 'no paper-method fit grade');
+  });
+});
+
+describe('no-paper photo estimate: the bundled demo photo (assets/demo-door.png)', () => {
+  const pngBytes = readFileSync(new URL('../assets/demo-door.png', import.meta.url));
+  const truthJson = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+  let run;
+  before(async () => {
+    run = await runEstimate(asEstimatePhoto(decodePng(pngBytes), { isDemo: true }));
+  });
+
+  test('"Try it with a demo photo": detectDoor finds the door and estimateFromCorners makes it 820 x 2040 mm', () => {
+    const { photo, detection, state } = run;
+    assert.equal(photo.width, truthJson.imageWidth);
+    assert.equal(photo.height, truthJson.imageHeight);
+    assert.equal(photo.capture, 'demo');
+    assert.equal(state.method, 'estimate', 'the welcome demo takes the no-paper way in');
+
+    const raw = detectDoor(photo.image);
+    assert.equal(raw.ok, true, `detectDoor found a door (${raw.reason})`);
+    assert.ok(raw.confidence > 0.6, `confidence ${raw.confidence.toFixed(3)}`);
+    assert.ok(maxCornerError(raw.quad, truthJson.doorPx) < DETECT_TOL_PX, `worst corner ${maxCornerError(raw.quad, truthJson.doorPx).toFixed(2)} px`);
+    assert.ok(isConfident(detection), 'findDoor says "we found your door"');
+    assert.equal(run.placed, true);
+
+    assertEstimatesDemoDoor(run, truthJson.doorPx, 'demo photo');
+
+    // The true corners give the same answer: the match does not hang on the detector's few pixels.
+    const exact = estimateFromCorners({
+      corners: truthJson.doorPx,
+      imageWidth: photo.width,
+      imageHeight: photo.height,
+      ...photoFocal(photo),
+      sizes: standardSizesFrom(baseConfig),
+    });
+    assert.equal(exact.ok, true);
+    assert.equal(sizeLabel(exact.candidates[0]), '820x2040');
+  });
+
+  test('an enquiry from it is marked as the demo door, in the data and in the email', () => {
+    const { state } = run;
+    assert.equal(detailsIsDemoDoor(state), true);
+    assert.equal(measuredPayload(state).demo, true, 'the measured event says so too');
+    const plain = estimateEnquiry(run);
+    assert.equal(plain.payload.demo, true);
+    assert.equal(plain.payload.measurement.source, 'estimate');
+
+    const config = deepMerge(baseConfig, { lead: { mailto: 'sales@doors.example' } });
+    const { payload } = estimateEnquiry(run, config);
+    const { subject, body } = mailFor(config, payload);
+    assert.ok(subject.startsWith('[DEMO] '), `subject: ${subject}`);
+    assert.ok(body.includes(LEAD_MAIL_STRINGS['lead.mail.measuredDemoEstimate']), 'the body says whose door it is');
   });
 });
 
@@ -1006,7 +1339,8 @@ describe('js/config.js as it stands: your own settings through the same steps', 
 
   test('the demo photo measures 820 x 2040 mm with its measurement settings', () => {
     const photo = asPhoto(decodePng(pngBytes), { isDemo: true });
-    // js/screens/welcome.js: the demo photo is always measured with its own A4 sheet, whatever is selected.
+    // js/demo.js (selectDemoReference): the paper demo photo is always measured with its own A4 sheet,
+    // whatever is selected.
     const state = { referenceId: 'custom', customReference: { widthMm: 210, heightMm: 297 } };
     const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
     const marked = markedSheet(config, state, photo, sheet);

@@ -1,7 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { deepMerge, loadConfig, applyTheme } from '../js/theme.js';
+import { deepMerge, loadConfig, applyTheme, measurementMethods, normaliseConfig } from '../js/theme.js';
+import { DEFAULT_STANDARD_SIZES } from '../js/estimate.js';
 import liveConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
 // js/config.js is there to be edited, so only the loadConfig tests read it (and compare against whatever
@@ -53,6 +54,25 @@ describe('deepMerge', () => {
   test('replaces arrays whole instead of merging them', () => {
     const merged = deepMerge({ list: [1, 2, 3], nested: { list: [{ id: 'a' }, { id: 'b' }] } }, { list: [9], nested: { list: [] } });
     assert.deepEqual(merged, { list: [9], nested: { list: [] } });
+  });
+
+  test('a skin replaces the standard sizes whole, never entry by entry', () => {
+    const base = { measurement: { standardSizes: liveConfig.measurement.standardSizes, roundToMm: 1 } };
+    const usSizes = [
+      { widthMm: 762, heightMm: 2032 },
+      { widthMm: 813, heightMm: 2032 },
+    ];
+    const merged = deepMerge(base, { measurement: { standardSizes: usSizes } });
+    // Merged index by index, the result would keep the base list's later sizes after the two US ones.
+    assert.deepEqual(merged.measurement.standardSizes, usSizes);
+    assert.equal(merged.measurement.roundToMm, 1, 'the rest of the group is still merged');
+    assert.notEqual(merged.measurement.standardSizes, usSizes, 'and it is a copy');
+    assert.notEqual(merged.measurement.standardSizes[0], usSizes[0]);
+
+    // A skin that only switches a method off keeps the base sizes and the other methods.
+    const noAr = deepMerge(liveConfig, { measurement: { methods: { ar: false } } });
+    assert.deepEqual(noAr.measurement.methods, { ...liveConfig.measurement.methods, ar: false });
+    assert.deepEqual(noAr.measurement.standardSizes, liveConfig.measurement.standardSizes);
   });
 
   test('replaces primitives, and swaps objects and primitives either way', () => {
@@ -251,6 +271,158 @@ describe('loadConfig', () => {
     assert.deepEqual(await loadConfig(12345), liveConfig);
     const viaParams = await loadConfig(new URLSearchParams('skin=acme'));
     assert.equal(viaParams.brand.name, 'Acme Security Doors');
+  });
+
+  test('hands back the measuring settings normaliseConfig settles, with no warning for good ones', async (t) => {
+    const warnings = captureWarnings(t);
+    for (const search of ['', '?skin=acme']) {
+      const { measurement } = await loadConfig(search);
+      assert.deepEqual(Object.keys(measurement.methods).sort(), ['ar', 'camera', 'paper']);
+      for (const value of Object.values(measurement.methods)) assert.equal(typeof value, 'boolean');
+      assert.ok(Array.isArray(measurement.standardSizes) && measurement.standardSizes.length > 0);
+    }
+    assert.equal(warnings.callCount(), 0);
+  });
+});
+
+/** A config with only the measuring settings under test, the rest as shipped. */
+function withMeasurement(measurement) {
+  const config = deepMerge(baseConfig, { measurement: {} });
+  config.measurement = { ...config.measurement, ...measurement };
+  return config;
+}
+
+const builtInSizes = () => DEFAULT_STANDARD_SIZES.map(({ widthMm, heightMm }) => ({ widthMm, heightMm }));
+
+describe('measurementMethods', () => {
+  test('every way in is on unless it is set to false', () => {
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: { ar: true, camera: true, paper: true } })), {
+      ar: true,
+      camera: true,
+      paper: true,
+    });
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: { ar: false } })), { ar: false, camera: true, paper: true });
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: { camera: false, paper: false } })), {
+      ar: true,
+      camera: false,
+      paper: false,
+    });
+  });
+
+  test('reads anything that is not true or false as on', () => {
+    for (const methods of [undefined, null, 'none', [], 0, { ar: 'no', camera: 0, paper: null }]) {
+      assert.deepEqual(measurementMethods(withMeasurement({ methods })), { ar: true, camera: true, paper: true }, JSON.stringify(methods));
+    }
+    assert.deepEqual(measurementMethods({}), { ar: true, camera: true, paper: true });
+    assert.deepEqual(measurementMethods(undefined), { ar: true, camera: true, paper: true });
+  });
+
+  test('keeps paper on when nothing else would work on every phone and manual sizes are off', () => {
+    const allOff = { ar: false, camera: false, paper: false };
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: allOff, allowManualOverride: false })), { ...allOff, paper: true });
+    // AR alone is no way in on an iPhone.
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: { ...allOff, ar: true }, allowManualOverride: false })), {
+      ar: true,
+      camera: false,
+      paper: true,
+    });
+    // A typed-in size is a way in: a company may run the app as a price calculator only.
+    assert.deepEqual(measurementMethods(withMeasurement({ methods: allOff, allowManualOverride: true })), allOff);
+  });
+});
+
+describe('normaliseConfig', () => {
+  test('leaves good settings exactly as they are, without a warning', (t) => {
+    const warnings = captureWarnings(t);
+    const methods = { ar: false, camera: true, paper: true };
+    const standardSizes = [
+      { widthMm: 762, heightMm: 2032 },
+      { widthMm: 813, heightMm: 2032 },
+    ];
+    const config = withMeasurement({ methods, standardSizes });
+    const before = structuredClone(config);
+    assert.equal(normaliseConfig(config), config, 'fixes in place and returns the same object');
+    assert.deepEqual(config, before);
+    assert.deepEqual(normaliseConfig(deepMerge(liveConfig, undefined)), liveConfig);
+    assert.equal(warnings.callCount(), 0);
+  });
+
+  test('fills in missing settings quietly (a config from before they existed)', (t) => {
+    const warnings = captureWarnings(t);
+    const config = withMeasurement({});
+    delete config.measurement.methods;
+    delete config.measurement.standardSizes;
+    normaliseConfig(config);
+    assert.deepEqual(config.measurement.methods, { ar: true, camera: true, paper: true });
+    assert.deepEqual(config.measurement.standardSizes, builtInSizes());
+    assert.equal(Object.isFrozen(config.measurement.standardSizes[0]), false, 'a copy the app may change, not the frozen list');
+    assert.equal(warnings.callCount(), 0);
+  });
+
+  test('turns malformed methods into the defaults, with a warning for each mistake', (t) => {
+    const warnings = captureWarnings(t);
+    const notAGroup = normaliseConfig(withMeasurement({ methods: 'camera' }));
+    assert.deepEqual(notAGroup.measurement.methods, { ar: true, camera: true, paper: true });
+    assert.equal(warnings.callCount(), 1);
+    assert.match(warningText(warnings), /measurement\.methods/);
+
+    const typos = normaliseConfig(withMeasurement({ methods: { ar: 'false', camara: false, paper: false } }));
+    assert.deepEqual(typos.measurement.methods, { ar: true, camera: true, paper: false }, 'only known keys, as booleans');
+    assert.equal(warnings.callCount(), 3);
+    assert.match(warningText(warnings), /measurement\.methods\.ar should be true or false/);
+    assert.match(warningText(warnings), /measurement\.methods\.camara is not a setting/);
+  });
+
+  test('says so when it has to keep paper on', (t) => {
+    const warnings = captureWarnings(t);
+    const config = normaliseConfig(
+      withMeasurement({ methods: { ar: true, camera: false, paper: false }, allowManualOverride: false }),
+    );
+    assert.deepEqual(config.measurement.methods, { ar: true, camera: false, paper: true });
+    assert.equal(warnings.callCount(), 1);
+    assert.match(warningText(warnings), /keeping paper on/);
+  });
+
+  test('drops unusable and repeated standard sizes, keeping the good ones in order', (t) => {
+    const warnings = captureWarnings(t);
+    const config = normaliseConfig(
+      withMeasurement({
+        standardSizes: [
+          { widthMm: 820, heightMm: 2040 },
+          { widthMm: '870', heightMm: 2040 },
+          null,
+          { widthMm: 920 },
+          { widthMm: -820, heightMm: 2040 },
+          { widthMm: 820, heightMm: 20400000 },
+          { widthMm: Number.NaN, heightMm: 2040 },
+          { widthMm: 820, heightMm: 2040 },
+          { widthMm: 920, heightMm: 2100 },
+        ],
+      }),
+    );
+    assert.deepEqual(config.measurement.standardSizes, [
+      { widthMm: 820, heightMm: 2040 },
+      { widthMm: 920, heightMm: 2100 },
+    ]);
+    assert.equal(warnings.callCount(), 7);
+    assert.match(warningText(warnings), /standardSizes\[1\]/);
+    assert.match(warningText(warnings), /820 x 2040 more than once/);
+  });
+
+  test('falls back to the built-in sizes when none is usable', (t) => {
+    const warnings = captureWarnings(t);
+    for (const standardSizes of [[], [{ w: 820, h: 2040 }], 'AU', { widthMm: 820, heightMm: 2040 }, null]) {
+      const config = normaliseConfig(withMeasurement({ standardSizes }));
+      assert.deepEqual(config.measurement.standardSizes, builtInSizes(), JSON.stringify(standardSizes));
+    }
+    assert.ok(warnings.callCount() >= 5, 'each one is reported');
+    assert.match(warningText(warnings), /using the built-in sizes/);
+  });
+
+  test('copes with a config that has no measurement group at all', () => {
+    assert.deepEqual(normaliseConfig({}), {});
+    assert.equal(normaliseConfig(undefined), undefined);
+    assert.deepEqual(normaliseConfig({ measurement: null }), { measurement: null });
   });
 });
 

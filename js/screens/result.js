@@ -1,17 +1,32 @@
 /**
  * Result screen (step 3).
  *
- * Two modes share this module:
- *  - measured: state.measure is set, so we show the size read from the photo, how far to
- *    trust it, a flattened preview to sanity-check the outline, and an optional tape override;
- *  - manual entry: the customer chose "I already know my door size", so we only ask for
- *    the two numbers.
- * Either way the screen leaves state.size holding the size the quote is priced from.
+ * Four modes share this screen, picked by resultMode() from how the door was measured:
+ *  - paper (this module): state.measure came from the sheet of paper on the door, so we show the
+ *    size read from the photo, how far to trust it, a flattened preview to sanity-check the
+ *    outline, and an optional tape override;
+ *  - estimate and ar (js/screens/result-standard.js): no paper, so the size is an estimate matched
+ *    to the company's standard sizes (one photo) or measured with the phone's AR camera;
+ *  - manual entry (this module): the customer chose "I already know my door size", so we only ask
+ *    for the two numbers.
+ * Every mode leaves state.size holding the size the quote is priced from.
  */
 import { QUALITY_THRESHOLDS } from '../geometry.js';
 import { getSheetMm } from '../photo.js';
-import { warpToRect } from '../vision.js';
-import { applyMeasurementRules, formatLength } from '../quote.js';
+import { formatLength } from '../quote.js';
+import { measurementMethods } from '../theme.js';
+import {
+  addClass,
+  announceMeasured,
+  applyRules,
+  createSizeForm,
+  estimateChoices,
+  hasAdjustment,
+  mountAr,
+  mountEstimate,
+  strings as standardStrings,
+} from './result-standard.js';
+import { createPreview } from './result-preview.js';
 
 /** Screen id used by the router. */
 export const id = 'result';
@@ -19,7 +34,11 @@ export const id = 'result';
 /** Progress step this screen belongs to. */
 export const step = 3;
 
-/** Default copy for this screen; any key can be overridden through config.text. */
+/**
+ * Default copy for this screen (all four modes); any key can be overridden through config.text.
+ * The estimate and AR modes' own copy is merged in from result-standard.js, so the app's string
+ * table, which is built from each screen's `strings`, holds it too.
+ */
 export const strings = {
   'result.title': 'Your door size',
   'result.subtitle': 'Measured from your photo. Check it looks right, then get your price.',
@@ -87,6 +106,9 @@ export const strings = {
   'result.manual.widthTip': 'Measure between the frame at the narrowest point.',
   'result.manual.heightTip': 'Measure from the step to the top of the opening.',
   'result.manual.useCamera': 'Measure with my camera instead',
+  'result.manual.usePaper': 'Measure with a sheet of paper instead',
+
+  ...standardStrings,
 };
 
 /**
@@ -98,6 +120,39 @@ export function canEnter(state) {
   return Boolean(state && (state.measure || state.manualEntry));
 }
 
+const isLength = (value) => Number.isFinite(Number(value)) && Number(value) > 0;
+
+/**
+ * Which mode the screen shows. measure.method tells the ways of measuring apart; a measure with no
+ * method is the paper one (it predates the others). A no-paper measure with no usable size, which
+ * the measuring screens never produce, falls back to asking for the size rather than showing blanks.
+ *
+ * @param {object} state shared app state
+ * @returns {'paper' | 'estimate' | 'ar' | 'manual'}
+ */
+export function resultMode(state) {
+  const measure = state?.measure;
+  if (!measure) return 'manual';
+  if (measure.method === 'estimate') return estimateChoices(measure).length > 0 ? 'estimate' : 'manual';
+  if (measure.method === 'ar') return isLength(measure.widthMm) && isLength(measure.heightMm) ? 'ar' : 'manual';
+  return 'paper';
+}
+
+/**
+ * The manual-entry screen's way back to measuring, as config.measurement.methods allows: the no-paper
+ * camera (where the welcome screen's "Measure with my camera" goes) when it is on, else the paper
+ * method, else none. Each target has its own copy, so the same words always lead to the same screen.
+ *
+ * @param {object} config the merged config
+ * @returns {{ target: 'capture' | 'prepare', label: string, icon: string } | null}
+ */
+export function manualAlternative(config) {
+  const methods = measurementMethods(config);
+  if (methods.camera) return { target: 'capture', label: 'result.manual.useCamera', icon: 'camera' };
+  if (methods.paper) return { target: 'prepare', label: 'result.manual.usePaper', icon: 'paper' };
+  return null;
+}
+
 /**
  * Build the screen inside `root`.
  * @param {HTMLElement} root the empty <section> for this screen
@@ -105,11 +160,21 @@ export function canEnter(state) {
  * @returns {(() => void) | undefined} cleanup function
  */
 export function mount(root, ctx) {
-  return ctx.state.measure ? mountMeasured(root, ctx) : mountManualEntry(root, ctx);
+  switch (resultMode(ctx.state)) {
+    case 'estimate':
+      return mountEstimate(root, ctx);
+    case 'ar':
+      return mountAr(root, ctx);
+    case 'paper':
+      return mountMeasured(root, ctx);
+    default:
+      return mountManualEntry(root, ctx);
+  }
 }
 
 /* ------------------------------------------------------------------ */
-/* Shared helpers                                                      */
+/* Paper and manual-entry helpers                                      */
+/* (the size form and the 'measured' event are in result-standard.js)  */
 /* ------------------------------------------------------------------ */
 
 const QUALITY = {
@@ -128,19 +193,6 @@ const QUALITY = {
 // go on.
 const UNTRUSTED_ISSUES = new Set(['high_residual', 'implausible_size', 'methods_disagree', 'orientation_unclear']);
 
-const DEFAULT_PLAUSIBLE = { minWidthMm: 500, maxWidthMm: 1500, minHeightMm: 1500, maxHeightMm: 2800 };
-
-const PREVIEW_MARGIN_MM = 60;
-const PREVIEW_MAX_PX = 720;
-// Used only when the preview frame has no layout width yet (e.g. it is inside a hidden parent).
-const PREVIEW_FALLBACK_CSS_PX = 280;
-
-// Canvas overlay colours are fixed on purpose: a dark halo under a white core stays
-// readable over any photo, which a brand colour cannot guarantee.
-const INK = 'rgba(15, 23, 42, 0.85)';
-const PAPER = '#ffffff';
-const SAFE_FONT_STACK = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
-
 // Static, trusted illustration for the manual-entry mode (door opening with the two
 // distances to measure). Coloured from css/screens/result.css.
 const DOOR_ART = `<svg class="sm-result__art" viewBox="0 0 96 132" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
@@ -151,27 +203,6 @@ const DOOR_ART = `<svg class="sm-result__art" viewBox="0 0 96 132" aria-hidden="
   <path class="sm-result__art-measure" d="M27 46h42M32 41l-5 5 5 5M64 41l5 5-5 5"/>
   <path class="sm-result__art-measure" d="M12 17v103M7 22l5-5 5 5M7 115l5 5 5-5"/>
 </svg>`;
-
-/** Add classes after the fact so they survive however a ui.* factory treats a `class` prop. */
-function addClass(el, ...names) {
-  el.classList.add(...names);
-  return el;
-}
-
-/** Run the company's measurement rules over a width/height pair, returning only that pair. */
-function applyRules(measurementCfg, { widthMm, heightMm }) {
-  const out = applyMeasurementRules(measurementCfg, { widthMm, heightMm });
-  return { widthMm: out.widthMm, heightMm: out.heightMm };
-}
-
-function plausibleLimits(config) {
-  return { ...DEFAULT_PLAUSIBLE, ...(config.measurement?.plausible ?? {}) };
-}
-
-function hasAdjustment(config) {
-  const adj = config.measurement?.adjustments ?? {};
-  return Boolean(Number(adj.widthMm) || Number(adj.heightMm));
-}
 
 /**
  * True when measureDoor could not safely tell an upright sheet from one on its side, and the two
@@ -215,147 +246,8 @@ function accuracyFromSigmas(measure) {
   return Number.isFinite(sigma) ? Math.max(2, Math.ceil(2 * sigma)) : null;
 }
 
-/** Whole millimetres from a text input, or null when it is empty or not a number. */
-function parseMm(raw) {
-  const text = String(raw ?? '').trim().replace(',', '.');
-  if (text === '') return null;
-  const value = Number(text);
-  return Number.isFinite(value) ? Math.round(value) : null;
-}
-
-/**
- * Tell an embedding page which size the customer is going ahead with. The door screen already
- * emits 'measured' for a fresh photo measurement, so callers only use this for a size that was
- * chosen on this screen (typed in, or switched back to the photo).
- */
-function announceMeasured(ctx) {
-  const { size, measure } = ctx.state;
-  const payload = { widthMm: size.widthMm, heightMm: size.heightMm, source: size.source };
-  if (size.source === 'photo' && measure) {
-    payload.quality = measure.quality?.level;
-    payload.sigmaWidthMm = measure.sigmaWidthMm;
-    payload.sigmaHeightMm = measure.sigmaHeightMm;
-    // The bundled demo door, not the customer's own: said here as it is on the enquiry.
-    if (ctx.state.photo?.isDemo === true) payload.demo = true;
-  }
-  ctx.emit?.('measured', payload);
-}
-
-/**
- * Width + height inputs validated against config.measurement.plausible.
- * Errors stay quiet until a field has been left (or a submit was attempted), then track live.
- * @returns {{ el: HTMLElement, getValues: () => ({widthMm:number,heightMm:number}|null), submit: () => ({widthMm:number,heightMm:number}|null), isEmpty: () => boolean }}
- */
-function createSizeForm(ctx, { idPrefix, initial = null, hints = false, onChange, onSubmit }) {
-  const { ui, t } = ctx;
-  const limits = plausibleLimits(ctx.config);
-  const specs = [
-    {
-      key: 'widthMm',
-      slug: 'width',
-      min: limits.minWidthMm,
-      max: limits.maxWidthMm,
-      label: 'result.field.width',
-      hint: 'result.field.widthHint',
-      error: 'result.error.width',
-    },
-    {
-      key: 'heightMm',
-      slug: 'height',
-      min: limits.minHeightMm,
-      max: limits.maxHeightMm,
-      label: 'result.field.height',
-      hint: 'result.field.heightHint',
-      error: 'result.error.height',
-    },
-  ];
-  const fields = new Map();
-  const touched = new Set();
-
-  const check = (spec) => {
-    const mm = parseMm(fields.get(spec.key).input.value);
-    if (mm === null) return { value: null, error: t('result.error.required') };
-    if (mm < spec.min || mm > spec.max) {
-      return { value: null, error: t(spec.error, { min: spec.min, max: spec.max }) };
-    }
-    return { value: mm, error: null };
-  };
-
-  const getValues = () => {
-    const values = {};
-    for (const spec of specs) {
-      const { value } = check(spec);
-      if (value === null) return null;
-      values[spec.key] = value;
-    }
-    return values;
-  };
-
-  const submit = () => {
-    let firstInvalid = null;
-    for (const spec of specs) {
-      const field = fields.get(spec.key);
-      const { error } = check(spec);
-      touched.add(spec.key);
-      field.setError(error);
-      if (error && !firstInvalid) firstInvalid = field.input;
-    }
-    if (firstInvalid) {
-      firstInvalid.focus();
-      return null;
-    }
-    return getValues();
-  };
-
-  const isEmpty = () => specs.every((spec) => fields.get(spec.key).input.value.trim() === '');
-
-  for (const spec of specs) {
-    const field = ui.field({
-      id: `${idPrefix}-${spec.slug}`,
-      label: t(spec.label),
-      type: 'number',
-      inputmode: 'numeric',
-      required: true,
-      value: initial ? String(initial[spec.key]) : '',
-      suffix: t('result.unit'),
-      min: spec.min,
-      max: spec.max,
-      step: 1,
-      hint: hints ? t(spec.hint) : undefined,
-      onInput: () => {
-        if (touched.has(spec.key)) field.setError(check(spec).error);
-        onChange?.(getValues());
-      },
-    });
-    field.input.addEventListener('change', () => {
-      if (field.input.value !== '') touched.add(spec.key);
-      if (touched.has(spec.key)) field.setError(check(spec).error);
-      // Some input methods (autofill, steppers) commit without an input event.
-      onChange?.(getValues());
-    });
-    field.input.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter') return;
-      event.preventDefault();
-      onSubmit?.();
-    });
-    fields.set(spec.key, field);
-  }
-
-  const el = ui.h(
-    'form',
-    {
-      class: 'sm-result__form sm-stack',
-      attrs: { novalidate: '' },
-      on: { submit: (event) => event.preventDefault() },
-    },
-    specs.map((spec) => fields.get(spec.key).el),
-  );
-
-  return { el, getValues, submit, isEmpty };
-}
-
 /* ------------------------------------------------------------------ */
-/* Mode A: measured from the photo                                     */
+/* Paper mode: measured from the photo with the sheet of paper         */
 /* ------------------------------------------------------------------ */
 
 function mountMeasured(root, ctx) {
@@ -473,26 +365,7 @@ function mountMeasured(root, ctx) {
     : null;
 
   /* Flattened preview */
-  const canvas = h('canvas', {
-    class: 'sm-result__canvas',
-    attrs: { role: 'img', 'aria-label': t('result.preview.alt', openingVars) },
-  });
-  const frame = h('div', { class: 'sm-result__frame' }, canvas);
-  const previewCard = addClass(
-    ui.card(
-      null,
-      h(
-        'figure',
-        { class: 'sm-result__figure' },
-        frame,
-        h('figcaption', {
-          class: 'sm-result__caption sm-small sm-muted',
-          text: t('result.preview.caption'),
-        }),
-      ),
-    ),
-    'sm-result__preview',
-  );
+  const preview = createPreview(ui, { caption: t('result.preview.caption') });
 
   /* Fix-it tools */
   const adjustTool = ui.button(t('result.adjustCorners'), {
@@ -616,187 +489,25 @@ function mountMeasured(root, ctx) {
   }
 
   renderSize();
-  root.append(...[header, hero, issuesCard, previewCard, tools, override, actions].filter(Boolean));
+  root.append(...[header, hero, issuesCard, preview.el, tools, override, actions].filter(Boolean));
 
-  /* Render the preview once the screen has painted, so the numbers never wait for the warp */
-  const doorW = Number(measure.widthMm);
-  const doorH = Number(measure.heightMm);
-  const canPreview =
-    Boolean(state.photo?.image) &&
-    Array.isArray(measure.planeToImage) &&
-    Number.isFinite(doorW) &&
-    Number.isFinite(doorH) &&
-    doorW > 0 &&
-    doorH > 0;
-  let frameA = 0;
-  let frameB = 0;
+  // Drawn once the screen has painted, so the numbers never wait for the warp; hidden when the
+  // photo or the measured door rectangle is missing.
+  preview.draw(state.photo?.image, measure, {
+    widthLabel: formatLength(opening.widthMm),
+    heightLabel: formatLength(opening.heightMm),
+    alt: t('result.preview.alt', openingVars),
+  });
 
-  if (canPreview) {
-    // Low-res placeholder with the final aspect ratio, so nothing jumps when the real
-    // pixels arrive.
-    canvas.width = Math.max(1, Math.round((doorW + 2 * PREVIEW_MARGIN_MM) / 10));
-    canvas.height = Math.max(1, Math.round((doorH + 2 * PREVIEW_MARGIN_MM) / 10));
-    frameA = requestAnimationFrame(() => {
-      frameB = requestAnimationFrame(() => {
-        try {
-          renderPreview(canvas, frame, state.photo.image, measure, {
-            widthLabel: formatLength(opening.widthMm),
-            heightLabel: formatLength(opening.heightMm),
-          });
-          canvas.classList.add('is-ready');
-        } catch (error) {
-          console.warn('[SecureMeasure] Could not draw the flattened preview.', error);
-          previewCard.hidden = true;
-        }
-      });
-    });
-  } else {
-    previewCard.hidden = true;
-  }
-
-  return () => {
-    cancelAnimationFrame(frameA);
-    cancelAnimationFrame(frameB);
-  };
+  return () => preview.destroy();
 }
 
 /* ------------------------------------------------------------------ */
-/* Flattened preview drawing                                           */
-/* ------------------------------------------------------------------ */
-
-/**
- * Warp the photo to a fronto-parallel view of the door (plus a margin) and annotate it.
- * Throws on any failure; the caller hides the preview.
- */
-function renderPreview(canvas, frame, photoImage, measure, labels) {
-  const cssWidth = frame.clientWidth || PREVIEW_FALLBACK_CSS_PX;
-  const dpr = globalThis.devicePixelRatio || 1;
-  const outWidth = Math.max(1, Math.min(PREVIEW_MAX_PX, Math.round(cssWidth * dpr)));
-
-  const image = warpToRect(photoImage, measure.planeToImage, {
-    widthMm: measure.widthMm,
-    heightMm: measure.heightMm,
-    marginMm: PREVIEW_MARGIN_MM,
-    outWidth,
-  });
-
-  canvas.width = image.width;
-  canvas.height = image.height;
-  const g = canvas.getContext('2d');
-  if (!g) throw new Error('no_canvas_context');
-  g.putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
-
-  drawDimensions(g, {
-    width: image.width,
-    height: image.height,
-    doorW: measure.widthMm,
-    doorH: measure.heightMm,
-    marginMm: PREVIEW_MARGIN_MM,
-    // Canvas pixels per CSS pixel, so strokes and text keep their on-screen size.
-    unit: Math.max(1, image.width / cssWidth),
-    fontFamily: typeof getComputedStyle === 'function' ? getComputedStyle(canvas).fontFamily : '',
-    ...labels,
-  });
-}
-
-/** Door outline plus width (top margin) and height (left margin) dimension lines. */
-function drawDimensions(g, { width, height, doorW, doorH, marginMm, unit, fontFamily, widthLabel, heightLabel }) {
-  const sx = width / (doorW + 2 * marginMm);
-  const sy = height / (doorH + 2 * marginMm);
-  const x0 = marginMm * sx;
-  const y0 = marginMm * sy;
-  const w = doorW * sx;
-  const hgt = doorH * sy;
-
-  g.save();
-
-  // Door opening outline: mitred so the corners stay crisp for checking against the photo.
-  g.lineJoin = 'miter';
-  g.lineCap = 'butt';
-  strokeTwoTone(g, unit, 1.5, () => g.rect(x0, y0, w, hgt));
-
-  // Dimension lines run down the middle of the margin strips, with a tick at each end.
-  g.lineCap = 'round';
-  const topY = y0 / 2;
-  const leftX = x0 / 2;
-  const tickX = Math.min(4 * unit, x0 * 0.4);
-  const tickY = Math.min(4 * unit, y0 * 0.4);
-  strokeTwoTone(g, unit, 1.25, () => {
-    g.moveTo(x0, topY);
-    g.lineTo(x0 + w, topY);
-    g.moveTo(x0, topY - tickY);
-    g.lineTo(x0, topY + tickY);
-    g.moveTo(x0 + w, topY - tickY);
-    g.lineTo(x0 + w, topY + tickY);
-  });
-  strokeTwoTone(g, unit, 1.25, () => {
-    g.moveTo(leftX, y0);
-    g.lineTo(leftX, y0 + hgt);
-    g.moveTo(leftX - tickX, y0);
-    g.lineTo(leftX + tickX, y0);
-    g.moveTo(leftX - tickX, y0 + hgt);
-    g.lineTo(leftX + tickX, y0 + hgt);
-  });
-
-  // Labels are slightly thicker than the margin strip on small previews, so keep them
-  // fully on the canvas and let them overlap the outline instead of being clipped.
-  const fontPx = Math.round(11 * unit);
-  const thickness = fontPx + 5 * unit;
-  const inset = thickness / 2 + unit;
-  g.font = `600 ${fontPx}px ${SAFE_FONT_STACK}`;
-  // An unparsable family is ignored by the canvas, leaving the safe stack in place.
-  if (fontFamily) g.font = `600 ${fontPx}px ${fontFamily}`;
-  g.textAlign = 'center';
-  g.textBaseline = 'middle';
-  drawLabel(g, widthLabel, x0 + w / 2, Math.max(topY, inset), 0, { unit, thickness });
-  drawLabel(g, heightLabel, Math.max(leftX, inset), y0 + hgt / 2, -Math.PI / 2, { unit, thickness });
-
-  g.restore();
-}
-
-/** Stroke one path twice: a dark halo, then a light core on top. */
-function strokeTwoTone(g, unit, coreWidth, buildPath) {
-  g.beginPath();
-  buildPath();
-  g.strokeStyle = INK;
-  g.lineWidth = (coreWidth + 2) * unit;
-  g.stroke();
-  g.strokeStyle = PAPER;
-  g.lineWidth = coreWidth * unit;
-  g.stroke();
-}
-
-/** Dark pill with light text, centred on (cx, cy) and rotated by `angle`. */
-function drawLabel(g, text, cx, cy, angle, { unit, thickness }) {
-  const w = g.measureText(text).width + 12 * unit;
-  const r = thickness / 2;
-  g.save();
-  g.translate(cx, cy);
-  g.rotate(angle);
-  // Hand-built rounded rectangle: CanvasRenderingContext2D.roundRect is missing on iOS 15.
-  g.beginPath();
-  g.moveTo(-w / 2 + r, -r);
-  g.arcTo(w / 2, -r, w / 2, r, r);
-  g.arcTo(w / 2, r, -w / 2, r, r);
-  g.arcTo(-w / 2, r, -w / 2, -r, r);
-  g.arcTo(-w / 2, -r, w / 2, -r, r);
-  g.closePath();
-  g.fillStyle = INK;
-  g.fill();
-  g.strokeStyle = PAPER;
-  g.lineWidth = unit;
-  g.stroke();
-  g.fillStyle = PAPER;
-  g.fillText(text, 0, 0.5 * unit);
-  g.restore();
-}
-
-/* ------------------------------------------------------------------ */
-/* Mode B: the customer types the size in                              */
+/* Manual entry: the customer types the size in                        */
 /* ------------------------------------------------------------------ */
 
 function mountManualEntry(root, ctx) {
-  const { ui, t, state } = ctx;
+  const { ui, t, state, config } = ctx;
   const { h } = ui;
 
   const header = ui.screenHeader({
@@ -835,14 +546,17 @@ function mountManualEntry(root, ctx) {
   });
   getPrice.disabled = !form.getValues();
 
-  const useCamera = ui.button(t('result.manual.useCamera'), {
-    variant: 'ghost',
-    icon: 'camera',
-    onClick: () => {
-      state.manualEntry = false;
-      ctx.go('prepare');
-    },
-  });
+  const alternative = manualAlternative(config);
+  const measureInstead = alternative
+    ? ui.button(t(alternative.label), {
+        variant: 'ghost',
+        icon: alternative.icon,
+        onClick: () => {
+          state.manualEntry = false;
+          ctx.go(alternative.target);
+        },
+      })
+    : null;
 
   function submit() {
     const values = form.submit();
@@ -856,7 +570,7 @@ function mountManualEntry(root, ctx) {
     header,
     howTo,
     addClass(ui.card(null, form.el), 'sm-result__entry'),
-    ui.actionBar(getPrice, useCamera),
+    ui.actionBar(getPrice, measureInstead),
   );
   return undefined;
 }

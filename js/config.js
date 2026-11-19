@@ -87,9 +87,48 @@ export default {
   },
 
   // ---------------------------------------------------------------------------
-  // MEASUREMENT: how the photo is turned into a door size.
+  // MEASUREMENT: the ways a customer can measure, and how each one turns into
+  // a door size.
   // ---------------------------------------------------------------------------
   measurement: {
+    // Which ways in the welcome screen offers. Turn any of them off with false.
+    //   ar      Android phones with AR: the customer taps the door's corners in
+    //           the live camera view and the phone measures the opening. Only
+    //           offered on phones that can do it (no iPhone browser can, yet).
+    //   camera  every phone: one photo of the door, matched to the closest of
+    //           your standardSizes below. No paper needed.
+    //   paper   the exact method: a sheet of paper taped to the door gives the
+    //           photo its scale (see references below).
+    // Sizes from ar and camera are estimates, and the customer is told so: a
+    // check measure confirms the exact size before their door is made.
+    methods: {
+      ar: true, //     Android phones with AR
+      camera: true, // every phone, no paper
+      paper: true, //  the exact method, with a sheet of paper
+    },
+
+    // The standard door (opening) sizes you sell, in mm. The no-paper photo is
+    // matched to the closest of these, and an AR measurement suggests the nearest
+    // one. List only the sizes you actually make, in any order:
+    //   { widthMm: 820, heightMm: 2040 } is a door 820 mm wide and 2040 mm high.
+    // These are common Australian sizes. Elsewhere, for example:
+    //   US: 762, 813 or 914 wide x 2032 high (and 813 or 914 x 2134 for 7 ft doors)
+    //   UK: 762 or 838 wide x 1981 high
+    // Keep 820 x 2040 in the list while you keep the demo photo below: that is the
+    // size of the demo door.
+    standardSizes: [
+      { widthMm: 720, heightMm: 2040 },
+      { widthMm: 770, heightMm: 2040 },
+      { widthMm: 820, heightMm: 2040 },
+      { widthMm: 870, heightMm: 2040 },
+      { widthMm: 920, heightMm: 2040 },
+      { widthMm: 820, heightMm: 2100 },
+      { widthMm: 870, heightMm: 2100 },
+      { widthMm: 920, heightMm: 2100 },
+      { widthMm: 820, heightMm: 2340 },
+      { widthMm: 920, heightMm: 2340 },
+    ],
+
     // The flat objects a customer may tape to the door to give the photo a scale.
     //   id           short unique code (lower-case letters, numbers, dashes)
     //   label        the name the customer sees
@@ -145,13 +184,17 @@ export default {
     // on the photo. false makes the photo the only way to get a size.
     allowManualOverride: true,
 
-    // The sample photo behind "try it with our example door", so people can see
-    // how it works before going to their own door. A path inside this folder
-    // (no slash at the start). Set to '' to remove the example.
-    // It is always measured with an A4 sheet, whatever sheet the customer has
-    // chosen. If someone sends an enquiry from it, the customer is told it is
-    // the demo door and the enquiry you receive is marked as a demo
-    // ("demo": true, and "[DEMO]" at the start of the email subject).
+    // The sample photo behind "Try it with a demo photo", so people can see how
+    // it works before going to their own door. A path inside this folder (no
+    // slash at the start). Set to '' to remove the example.
+    // The welcome screen uses it to show the no-paper photo method. "Get set up"
+    // offers it for the paper method too, and then it is always measured with
+    // the A4 sheet in the photo, whatever sheet the customer has chosen. If
+    // someone sends an enquiry from it, the customer is told it is the demo door
+    // and the enquiry you receive is marked as a demo ("demo": true, and
+    // "[DEMO]" at the start of the email subject).
+    // The app knows which lens took the bundled photo. To show a photo of your
+    // own, give it a new file name rather than saving over demo-door.png.
     demoPhotoUrl: 'assets/demo-door.png',
   },
 
@@ -319,10 +362,11 @@ export default {
     // How many days the quoted price is held for. Shown on the quote.
     quoteValidDays: 30,
 
-    // Small print under every price. Say plainly that the price depends on a
-    // check measure, because a photo measurement is an estimate.
+    // Small print under every price, however the customer got their size (a
+    // photo, AR or typing it in). Say plainly that the price depends on a check
+    // measure, because every one of those sizes is an estimate.
     disclaimer:
-      'This price is an estimate based on the measurements from your photo. We confirm the exact size and final price with a free check measure at your home before anything is made.',
+      'This price is an estimate based on the size you gave us. We confirm the exact size and final price with a free check measure at your home before anything is made.',
   },
 
   // ---------------------------------------------------------------------------

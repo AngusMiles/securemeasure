@@ -10,7 +10,8 @@
 export const COMMON = {
   'common.step': 'Step {n} of {total}',
   'common.steps.1': 'Photo',
-  'common.steps.2': 'Mark',
+  // Step 2 covers marking the corners (photo and paper), the AR session and the sheet of paper alike.
+  'common.steps.2': 'Measure',
   'common.steps.3': 'Size',
   'common.steps.4': 'Price',
   'common.loading': 'Loading…',
@@ -43,8 +44,8 @@ export const COMMON = {
   'common.crashTitle': 'Sorry, that screen didn’t load',
   'common.crashBody': 'Nothing has been sent. Start again and it should come good.',
   'common.bootFailed': 'Sorry, the measuring tool couldn’t load. Check your connection, then refresh this page.',
-  // Shown on "Get set up" after the phone closed the page while its camera was open. {choose} is the
-  // label of that screen's "Choose a photo" button.
+  // Shown on "Get set up" (or the camera screen) after the phone closed the page while its camera app
+  // was open. {choose} is the label of that screen's "Choose a photo" button.
   'common.photoInterrupted':
     'Your phone closed this page while the camera was open, so the photo was lost. Take the photo with your phone’s camera app first, then tap “{choose}” here.',
 };

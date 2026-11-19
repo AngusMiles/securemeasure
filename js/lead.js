@@ -62,6 +62,17 @@ export const LEAD_MAIL_STRINGS = Object.freeze({
   'lead.mail.measuredManual': 'Measured: entered by the customer (not from a photo)',
   'lead.mail.measuredPhoto': 'Measured: from a photo',
   'lead.mail.measuredDemo': "Measured: from the built-in demo photo, not the customer's own door",
+  'lead.mail.measuredEstimate':
+    'Measured: estimated from one photo, matched to the nearest standard size — needs a check measure',
+  // The no-paper estimate run on the bundled demo photo: the demo flag matters more than the method.
+  'lead.mail.measuredDemoEstimate':
+    "Measured: estimated from the built-in demo photo, not the customer's own door, matched to the nearest standard size",
+  'lead.mail.measuredAr': "Measured: with the phone's AR camera — needs a check measure",
+  'lead.mail.alternatives': 'Other standard sizes it could be: {sizes}',
+  'lead.mail.sizeShort': '{width} x {height} mm',
+  'lead.mail.arReading': 'AR reading of the opening: {size}',
+  'lead.mail.arStandard': 'the customer chose the nearest standard size',
+  'lead.mail.arWarnings': 'AR checks flagged: {warnings}',
   'lead.mail.confidence': 'confidence {quality}',
   'lead.mail.accuracy': 'about +/- {width} mm wide, +/- {height} mm high',
   'lead.mail.product': 'Product: {product}',
@@ -89,6 +100,21 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const TIMED_OUT = Symbol('timed out');
+
+/**
+ * Where a size can come from. 'photo' is the paper method (the name is older than the other ways in,
+ * and is kept because CRMs already filter on it), 'estimate' the no-paper photo matched to a standard
+ * size, 'ar' the phone's AR camera and 'manual' a size the customer typed in. Anything else is
+ * recorded as 'photo', the original source, rather than passed on unchecked.
+ */
+const MEASUREMENT_SOURCES = new Set(['photo', 'estimate', 'ar', 'manual']);
+
+/** The sources that read the size off a photo, so the only ones whose size can be the demo door's. */
+const PHOTO_SOURCES = new Set(['photo', 'estimate']);
+
+// Short, bounded lists: they are the company's catalogue and measureOpening's checks, never free text.
+const MAX_ALTERNATIVES = 3;
+const MAX_WARNINGS = 12;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -183,23 +209,61 @@ function makeReference(time, fields, customerValues) {
   return reference;
 }
 
+/** A { widthMm, heightMm } pair of finite numbers, rounded to whole mm, or null when either is unusable. */
+function cleanSize(size) {
+  const widthMm = finiteOrNull(size?.widthMm);
+  const heightMm = finiteOrNull(size?.heightMm);
+  if (widthMm === null || heightMm === null) return null;
+  return { widthMm: Math.round(widthMm), heightMm: Math.round(heightMm) };
+}
+
+/**
+ * The measurement block of the lead. Each source carries only what means something for it:
+ *
+ * - 'photo' (paper): the fit quality, its issue codes and the two sigmas, as before.
+ * - 'estimate': `alternatives`, the other standard sizes the photo could also be, and `aspectHW`,
+ *   the height-to-width ratio read from the photo. No quality or sigmas: the estimate has no
+ *   millimetre scale of its own, and the company must not be told a "plus or minus" nobody measured.
+ * - 'ar': `measured`, the AR reading of the opening before the company's rules, and `warnings`,
+ *   the AR self-check codes.
+ * - 'manual': the size alone.
+ *
+ * `standard` (true when the size is a standard size from the company's list that the customer
+ * accepted) is carried for any source that sets it.
+ */
 function cleanMeasurement(measurement) {
+  const source = MEASUREMENT_SOURCES.has(measurement?.source) ? measurement.source : 'photo';
   const out = {
     widthMm: finiteOrNull(measurement?.widthMm),
     heightMm: finiteOrNull(measurement?.heightMm),
-    source: measurement?.source === 'manual' ? 'manual' : 'photo',
+    source,
   };
-  // Callers may hand over either the level string or the whole MeasureResult.quality object.
-  const quality = measurement?.quality;
-  const level = typeof quality === 'string' ? quality : quality?.level;
-  if (typeof level === 'string' && level !== '') out.quality = level;
-  if (quality && typeof quality === 'object' && Array.isArray(quality.issues)) {
-    const issues = quality.issues.filter((issue) => typeof issue === 'string');
-    if (issues.length > 0) out.qualityIssues = issues;
-  }
-  for (const key of ['sigmaWidthMm', 'sigmaHeightMm']) {
-    const sigma = finiteOrNull(measurement?.[key]);
-    if (sigma !== null) out[key] = Math.round(sigma * 10) / 10;
+  if (typeof measurement?.standard === 'boolean') out.standard = measurement.standard;
+
+  if (source === 'photo') {
+    // Callers may hand over either the level string or the whole MeasureResult.quality object.
+    const quality = measurement?.quality;
+    const level = typeof quality === 'string' ? quality : quality?.level;
+    if (typeof level === 'string' && level !== '') out.quality = level;
+    if (quality && typeof quality === 'object' && Array.isArray(quality.issues)) {
+      const issues = quality.issues.filter((issue) => typeof issue === 'string');
+      if (issues.length > 0) out.qualityIssues = issues;
+    }
+    for (const key of ['sigmaWidthMm', 'sigmaHeightMm']) {
+      const sigma = finiteOrNull(measurement?.[key]);
+      if (sigma !== null) out[key] = Math.round(sigma * 10) / 10;
+    }
+  } else if (source === 'estimate') {
+    // Always present (possibly empty) for an estimate, so a CRM can map the field once.
+    const given = Array.isArray(measurement?.alternatives) ? measurement.alternatives : [];
+    out.alternatives = given.map(cleanSize).filter(Boolean).slice(0, MAX_ALTERNATIVES);
+    const aspect = finiteOrNull(measurement?.aspectHW);
+    if (aspect !== null && aspect > 0) out.aspectHW = Math.round(aspect * 10000) / 10000;
+  } else if (source === 'ar') {
+    const measured = cleanSize(measurement?.measured);
+    if (measured) out.measured = measured;
+    const given = Array.isArray(measurement?.warnings) ? measurement.warnings : [];
+    out.warnings = given.filter((code) => typeof code === 'string' && code !== '').slice(0, MAX_WARNINGS);
   }
   return out;
 }
@@ -310,13 +374,17 @@ export function validateCustomer(config, customer) {
  * @param {object} input
  * @param {object} input.config merged app config
  * @param {Record<string, unknown>} input.customer field values keyed by field id, plus consent
- * @param {{ widthMm: number, heightMm: number, source: 'photo' | 'manual', quality?: string | { level: string, issues?: string[] }, sigmaWidthMm?: number, sigmaHeightMm?: number }} input.measurement
+ * @param {object} input.measurement the size and how it was got:
+ *   `{ widthMm, heightMm, source, standard? }` plus, by source, 'photo' (paper):
+ *   `quality?` (a level string or the whole { level, issues } object), `sigmaWidthMm?`, `sigmaHeightMm?`;
+ *   'estimate': `alternatives?: { widthMm, heightMm }[]`, `aspectHW?`; 'ar': `measured?: { widthMm, heightMm }`,
+ *   `warnings?: string[]`; 'manual': nothing more. An unknown source is recorded as 'photo'.
  * @param {object | null} [input.quote] a calculateQuote result
  * @param {Record<string, string | boolean>} [input.selections] chosen options keyed by option id
  * @param {{ id: string, name: string } | null} [input.product] the chosen product from config.pricing.products
  * @param {boolean | null} [input.includeInstallation] the customer's installation choice; worked out from the quote / config default when omitted
  * @param {string | null} [input.photoDataUrl] attached as 'photo' only when config.lead.includePhoto is true
- * @param {boolean} [input.demo] true when the size was measured from the bundled demo photo rather than the customer's own door
+ * @param {boolean} [input.demo] true when the size was read off the bundled demo photo rather than the customer's own door; only kept for the photo sources ('photo', 'estimate')
  * @param {string | null} [input.reference] the reference of an earlier attempt at this same enquiry, kept so that a retry is not a second lead; a new one is made when omitted
  * @param {Date} [input.now] a retry passes the first attempt's time, so createdAt stays the same too
  * @returns {object} { reference, createdAt, brand, demo, customer, measurement, product, selections, includeInstallation, quote, photo? }
@@ -352,8 +420,9 @@ export function buildLeadPayload({
     reference: referenceOut,
     createdAt: when.toISOString(),
     brand: typeof config?.brand?.name === 'string' ? config.brand.name : '',
-    // Only a size taken from a photo can be the demo door's: one the customer typed in is their own.
-    demo: demo === true && measurementOut.source === 'photo',
+    // Only a size read off a photo (paper or estimate) can be the demo door's. One the customer typed
+    // in is their own, and so is an AR reading: AR measures the door in front of the phone, never a photo.
+    demo: demo === true && PHOTO_SOURCES.has(measurementOut.source),
     customer: customerOut,
     measurement: measurementOut,
     product:
@@ -452,7 +521,14 @@ function optionLines(config, selections) {
 
 function measuredLine(config, payload) {
   const measurement = payload?.measurement;
-  if (measurement?.source === 'manual') return mailText(config, 'lead.mail.measuredManual');
+  const source = measurement?.source;
+  if (source === 'manual') return mailText(config, 'lead.mail.measuredManual');
+  // Neither of these has a "plus or minus" the customer was shown, so none is given to the company:
+  // the wording itself says the size is an estimate that a check measure confirms.
+  if (source === 'estimate') {
+    return mailText(config, payload?.demo === true ? 'lead.mail.measuredDemoEstimate' : 'lead.mail.measuredEstimate');
+  }
+  if (source === 'ar') return mailText(config, 'lead.mail.measuredAr');
   let text = mailText(config, payload?.demo === true ? 'lead.mail.measuredDemo' : 'lead.mail.measuredPhoto');
   if (measurement?.quality) text += `, ${mailText(config, 'lead.mail.confidence', { quality: oneLine(measurement.quality) })}`;
   const { sigmaWidthMm, sigmaHeightMm } = measurement ?? {};
@@ -481,10 +557,34 @@ function totalLine(config, quote) {
   return mailText(config, 'lead.mail.total', { total });
 }
 
-function sizeText(config, measurement) {
+function sizeText(config, measurement, key = 'lead.mail.size') {
   const { widthMm, heightMm } = measurement ?? {};
   if (!Number.isFinite(widthMm) || !Number.isFinite(heightMm)) return '';
-  return mailText(config, 'lead.mail.size', { width: Math.round(widthMm), height: Math.round(heightMm) });
+  return mailText(config, key, { width: Math.round(widthMm), height: Math.round(heightMm) });
+}
+
+/**
+ * The lines under "Measured:" that only an estimate or an AR reading has: the other standard sizes
+ * an estimate could be, so whoever books the check measure knows what to expect; and the AR reading
+ * itself with any self-check it failed, so a priced standard size can be told from what was measured.
+ */
+function sourceDetailLines(config, measurement) {
+  const lines = [];
+  if (measurement?.source === 'estimate') {
+    const alternatives = Array.isArray(measurement.alternatives) ? measurement.alternatives : [];
+    const sizes = alternatives.map((size) => sizeText(config, size, 'lead.mail.sizeShort')).filter(Boolean);
+    if (sizes.length > 0) lines.push(mailText(config, 'lead.mail.alternatives', { sizes: sizes.join(', ') }));
+  } else if (measurement?.source === 'ar') {
+    const reading = sizeText(config, measurement.measured);
+    if (reading) {
+      let line = mailText(config, 'lead.mail.arReading', { size: reading });
+      if (measurement.standard === true) line += ` (${mailText(config, 'lead.mail.arStandard')})`;
+      lines.push(line);
+    }
+    const warnings = (Array.isArray(measurement.warnings) ? measurement.warnings : []).map(oneLine).filter(Boolean);
+    if (warnings.length > 0) lines.push(mailText(config, 'lead.mail.arWarnings', { warnings: warnings.join(', ') }));
+  }
+  return lines;
 }
 
 function mailSubject(config, payload) {
@@ -519,7 +619,7 @@ function mailBody(config, payload) {
 
   const size = sizeText(config, payload?.measurement) || mailText(config, 'lead.mail.notProvided');
   lines.push(mailText(config, 'lead.mail.doorSize', { size }));
-  lines.push(measuredLine(config, payload));
+  lines.push(measuredLine(config, payload), ...sourceDetailLines(config, payload?.measurement));
   const productName = oneLine(payload?.product?.name) || mailText(config, 'lead.mail.notSelected');
   lines.push(mailText(config, 'lead.mail.product', { product: productName }));
   const options = optionLines(config, payload?.selections);

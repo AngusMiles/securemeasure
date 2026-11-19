@@ -1,0 +1,483 @@
+/*
+ * AR screen: the pre-session card (scoped to .sm-screen--ar) and the DOM overlay shown over the
+ * camera during the AR session (global .sm-ar-* classes: the overlay root is a child of <body>, not
+ * of the screen, and takes the theme from the custom properties on <html>).
+ */
+
+/* ---- Pre-session card ---------------------------------------------------------------------- */
+
+.sm-screen--ar .sm-ar__heading {
+  margin: 0;
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+.sm-screen--ar .sm-ar__diagram {
+  display: block;
+  width: 100%;
+  max-width: 260px;
+  height: auto;
+  margin: 0 auto;
+}
+
+.sm-ar__dg-wall {
+  fill: var(--sm-bg);
+}
+
+.sm-ar__dg-floor {
+  fill: var(--sm-border);
+}
+
+.sm-ar__dg-frame {
+  fill: var(--sm-surface);
+  stroke: var(--sm-line-strong);
+  stroke-width: 2;
+}
+
+.sm-ar__dg-door {
+  fill: var(--sm-tint-primary);
+}
+
+.sm-ar__dg-handle {
+  fill: var(--sm-muted);
+}
+
+.sm-ar__dg-outline {
+  fill: none;
+  stroke: var(--sm-accent);
+  stroke-width: 2.5;
+  stroke-dasharray: 6 4;
+}
+
+.sm-ar__dg-ring {
+  fill: none;
+  stroke: var(--sm-ink-primary);
+  stroke-width: 2;
+}
+
+.sm-ar__dg-dot {
+  fill: var(--sm-accent);
+  stroke: var(--sm-surface);
+  stroke-width: 2;
+}
+
+.sm-screen--ar .sm-ar__steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-screen--ar .sm-ar__step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-3);
+}
+
+.sm-screen--ar .sm-ar__num {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--sm-primary);
+  color: var(--sm-primary-contrast);
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.sm-screen--ar .sm-ar__step-text {
+  min-width: 0;
+  padding-top: 3px;
+  font-size: var(--sm-text-md);
+  line-height: 1.4;
+  color: var(--sm-text);
+}
+
+.sm-screen--ar .sm-ar__note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-2);
+  margin: 0;
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+  color: var(--sm-muted);
+}
+
+.sm-screen--ar .sm-ar__note svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--sm-ink-primary);
+}
+
+/* ---- AR overlay ------------------------------------------------------------------------------ */
+
+/*
+ * During the session the browser styles the root itself (:xr-overlay: fixed, full screen, transparent).
+ * These rules give it the same box beforehand. It stays invisible until the session is running, so
+ * nothing shows over the page while Chrome asks for permission or installs its AR service.
+ */
+.sm-ar-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+  padding: max(var(--sm-space-3), env(safe-area-inset-top, 0px)) max(var(--sm-space-3), env(safe-area-inset-right, 0px))
+    max(var(--sm-space-3), env(safe-area-inset-bottom, 0px)) max(var(--sm-space-3), env(safe-area-inset-left, 0px));
+  overflow: hidden;
+  background: transparent;
+  color: var(--sm-text);
+  font-family: var(--sm-font);
+  font-size: var(--sm-text-md);
+  line-height: 1.4;
+  visibility: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+}
+
+.sm-ar-overlay.is-live {
+  visibility: visible;
+}
+
+/* The base sheet hides [hidden] with !important already; the overlay is outside any screen, so restate it. */
+.sm-ar-overlay [hidden] {
+  display: none !important;
+}
+
+/* Drawing and labels never take a tap: a tap there is an XR select, which places the point. */
+.sm-ar-canvas,
+.sm-ar-labels {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.sm-ar-labels {
+  overflow: hidden;
+}
+
+.sm-ar-top,
+.sm-ar-middle,
+.sm-ar-bottom {
+  position: relative;
+  z-index: 1;
+}
+
+.sm-ar-top {
+  flex: none;
+  display: flex;
+  justify-content: center;
+}
+
+.sm-ar-middle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  pointer-events: none;
+}
+
+.sm-ar-middle > * {
+  pointer-events: auto;
+}
+
+.sm-ar-bottom {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sm-space-3);
+}
+
+/* ---- Instruction pill ---- */
+
+.sm-ar-pill {
+  width: 100%;
+  max-width: 460px;
+  padding: var(--sm-space-3) var(--sm-space-4);
+  background: var(--sm-surface);
+  border-radius: var(--sm-radius-box);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+  color: var(--sm-text);
+}
+
+.sm-ar-pill:focus {
+  outline: none;
+}
+
+.sm-ar-pill:focus-visible {
+  outline: 3px solid var(--sm-focus);
+  outline-offset: 2px;
+}
+
+.sm-ar-pill__eyebrow {
+  margin: 0;
+  color: var(--sm-ink-primary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.sm-ar-pill__title {
+  margin: 2px 0 0;
+  font-size: var(--sm-text-lg);
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.sm-ar-pill__text {
+  margin: var(--sm-space-1) 0 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.4;
+}
+
+.sm-ar-pill__hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: var(--sm-space-2) 0 0;
+  padding: 6px 10px;
+  background: var(--sm-tint-warning);
+  border-radius: var(--sm-radius-sm);
+  color: var(--sm-ink-warning);
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.sm-ar-pill__hint .sm-icon {
+  margin-top: 1px;
+}
+
+/* ---- Retry panel ---- */
+
+.sm-ar-panel {
+  width: 100%;
+  max-width: 420px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.32);
+}
+
+.sm-ar-panel__title {
+  margin: 0;
+  font-size: var(--sm-text-lg);
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.sm-ar-panel__text {
+  margin: 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+}
+
+/* ---- Bottom controls ---- */
+
+.sm-ar-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sm-space-3);
+  width: 100%;
+  max-width: 460px;
+}
+
+.sm-ar-bar__undo {
+  justify-self: start;
+}
+
+.sm-ar-bar__cancel {
+  justify-self: end;
+}
+
+.sm-ar-bar .sm-btn,
+.sm-ar-skip {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+}
+
+/* Undo stays readable when disabled over a busy camera image. */
+.sm-ar-bar .sm-btn:disabled {
+  opacity: 0.7;
+  box-shadow: none;
+}
+
+.sm-ar-place {
+  display: grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  padding: 0;
+  border: 4px solid var(--sm-surface);
+  border-radius: 50%;
+  background: var(--sm-accent);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+  color: var(--sm-accent-contrast);
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  touch-action: manipulation;
+  transition: transform 0.1s, opacity 0.15s;
+}
+
+.sm-ar-place:active {
+  transform: scale(0.94);
+}
+
+.sm-ar-place:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.sm-ar-place:focus-visible {
+  outline: 3px solid var(--sm-surface);
+  outline-offset: 3px;
+}
+
+/* ---- Drawing ---- */
+
+.sm-ar-ring {
+  fill: rgba(255, 255, 255, 0.22);
+  stroke: #ffffff;
+  stroke-width: 3;
+  stroke-linejoin: round;
+}
+
+.sm-ar-line__halo {
+  stroke: rgba(0, 0, 0, 0.45);
+  stroke-width: 8;
+  stroke-linecap: round;
+}
+
+.sm-ar-line {
+  stroke: #ffffff;
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+
+/* The edge still following the crosshair: dashed, so it reads as "not placed yet" without colour. */
+.sm-ar-line.is-live {
+  stroke-dasharray: 10 8;
+}
+
+.sm-ar-line--sill {
+  stroke: var(--sm-accent);
+}
+
+.sm-ar-dot {
+  fill: var(--sm-accent);
+  stroke: #ffffff;
+  stroke-width: 3;
+}
+
+.sm-ar-cross__halo {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.45);
+  stroke-width: 7;
+}
+
+/* Not on anything usable: a dashed ring. On something usable: a solid ring with a filled centre. */
+.sm-ar-cross__ring {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 3;
+  stroke-dasharray: 7 6;
+}
+
+.sm-ar-cross__ticks {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.sm-ar-cross__dot {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.sm-ar-cross.is-ok .sm-ar-cross__ring {
+  stroke-dasharray: none;
+}
+
+.sm-ar-cross.is-ok .sm-ar-cross__dot {
+  fill: var(--sm-accent);
+  stroke: #ffffff;
+}
+
+/* Collecting the frames of a tap: the ring pulses (with reduced motion it thickens instead, below). */
+.sm-ar-cross.is-collecting .sm-ar-cross__ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sm-ar-pulse 0.5s ease-in-out infinite alternate;
+}
+
+.sm-ar-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 3px 9px;
+  background: var(--sm-text);
+  border-radius: 999px;
+  color: var(--sm-surface);
+  font-size: var(--sm-text-sm);
+  font-weight: 700;
+  line-height: 1.3;
+  white-space: nowrap;
+  will-change: transform;
+}
+
+@keyframes sm-ar-pulse {
+  to {
+    transform: scale(0.7);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-ar-cross.is-collecting .sm-ar-cross__ring {
+    animation: none;
+    stroke-width: 5;
+  }
+
+  .sm-ar-place,
+  .sm-ar-place:active {
+    transform: none;
+    transition: none;
+  }
+}
+
+/* A short landscape screen: tighter pill so the camera view keeps most of the height. */
+@media (max-height: 480px) {
+  .sm-ar-pill__text {
+    display: none;
+  }
+
+  .sm-ar-place {
+    width: 64px;
+    height: 64px;
+  }
+}

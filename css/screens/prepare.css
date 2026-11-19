@@ -136,6 +136,13 @@
   color: var(--sm-success);
 }
 
+/* ---- Action bar ---------------------------------------------------------------------------- */
+
+/* "Try the paper method with our demo photo" wraps at 320px: as two even lines, not a lone last word. */
+.sm-screen--prepare .sm-actionbar > .sm-btn {
+  text-wrap: balance;
+}
+
 /* color-mix() wrapped around var() cannot fall back by declaration order (it only fails at
    computed-value time), so the tint is opt-in for engines that support it. */
 @supports (color: color-mix(in srgb, red 50%, blue)) {

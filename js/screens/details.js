@@ -5,7 +5,7 @@
  */
 
 import { validateCustomer, buildLeadPayload, submitLead, leadMode } from '../lead.js';
-import { calculateQuote, formatMoney, formatLength } from '../quote.js';
+import { applyMeasurementRules, calculateQuote, formatMoney, formatLength } from '../quote.js';
 import { photoToJpegDataUrl } from '../photo.js';
 
 /** Screen id, used for routing and the `sm-screen--details` class. */
@@ -21,6 +21,9 @@ export const strings = {
   'details.summaryLabel': 'Your order summary',
   'details.summarySize': 'Size',
   'details.sizeValue': '{width} wide × {height} high',
+  // Under the size when it was not measured exactly, so the summary does not read as a made-to-measure size.
+  'details.sizeEstimate': 'Standard size estimate, confirmed at your check measure',
+  'details.sizeAr': 'AR estimate, confirmed at your check measure',
   'details.summaryProduct': 'Door',
   'details.summaryTotal': 'Estimated total',
   'details.summaryPrice': 'Price',
@@ -42,6 +45,16 @@ export const strings = {
 
 const FORM_ID = 'sm-details-form';
 const DEFAULT_INPUTMODE = { tel: 'tel', email: 'email' };
+
+/** The note under the summary's size, by state.size.source. Paper and typed sizes need none. */
+const SIZE_NOTES = { estimate: 'details.sizeEstimate', ar: 'details.sizeAr' };
+
+// The result screen's "Which is your door?" list (estimateChoices in js/screens/result-standard.js):
+// at most this many standard sizes, the most likely one always and each other one at least this
+// likely. The lead's `alternatives` are the ones of these the customer did not pick, so the company
+// hears about exactly the sizes the customer was offered.
+const OFFERED_SIZES = 3;
+const OFFERED_MIN_P = 0.05;
 
 // 'consent' belongs to the checkbox; the others must never be written as keys of state.customer.
 const RESERVED_FIELD_IDS = new Set(['', 'consent', '__proto__', 'constructor', 'prototype']);
@@ -194,11 +207,13 @@ export function mount(root, ctx) {
   }
 
   function buildSummary() {
-    const { widthMm, heightMm } = state.size;
+    const { widthMm, heightMm, source } = state.size;
     const quote = state.quote;
     const priced = Boolean(quote && quote.status === 'ok');
     const taxNote =
       priced && quote.taxLabel && quote.taxAmount > 0 ? t('details.taxNote', { tax: quote.taxLabel }) : null;
+    // hasOwnProperty rather than Object.hasOwn, which iOS 15.0 to 15.3 lack.
+    const sizeNote = Object.prototype.hasOwnProperty.call(SIZE_NOTES, source) ? t(SIZE_NOTES[source]) : null;
 
     return ui.card(
       { class: 'sm-details-summary' },
@@ -208,6 +223,7 @@ export function mount(root, ctx) {
         summaryRow(
           t('details.summarySize'),
           t('details.sizeValue', { width: noBreak(formatLength(widthMm)), height: noBreak(formatLength(heightMm)) }),
+          { note: sizeNote },
         ),
         product ? summaryRow(t('details.summaryProduct'), product.name) : null,
         priced
@@ -295,7 +311,7 @@ export function mount(root, ctx) {
       payload = buildLeadPayload({
         config,
         customer,
-        measurement: leadMeasurement(state),
+        measurement: leadMeasurement(state, config),
         quote: leadQuote(state.quote),
         selections: state.quoteInput.selections ?? {},
         includeInstallation: effectiveInstallation(config, state.quoteInput.includeInstallation),
@@ -334,26 +350,90 @@ export function mount(root, ctx) {
 }
 
 /**
- * True when the size being sent was measured from the bundled demo photo, so it is the demo
- * door's and not the customer's. A size the customer typed in afterwards is their own.
+ * True when the size being sent was read off the bundled demo photo, so it is the demo door's and
+ * not the customer's. Only the two photo sources count: a size the customer typed in afterwards is
+ * their own, and so is an AR reading, which measures the door in front of the phone even when the
+ * demo photo is still loaded from an earlier try.
+ *
+ * @param {object} state shared app state
+ * @returns {boolean}
  */
-function isDemoDoor(state) {
-  return state.size?.source !== 'manual' && state.photo?.isDemo === true;
+export function isDemoDoor(state) {
+  const source = state?.size?.source;
+  return (source === 'photo' || source === 'estimate') && state.photo?.isDemo === true;
 }
 
 /**
- * The measurement block of the lead. Fit quality and uncertainty only mean something
- * for a photo measurement, so they are left out when the customer typed the size in.
+ * The measurement block of the lead (buildLeadPayload's `measurement`), for each way the size can
+ * have been got. Each carries only what means something for it, and only when state.measure is the
+ * measurement the size came from (a stale one from an earlier try is never mixed in):
+ *
+ * - 'photo' (paper): the fit quality and the two sigmas.
+ * - 'estimate': `standard: true`, `alternatives` (the other standard sizes the customer was offered,
+ *   as listed in config.measurement.standardSizes) and `aspectHW`.
+ * - 'ar': `standard` (whether the customer took the nearest standard size), `measured` (the AR
+ *   reading of the opening, before the company's rules) and `warnings` (the AR self-check codes).
+ * - 'manual': the size alone.
+ *
+ * @param {object} state shared app state (state.size must be set)
+ * @param {object} [config] merged app config. Its measurement rules tell exactly which standard size
+ *   the customer chose; without it the nearest candidate is taken to be the chosen one.
+ * @returns {object}
  */
-function leadMeasurement(state) {
+export function leadMeasurement(state, config) {
   const { widthMm, heightMm, source } = state.size;
   const measurement = { widthMm, heightMm, source };
-  if (source !== 'manual' && state.measure) {
-    measurement.quality = state.measure.quality?.level;
-    measurement.sigmaWidthMm = state.measure.sigmaWidthMm;
-    measurement.sigmaHeightMm = state.measure.sigmaHeightMm;
+  const measure = state.measure;
+
+  if (source === 'estimate') {
+    // A size matched from the photo is always one of the company's standard sizes.
+    measurement.standard = true;
+    if (measure?.method === 'estimate') {
+      measurement.alternatives = offeredAlternatives(state.size, measure, config);
+      measurement.aspectHW = measure.aspectHW;
+    }
+  } else if (source === 'ar') {
+    measurement.standard = state.size.standard === true;
+    if (measure?.method === 'ar') {
+      measurement.measured = { widthMm: measure.widthMm, heightMm: measure.heightMm };
+      measurement.warnings = Array.isArray(measure.warnings) ? [...measure.warnings] : [];
+    }
+  } else if (source === 'photo' && measure && (measure.method == null || measure.method === 'paper')) {
+    // Fit quality and uncertainty only mean something for the paper method.
+    measurement.quality = measure.quality?.level;
+    measurement.sigmaWidthMm = measure.sigmaWidthMm;
+    measurement.sigmaHeightMm = measure.sigmaHeightMm;
   }
   return measurement;
+}
+
+/**
+ * The standard sizes the result screen offered besides the one the customer is going ahead with,
+ * best first, as listed in the company's catalogue (opening sizes, before its fitting allowance).
+ * state.size has the company's rules applied, so each candidate is put through the same rules to
+ * find the chosen one; failing that (no config), the candidate nearest the size is taken.
+ */
+function offeredAlternatives(size, measure, config) {
+  const usable = (c) => c && Number.isFinite(c.widthMm) && Number.isFinite(c.heightMm);
+  const candidates = (Array.isArray(measure.candidates) ? measure.candidates : []).filter(usable);
+  if (candidates.length === 0) return [];
+
+  const rules = config?.measurement;
+  let chosen = candidates.findIndex((c) => {
+    const ruled = applyMeasurementRules(rules, c);
+    return ruled.widthMm === size.widthMm && ruled.heightMm === size.heightMm;
+  });
+  if (chosen < 0) {
+    const gap = (c) => Math.abs(c.widthMm - size.widthMm) + Math.abs(c.heightMm - size.heightMm);
+    chosen = candidates.reduce((best, c, i) => (gap(c) < gap(candidates[best]) ? i : best), 0);
+  }
+
+  // As the result screen offers them: the most likely size whatever its chance (a long catalogue can
+  // leave even the best below OFFERED_MIN_P), the others only with a chance of at least OFFERED_MIN_P.
+  return candidates
+    .slice(0, OFFERED_SIZES)
+    .filter((c, i) => i !== chosen && (i === 0 || Number(c.p) >= OFFERED_MIN_P))
+    .map((c) => ({ widthMm: c.widthMm, heightMm: c.heightMm }));
 }
 
 /**

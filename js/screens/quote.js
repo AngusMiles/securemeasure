@@ -23,6 +23,8 @@ export const strings = {
   'quote.size.edit': 'Edit',
   'quote.size.editAria': 'Edit door size',
   'quote.size.manual': 'Entered by you',
+  'quote.size.estimate': 'Standard size estimate',
+  'quote.size.ar': 'AR estimate',
   'quote.products.title': 'Choose your door',
   'quote.product.from': 'from {price}',
   'quote.options.title': 'Options',
@@ -36,7 +38,7 @@ export const strings = {
   'quote.tax.added': '{taxLabel}',
   'quote.tax.included': 'Includes {taxLabel} of {amount}',
   'quote.total.label': 'Estimated total',
-  'quote.oversize': 'Your door is bigger than a standard size, so a custom-size surcharge applies.',
+  'quote.oversize': 'Your door is bigger than the size our base price covers, so an oversize surcharge applies.',
   'quote.valid': 'Price valid for {days} days',
   'quote.valid.one': 'Price valid for 1 day',
   'quote.custom.title': 'This size needs a custom quote',
@@ -58,6 +60,13 @@ export function canEnter(state) {
 }
 
 const NBSP = ' ';
+
+/**
+ * The chip beside the size, by state.size.source. A paper measurement needs none; every other size
+ * says plainly what it is, so a price for a matched standard size or an AR reading is never mistaken
+ * for one made from an exact measurement (the check measure settles it either way).
+ */
+const SIZE_CHIPS = { manual: 'quote.size.manual', estimate: 'quote.size.estimate', ar: 'quote.size.ar' };
 
 /** @returns {any[]} the value when it is an array, otherwise an empty array */
 function asArray(value) {
@@ -216,8 +225,8 @@ export function mount(root, ctx) {
       { class: 'sm-quote-size-text' },
       h('span', { class: 'sm-quote-size-label sm-small sm-muted', text: t('quote.size.label') }),
       h('span', { class: 'sm-quote-size-value sm-num', text: sizeText }),
-      size.source === 'manual'
-        ? h('span', { class: 'sm-quote-size-chip' }, ui.chip(t('quote.size.manual'), { tone: 'neutral' }))
+      Object.prototype.hasOwnProperty.call(SIZE_CHIPS, size.source)
+        ? h('span', { class: 'sm-quote-size-chip' }, ui.chip(t(SIZE_CHIPS[size.source]), { tone: 'neutral' }))
         : null,
     ),
     editButton,

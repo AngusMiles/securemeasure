@@ -133,9 +133,9 @@
   color: var(--sm-text);
 }
 
-/* ---- Privacy line -------------------------------------------------------------------------- */
+/* ---- Standard-size and privacy lines -------------------------------------------------------- */
 
-.sm-screen--welcome .sm-welcome__privacy {
+.sm-screen--welcome .sm-welcome__note {
   display: flex;
   align-items: flex-start;
   gap: var(--sm-space-2);
@@ -145,10 +145,101 @@
   color: var(--sm-muted);
 }
 
-.sm-screen--welcome .sm-welcome__privacy svg {
+/* The two lines belong together: half the usual gap between them. */
+.sm-screen--welcome .sm-welcome__note + .sm-welcome__note {
+  margin-top: calc(var(--sm-space-2) * -1);
+}
+
+.sm-screen--welcome .sm-welcome__note svg {
   flex: none;
   margin-top: 1px;
+}
+
+/* What the customer will get (a standard size, then a check measure) is part of the offer: body text. */
+.sm-screen--welcome .sm-welcome__note--standard {
+  color: var(--sm-text);
+}
+
+.sm-screen--welcome .sm-welcome__note--standard svg {
+  color: var(--sm-ink-primary);
+}
+
+.sm-screen--welcome .sm-welcome__note--privacy svg {
   color: var(--sm-success);
+}
+
+/* ---- The ways in --------------------------------------------------------------------------- */
+
+/*
+ * Up to five buttons, best first: AR (added once the phone says it can), the camera, the demo, then
+ * the two quiet alternatives (paper, a size they know). Long labels wrap inside their button rather
+ * than push the bar wider at 320px; balanced, a wrapped label reads as two even lines.
+ */
+.sm-screen--welcome .sm-welcome__actions > .sm-btn {
+  text-wrap: balance;
+}
+
+/* The quiet alternatives read as one short list of links: no gap between them, 44px tap height each. */
+.sm-screen--welcome .sm-welcome__actions > .sm-btn--ghost + .sm-btn--ghost {
+  margin-top: calc(var(--sm-space-2) * -1);
+}
+
+/* The AR button arrives a moment after the screen; let it fade in rather than pop. */
+.sm-screen--welcome .sm-welcome__ar {
+  animation: sm-fade-in 0.24s var(--sm-ease);
+}
+
+/* 320px phones: a little less padding gives "Measure with my camera" room for one line. */
+@media (max-width: 359px) {
+  .sm-screen--welcome .sm-welcome__actions > .sm-btn--lg {
+    padding-right: var(--sm-space-4);
+    padding-left: var(--sm-space-4);
+  }
+
+  .sm-screen--welcome .sm-welcome__actions > .sm-btn--ghost {
+    padding-right: var(--sm-space-2);
+    padding-left: var(--sm-space-2);
+  }
+}
+
+/* Short screens: five buttons would cover half of it, so each is trimmed (never below the 44px tap size). */
+@media (max-height: 640px) {
+  .sm-screen--welcome .sm-welcome__actions {
+    gap: 6px;
+    padding-top: var(--sm-space-2);
+  }
+
+  .sm-screen--welcome .sm-welcome__actions > .sm-btn--ghost + .sm-btn--ghost {
+    margin-top: -6px;
+  }
+
+  .sm-screen--welcome .sm-welcome__actions > .sm-btn--lg {
+    min-height: 50px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .sm-screen--welcome .sm-welcome__actions > .sm-btn--md {
+    min-height: var(--sm-tap);
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+}
+
+/*
+ * A phone on its side (or a short embed): even trimmed, the five buttons are about 264px tall, as tall as
+ * the whole scroller, so a sticky bar would hide the title, "What you'll need" and the check-measure note
+ * at every scroll position. The bar then scrolls with the page, after the content, and covers nothing,
+ * so the scroller keeps no strip clear for it (scroll-padding-bottom in css/base.css).
+ */
+@media (max-height: 480px) {
+  .sm-screen--welcome .sm-welcome__actions {
+    position: static;
+  }
+
+  .sm-main:has(> .sm-screen--welcome) {
+    scroll-padding-bottom: 0;
+  }
 }
 
 /* color-mix() wrapped around var() cannot fall back by declaration order (it only fails at

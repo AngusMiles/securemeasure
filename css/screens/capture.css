@@ -1,0 +1,329 @@
+/*
+ * Capture screen: a full-height live viewfinder (dark stage) with a door-shaped guide, a message card
+ * over it until the camera is live, and a light action bar with the shutter and the photo fallbacks.
+ *
+ * Everything is scoped under .sm-capture (js/screens/capture.js adds it with .sm-screen--flush).
+ */
+
+.sm-capture {
+  --sm-capture-shutter: 72px;
+
+  /* Plain-token values first: browsers without color-mix() keep these. */
+  --sm-capture-stage-bg: var(--sm-text);
+  --sm-capture-pill-bg: var(--sm-text);
+  --sm-capture-pill-fg: var(--sm-surface);
+  --sm-capture-guide: var(--sm-surface);
+  --sm-capture-guide-edge: rgba(0, 0, 0, 0.45);
+  --sm-capture-veil: rgba(0, 0, 0, 0.36);
+}
+
+/* A var() inside color-mix() cannot fall back per declaration, hence @supports. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .sm-capture {
+    --sm-capture-stage-bg: color-mix(in srgb, var(--sm-text) 30%, black);
+    --sm-capture-pill-bg: color-mix(in srgb, var(--sm-text) 84%, transparent);
+    --sm-capture-guide-edge: color-mix(in srgb, black 45%, transparent);
+    --sm-capture-veil: color-mix(in srgb, black 36%, transparent);
+  }
+}
+
+/* Several pieces are shown and hidden with the hidden attribute while having an explicit display below. */
+.sm-capture [hidden] {
+  display: none !important;
+}
+
+/* ---------- Stage: the live picture and everything over it ---------- */
+
+.sm-capture .sm-capture__stage {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--sm-capture-stage-bg);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Fills the stage; object-fit: cover is what js/camera.js coverMapping() undoes for the guide prior. */
+.sm-capture .sm-capture__video {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: transparent;
+  pointer-events: none;
+}
+
+/* The door-shaped guide: dashed in the surface colour, with a dark hairline either side so it still
+   shows on a white door, and the picture outside it dimmed. js/screens/capture.js positions it. */
+.sm-capture .sm-capture__guide {
+  position: absolute;
+  z-index: 1;
+  box-sizing: border-box;
+  border: 3px dashed var(--sm-capture-guide);
+  border-radius: 3px;
+  outline: 1px solid var(--sm-capture-guide-edge);
+  box-shadow: 0 0 0 100vmax var(--sm-capture-veil), inset 0 0 0 1px var(--sm-capture-guide-edge);
+  pointer-events: none;
+}
+
+/* The door handle, so the frame reads as a door rather than just a box. */
+.sm-capture .sm-capture__guide::after {
+  position: absolute;
+  top: 50%;
+  right: 12%;
+  width: 4px;
+  height: 7%;
+  min-height: 12px;
+  border-radius: 2px;
+  background: var(--sm-capture-guide);
+  box-shadow: 0 0 0 1px var(--sm-capture-guide-edge);
+  opacity: 0.85;
+  content: "";
+}
+
+/* The instruction over the top of the picture. js/camera.js guideRect() keeps the guide below it. */
+.sm-capture .sm-capture__hint {
+  position: absolute;
+  top: var(--sm-space-3);
+  left: 50%;
+  z-index: 2;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: calc(100% - 2 * max(var(--sm-space-3), env(safe-area-inset-left, 0px)));
+  margin: 0;
+  padding: var(--sm-space-2) 14px;
+  border-radius: var(--sm-radius-box);
+  background: var(--sm-capture-pill-bg);
+  color: var(--sm-capture-pill-fg);
+  box-shadow: var(--sm-shadow);
+  font-size: var(--sm-text-sm);
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: center;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+/* ---------- Message card (until the camera is live, or when it cannot be) ---------- */
+
+/* A scrolling column, with the card centred by auto margins: unlike align-items: center that never
+   pushes the top of a tall card out of reach on a short screen. */
+.sm-capture .sm-capture__panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sm-space-4) max(var(--sm-space-4), env(safe-area-inset-right, 0px)) var(--sm-space-4)
+    max(var(--sm-space-4), env(safe-area-inset-left, 0px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.sm-capture .sm-capture__card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sm-space-3);
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 26rem;
+  margin: auto;
+  padding: var(--sm-space-5) var(--sm-space-4);
+  border-radius: var(--sm-radius-box);
+  background: var(--sm-surface);
+  color: var(--sm-text);
+  box-shadow: var(--sm-shadow);
+  text-align: center;
+}
+
+.sm-capture .sm-capture__panel-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--sm-tint-primary);
+  color: var(--sm-ink-primary);
+}
+
+.sm-capture .sm-capture__panel-icon--alert {
+  background: var(--sm-tint-warning);
+  color: var(--sm-ink-warning);
+}
+
+.sm-capture .sm-capture__message {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+}
+
+.sm-capture .sm-capture__panel-title {
+  margin: 0;
+  font-size: var(--sm-text-lg);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.sm-capture .sm-capture__panel-text {
+  margin: 0;
+  font-size: var(--sm-text-md);
+  line-height: 1.45;
+}
+
+.sm-capture .sm-capture__panel-help {
+  margin: 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.45;
+}
+
+/* ---------- Action bar: tips, shutter, fallbacks ---------- */
+
+.sm-capture .sm-capture__bar {
+  gap: var(--sm-space-2);
+}
+
+.sm-capture .sm-capture__tips {
+  margin: 0;
+  color: var(--sm-muted);
+  font-size: var(--sm-text-sm);
+  line-height: 1.35;
+  text-align: center;
+}
+
+.sm-capture .sm-capture__shutter-row {
+  display: flex;
+  justify-content: center;
+}
+
+/* Always round, whatever the skin's corner radius: it is a camera shutter. */
+.sm-capture .sm-capture__shutter {
+  display: grid;
+  flex: none;
+  place-items: center;
+  box-sizing: border-box;
+  width: var(--sm-capture-shutter);
+  height: var(--sm-capture-shutter);
+  margin: 0;
+  padding: 5px;
+  border: 3px solid var(--sm-accent);
+  border-radius: 50%;
+  background: var(--sm-surface);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-appearance: none;
+  appearance: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sm-capture .sm-capture__shutter-face {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--sm-accent);
+  color: var(--sm-accent-contrast);
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.sm-capture .sm-capture__shutter-face svg {
+  display: block;
+}
+
+.sm-capture .sm-capture__shutter:active .sm-capture__shutter-face {
+  transform: scale(0.9);
+}
+
+.sm-capture .sm-capture__shutter:focus-visible {
+  outline: 3px solid var(--sm-focus);
+  outline-offset: 3px;
+}
+
+/* Waiting for the camera: greyed out, and not by colour alone (the ring goes dashed too). */
+.sm-capture .sm-capture__shutter:disabled {
+  border-color: var(--sm-line-strong);
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.sm-capture .sm-capture__shutter:disabled .sm-capture__shutter-face {
+  background: var(--sm-border);
+  color: var(--sm-muted);
+  transform: none;
+}
+
+/* Taking the photo: a spinner in place of the camera icon. */
+.sm-capture .sm-capture__shutter[aria-busy="true"] {
+  border-style: solid;
+}
+
+.sm-capture .sm-capture__shutter[aria-busy="true"] .sm-capture__shutter-face svg {
+  display: none;
+}
+
+.sm-capture .sm-capture__shutter[aria-busy="true"] .sm-capture__shutter-face::after {
+  width: 24px;
+  height: 24px;
+  border: 3px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: sm-spin 0.7s linear infinite;
+  content: "";
+}
+
+/* Two small buttons side by side under the shutter while the live camera works; they stack and grow
+   into the main buttons when it does not (js/screens/capture.js swaps their kit classes). */
+.sm-capture .sm-capture__fallbacks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sm-space-2);
+}
+
+.sm-capture .sm-capture__fallbacks > .sm-btn {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+.sm-capture .sm-capture__fallbacks--main {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+
+.sm-capture .sm-capture__fallbacks--main > .sm-btn {
+  flex: none;
+}
+
+/* Short screens (older small phones, or a phone on its side): a smaller shutter leaves more picture. */
+@media (max-height: 640px) {
+  .sm-capture {
+    --sm-capture-shutter: 60px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-capture .sm-capture__shutter-face {
+    transition: none;
+  }
+
+  .sm-capture .sm-capture__shutter:active .sm-capture__shutter-face {
+    transform: none;
+  }
+
+  /* A frozen spinner reads as a hang, so it keeps turning, slowly (as in base.css). */
+  .sm-capture .sm-capture__shutter[aria-busy="true"] .sm-capture__shutter-face::after {
+    animation-duration: 1.6s !important;
+    animation-iteration-count: infinite !important;
+  }
+}

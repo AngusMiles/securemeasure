@@ -1,12 +1,14 @@
 /**
  * Config loading and theming.
  *
- * Merges an optional skin over js/config.js and pushes the brand settings into
- * CSS custom properties. Nothing here touches the DOM at import time, so the
- * module also runs under Node for tests.
+ * Merges an optional skin over js/config.js, settles the measuring settings
+ * every screen relies on (which ways in are offered, the standard door sizes),
+ * and pushes the brand settings into CSS custom properties. Nothing here
+ * touches the DOM at import time, so the module also runs under Node for tests.
  */
 
 import baseConfig from './config.js';
+import { DEFAULT_STANDARD_SIZES } from './estimate.js';
 
 /** Keys that could reach Object.prototype if copied from untrusted data. */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -40,6 +42,15 @@ const BARE_NUMBER_PATTERN = /^\d*\.?\d+$/;
 const LANGUAGE_TAG_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{1,8})*$/i;
 
 const LOG_PREFIX = '[SecureMeasure]';
+
+/** The ways in config.measurement.methods can switch on and off. Each one is on unless set to false. */
+const METHOD_KEYS = ['ar', 'camera', 'paper'];
+
+/**
+ * Longest side, in mm, accepted for a standard door size. Far beyond any door: it only catches a size
+ * typed in the wrong unit (2040 cm) or with a slipped digit.
+ */
+const MAX_STANDARD_SIDE_MM = 10000;
 
 /** Lowest WCAG contrast ratio at which the primary colour is still used as a text colour. */
 const MIN_TEXT_CONTRAST = 4.5;
@@ -100,7 +111,8 @@ function clone(value) {
  *
  * Plain objects are merged key by key. Arrays, primitives and null in
  * `override` replace the base value outright (an array is never merged item by
- * item). An `undefined` override, at the top level or for a single key, means
+ * item: a skin's two-entry `standardSizes` list is the whole list, not the first
+ * two of the base list with the rest kept). An `undefined` override, at the top level or for a single key, means
  * "not specified" and keeps the base value. Neither input is mutated and the
  * result shares no objects or arrays with them. The keys `__proto__`,
  * `constructor` and `prototype` are dropped wherever they appear.
@@ -127,6 +139,117 @@ export function deepMerge(base, override) {
   return /** @type {T} */ (out);
 }
 
+/** @param {string} message */
+function warn(message) {
+  console.warn(`${LOG_PREFIX} ${message}`);
+}
+
+/**
+ * Which ways in the welcome screen may offer, read from `config.measurement.methods`.
+ *
+ * Each of ar, camera and paper is on unless it is set to false. Anything other than true or false (a
+ * typo such as 'no', a missing key, a missing methods group) reads as the default: on. AR only works on
+ * some Android phones, so a config that leaves neither camera nor paper on, and has manual sizes turned
+ * off as well, would leave most customers no way to a size at all; paper then stays on, because a
+ * screen with no way forward is never what a company meant.
+ *
+ * @param {object} config the merged config
+ * @returns {{ ar: boolean, camera: boolean, paper: boolean }}
+ */
+export function measurementMethods(config) {
+  const measurement = isPlainObject(config?.measurement) ? config.measurement : {};
+  const raw = isPlainObject(measurement.methods) ? measurement.methods : {};
+  const methods = {};
+  for (const key of METHOD_KEYS) methods[key] = typeof raw[key] === 'boolean' ? raw[key] : true;
+  if (!methods.camera && !methods.paper && measurement.allowManualOverride === false) methods.paper = true;
+  return methods;
+}
+
+/**
+ * @param {unknown} size
+ * @returns {boolean} true for { widthMm, heightMm } with both sides a positive number of mm
+ */
+function isStandardSize(size) {
+  if (!isPlainObject(size)) return false;
+  return [size.widthMm, size.heightMm].every(
+    (mm) => typeof mm === 'number' && Number.isFinite(mm) && mm > 0 && mm <= MAX_STANDARD_SIDE_MM,
+  );
+}
+
+/**
+ * `measurement.standardSizes` with the unusable and repeated entries left out, or a fresh copy of the
+ * built-in Australian sizes when the setting is missing, not a list, or holds no usable size at all.
+ * (A size listed twice would count double when the photo estimate weighs up which size a door is.)
+ *
+ * @param {unknown} value
+ * @returns {Array<{ widthMm: number, heightMm: number }>}
+ */
+function usableStandardSizes(value) {
+  const builtIn = () => DEFAULT_STANDARD_SIZES.map(({ widthMm, heightMm }) => ({ widthMm, heightMm }));
+  // A config written before this setting existed: nothing to warn about.
+  if (value === undefined) return builtIn();
+  if (!Array.isArray(value)) {
+    warn('measurement.standardSizes should be a list such as [{ widthMm: 820, heightMm: 2040 }]; using the built-in sizes.');
+    return builtIn();
+  }
+  const seen = new Set();
+  const usable = value.filter((size, index) => {
+    if (!isStandardSize(size)) {
+      warn(`measurement.standardSizes[${index}] is not a size such as { widthMm: 820, heightMm: 2040 }; leaving it out.`);
+      return false;
+    }
+    const key = `${size.widthMm}x${size.heightMm}`;
+    if (seen.has(key)) {
+      warn(`measurement.standardSizes lists ${size.widthMm} x ${size.heightMm} more than once; keeping the first.`);
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+  if (usable.length > 0) return usable;
+  warn('measurement.standardSizes has no usable sizes; using the built-in sizes.');
+  return builtIn();
+}
+
+/**
+ * Makes the measuring settings safe for every screen to read, so that a typo in js/config.js or a skin
+ * cannot leave the welcome screen without buttons or the photo estimate without sizes to choose from:
+ *   - `measurement.methods` becomes exactly `{ ar, camera, paper }`, as measurementMethods() reads it;
+ *   - `measurement.standardSizes` keeps only usable sizes, and falls back to the built-in Australian list
+ *     when none is left.
+ * A setting that had to be changed is reported with a console warning; a missing one (a config written
+ * before these settings existed) is filled in quietly. Nothing else in the config is touched.
+ *
+ * Changes `config` in place (loadConfig hands it a fresh copy) and returns it.
+ *
+ * @param {object} config the merged config
+ * @returns {object} the same config
+ */
+export function normaliseConfig(config) {
+  if (!isPlainObject(config) || !isPlainObject(config.measurement)) return config;
+  const measurement = config.measurement;
+
+  const raw = measurement.methods;
+  if (raw !== undefined && !isPlainObject(raw)) {
+    warn('measurement.methods should be a group such as { ar: true, camera: true, paper: true }; offering every way in.');
+  } else if (raw !== undefined) {
+    for (const [key, value] of Object.entries(raw)) {
+      if (!METHOD_KEYS.includes(key)) warn(`measurement.methods.${key} is not a setting (use ar, camera or paper); ignoring it.`);
+      else if (typeof value !== 'boolean') warn(`measurement.methods.${key} should be true or false; leaving it on.`);
+    }
+  }
+  const methods = measurementMethods(config);
+  if (isPlainObject(raw) && raw.paper === false && methods.paper) {
+    warn(
+      'measurement.methods leaves neither camera nor paper on and measurement.allowManualOverride is false, so most customers would have no way to a size (AR works on some Android phones only); keeping paper on.',
+    );
+  }
+  measurement.methods = methods;
+
+  measurement.standardSizes = usableStandardSizes(measurement.standardSizes);
+  return config;
+}
+
 /**
  * Reads the requested skin name from a query string.
  * @param {unknown} search e.g. '?skin=acme' (a URLSearchParams is accepted too)
@@ -147,16 +270,22 @@ function requestedSkin(search) {
  *
  * The name must match /^[a-z0-9-]{1,40}$/. An invalid name, a missing skin file
  * or a skin that fails to load logs a console warning and yields the base
- * config, so the app always starts. Every call returns a fresh copy that is
- * safe to mutate.
+ * config, so the app always starts. Either way the result goes through
+ * normaliseConfig. Every call returns a fresh copy that is safe to mutate.
  *
  * @param {string} [search] query string to read; defaults to the page's own
  * @returns {Promise<object>} the merged config
  */
 export async function loadConfig(search = globalThis.location?.search ?? '') {
-  const base = deepMerge(baseConfig, undefined);
+  return normaliseConfig(await mergeSkin(deepMerge(baseConfig, undefined), requestedSkin(search)));
+}
 
-  const name = requestedSkin(search);
+/**
+ * @param {object} base a fresh copy of js/config.js
+ * @param {string | null} name the requested skin, unvalidated
+ * @returns {Promise<object>} the skin merged over `base`, or `base` itself when there is no usable skin
+ */
+async function mergeSkin(base, name) {
   if (name === null) return base;
 
   if (!SKIN_NAME_PATTERN.test(name)) {

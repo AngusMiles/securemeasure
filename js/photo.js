@@ -14,8 +14,18 @@ import { toLuma } from './vision.js';
  * @property {number} width              working width in px
  * @property {number} height             working height in px
  * @property {boolean} isDemo            true for the bundled demo photo
+ * @property {number|null} focal35mm     EXIF FocalLengthIn35mmFilm of a JPEG, else null (PNG, no EXIF, URL
+ *                                       sources, live video frames; iOS `<input capture>` strips EXIF; EXIF
+ *                                       whose recorded pixel size has another shape, i.e. a cropped copy).
+ *                                       Use it through photoFocal (js/estimate.js), which also checks the
+ *                                       photo still has a whole camera frame's shape.
+ * @property {'live'|'frame'|'file'|'demo'} capture  how the photo was taken: ImageCapture.takePhoto() ('live'),
+ *                                       a grabbed video frame ('frame'), a picked or camera-app file ('file'),
+ *                                       or the bundled demo photo ('demo')
  * @property {object|null} _luma         lazily cached greyscale copy (see getLuma)
  */
+
+const CAPTURE_KINDS = new Set(['live', 'frame', 'file', 'demo']);
 
 const DEFAULT_MAX_SIDE = 2560;
 
@@ -36,17 +46,29 @@ const FALLBACK_SHEET_MM = { w: 210, h: 297 };
  *
  * @param {File|Blob|string} source  a picked/captured file, or a URL (relative URLs resolve against the page)
  * @param {object} config            merged app config (uses measurement.maxWorkingSizePx)
- * @param {{ isDemo?: boolean }} [options]
+ * @param {{ isDemo?: boolean, capture?: 'live'|'frame'|'file'|'demo' }} [options]
+ *   capture: how the source was taken (see Photo.capture); unknown values count as 'file'. isDemo implies 'demo'.
  * @returns {Promise<Photo>}
  * @throws {Error} Error('decode_failed') when the source cannot be decoded
  */
-export async function loadPhoto(source, config, { isDemo = false } = {}) {
+export async function loadPhoto(source, config, { isDemo = false, capture = 'file' } = {}) {
   let decoded = null;
   try {
     decoded = typeof source === 'string' ? await decodeUrl(source) : await decodeBlob(source);
     if (!(decoded.width > 0 && decoded.height > 0)) throw new Error('empty image');
     const working = drawWorkingCanvas(decoded.drawable, decoded.width, decoded.height, workingMaxSide(config));
-    return { ...working, isDemo: Boolean(isDemo), _luma: null };
+    return {
+      ...working,
+      isDemo: Boolean(isDemo),
+      // The working canvas is the decoded image scaled down (never cropped by us), so the 35 mm equivalent
+      // holds for it exactly when it held for the decoded image. That is only certain for our own captures:
+      // a picked file may have been cropped in a gallery app that kept the camera's EXIF. readJpegInfo drops
+      // the focal when EXIF's own pixel size has another shape, and photoFocal (js/estimate.js) uses it only
+      // for a whole-frame shape (4:3 or 3:2), so a crop falls back to the phone prior and its wider sigma.
+      focal35mm: decoded.focal35mm,
+      capture: isDemo ? 'demo' : CAPTURE_KINDS.has(capture) ? capture : 'file',
+      _luma: null,
+    };
   } catch (cause) {
     throw new Error('decode_failed', { cause });
   } finally {
@@ -120,7 +142,8 @@ export function photoToJpegDataUrl(photo, maxSide = 1024, quality = 0.7) {
 
 /**
  * Put a freshly loaded photo into the shared state and clear everything that was derived from
- * the previous one (sheet, door, measurement, size), as the state contract requires.
+ * the previous one (sheet, door corners and door detection, measurement, size), as the state contract
+ * requires. `state.method` is left alone: the caller sets it straight after, for the way in it serves.
  * The working canvas of the photo being replaced is released; nothing may draw from it afterwards.
  *
  * @param {object} state  the shared app state (mutated)
@@ -132,22 +155,27 @@ export function setPhoto(state, photo) {
   if (previous && previous !== photo && previous.canvas) releaseCanvas(previous.canvas);
   state.photo = photo;
   state.sheet = { points: null, refined: false, detected: false };
-  state.door = { points: null };
+  state.door = { points: null, detection: null };
   state.measure = null;
   state.size = null;
   state.manualEntry = false;
 }
 
 /**
- * Read the EXIF orientation and the stored (unrotated) pixel size from the head of a JPEG.
- * Pure; returns orientation 1 and null sizes for anything it does not recognise.
+ * Read the EXIF orientation, the EXIF 35 mm-equivalent focal length and the stored (unrotated) pixel size
+ * from the head of a JPEG. Pure; returns orientation 1 and nulls for anything it does not recognise.
  *
  * @param {Uint8Array} bytes  the first bytes of the file
- * @returns {{ orientation: number, width: number|null, height: number|null }}  orientation is the EXIF value 1..8
+ * @returns {{ orientation: number, width: number|null, height: number|null, focal35mm: number|null }}
+ *   orientation is the EXIF value 1..8; focal35mm is FocalLengthIn35mmFilm in mm (null when absent or 0,
+ *   which EXIF uses for "unknown", and when EXIF's PixelX/YDimension has a different shape from the
+ *   stored frame: an editor cropped the picture and copied the camera's EXIF, so the focal length
+ *   describes a bigger picture than this one)
  */
 export function readJpegInfo(bytes) {
-  const info = { orientation: 1, width: null, height: null };
+  const info = { orientation: 1, width: null, height: null, focal35mm: null };
   if (!bytes || bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return info;
+  let exifSize = null;
   try {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let pos = 2;
@@ -167,8 +195,12 @@ export function readJpegInfo(bytes) {
       if (length < 2) break;
       const start = pos + 4;
       if (marker === 0xe1) {
-        const orientation = readExifOrientation(view, start, Math.min(pos + 2 + length, view.byteLength));
-        if (orientation) info.orientation = orientation;
+        const exif = readExif(view, start, Math.min(pos + 2 + length, view.byteLength));
+        if (exif.orientation) info.orientation = exif.orientation;
+        if (exif.focal35mm) {
+          info.focal35mm = exif.focal35mm;
+          exifSize = exif.pixelWidth && exif.pixelHeight ? { w: exif.pixelWidth, h: exif.pixelHeight } : null;
+        }
       } else if (isFrameHeader(marker)) {
         info.height = view.getUint16(start + 1);
         info.width = view.getUint16(start + 3);
@@ -179,6 +211,11 @@ export function readJpegInfo(bytes) {
   } catch {
     // A truncated or malformed header just means we know less; the decoder has the final say.
   }
+  // Shape, not size: a photo that was only scaled down still has the camera's frame, and the 35 mm figure
+  // still holds for it. Either way up, since writers disagree on whether the size is before or after rotation.
+  if (info.focal35mm && exifSize && info.width && info.height && !sameShape(exifSize.w, exifSize.h, info.width, info.height)) {
+    info.focal35mm = null;
+  }
   return info;
 }
 
@@ -187,32 +224,113 @@ function isFrameHeader(marker) {
   return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
 }
 
+// Two sizes have the same shape when their long/short ratios are within this (relative) of each other.
+const SHAPE_TOLERANCE = 0.02;
+
 /**
+ * Whether two pixel sizes have the same long/short ratio, either way up.
+ * @param {number} aw
+ * @param {number} ah
+ * @param {number} bw
+ * @param {number} bh
+ */
+function sameShape(aw, ah, bw, bh) {
+  const ratio = (w, h) => Math.max(w, h) / Math.min(w, h);
+  return Math.abs(ratio(aw, ah) / ratio(bw, bh) - 1) <= SHAPE_TOLERANCE;
+}
+
+// EXIF tags we read. Orientation lives in IFD0; FocalLengthIn35mmFilm and the pixel size the camera
+// recorded (PixelXDimension / PixelYDimension) live in the Exif sub-IFD, which IFD0 points to with
+// ExifIFDPointer.
+const TAG_ORIENTATION = 0x0112;
+const TAG_EXIF_IFD_POINTER = 0x8769;
+const TAG_PIXEL_X = 0xa002;
+const TAG_PIXEL_Y = 0xa003;
+const TAG_FOCAL_35MM = 0xa405;
+const TYPE_SHORT = 3;
+const TYPE_LONG = 4;
+const TYPE_IFD = 13; // TIFF's "offset to an IFD" type; same bytes as a LONG
+
+/**
+ * The value of a SHORT or LONG entry (SHORT is what the spec asks for; a LONG is accepted too in case a
+ * writer widens it); 0 for a missing entry or any other type.
+ * @param {{ type: number, short: number, long: number }|undefined} entry
+ */
+function entryNumber(entry) {
+  if (!entry) return 0;
+  return entry.type === TYPE_SHORT ? entry.short : entry.type === TYPE_LONG ? entry.long : 0;
+}
+
+/**
+ * Orientation, 35 mm-equivalent focal length and the recorded pixel size from one APP1 segment. Every
+ * offset in the segment is checked against its end before it is read, so a truncated or hostile header
+ * just yields less.
+ *
  * @param {DataView} view
  * @param {number} start  first payload byte of an APP1 segment
  * @param {number} end    one past its last available byte
- * @returns {number} 1..8, or 0 when this segment holds no orientation
+ * @returns {{ orientation: number, focal35mm: number|null, pixelWidth: number, pixelHeight: number }}
+ *   orientation 0 when this segment holds none; pixelWidth / pixelHeight 0 when absent
  */
-function readExifOrientation(view, start, end) {
+function readExif(view, start, end) {
+  const none = { orientation: 0, focal35mm: null, pixelWidth: 0, pixelHeight: 0 };
   // 'Exif\0\0' (XMP also lives in APP1 and must be skipped)
-  if (end - start < 14 || view.getUint32(start) !== 0x45786966 || view.getUint16(start + 4) !== 0) return 0;
+  if (end - start < 14 || view.getUint32(start) !== 0x45786966 || view.getUint16(start + 4) !== 0) return none;
   const tiff = start + 6;
   const byteOrder = view.getUint16(tiff);
-  if (byteOrder !== 0x4949 && byteOrder !== 0x4d4d) return 0;
+  if (byteOrder !== 0x4949 && byteOrder !== 0x4d4d) return none;
   const little = byteOrder === 0x4949;
-  if (view.getUint16(tiff + 2, little) !== 42) return 0;
-  const ifd = tiff + view.getUint32(tiff + 4, little);
-  if (ifd + 2 > end) return 0;
+  if (view.getUint16(tiff + 2, little) !== 42) return none;
+
+  const ifd0 = readIfd(view, tiff, view.getUint32(tiff + 4, little), end, little);
+  const orientationEntry = ifd0.get(TAG_ORIENTATION);
+  const orientationValue = orientationEntry ? orientationEntry.short : 0;
+  const orientation = orientationValue >= 1 && orientationValue <= 8 ? orientationValue : 0;
+
+  let focal35mm = null;
+  let pixelWidth = 0;
+  let pixelHeight = 0;
+  const pointer = ifd0.get(TAG_EXIF_IFD_POINTER);
+  if (pointer && (pointer.type === TYPE_LONG || pointer.type === TYPE_IFD)) {
+    const exifIfd = readIfd(view, tiff, pointer.long, end, little);
+    const value = entryNumber(exifIfd.get(TAG_FOCAL_35MM));
+    if (value > 0) focal35mm = value; // 0 means "unknown"
+    pixelWidth = entryNumber(exifIfd.get(TAG_PIXEL_X));
+    pixelHeight = entryNumber(exifIfd.get(TAG_PIXEL_Y));
+  }
+  return { orientation, focal35mm, pixelWidth, pixelHeight };
+}
+
+/**
+ * The entries of one IFD whose value fits in its 4-byte field (all we read), keyed by tag; entries past
+ * `end` are left out, and an IFD that starts out of bounds gives an empty map.
+ *
+ * @param {DataView} view
+ * @param {number} tiff     position of the TIFF header (offsets are relative to it)
+ * @param {number} offset   offset of the IFD from the TIFF header
+ * @param {number} end      one past the last byte of the segment
+ * @param {boolean} little  byte order
+ * @returns {Map<number, { type: number, short: number, long: number }>}
+ */
+function readIfd(view, tiff, offset, end, little) {
+  const entries = new Map();
+  const ifd = tiff + offset;
+  // Offsets are unsigned 32-bit: anything that does not land inside the segment is ignored.
+  if (!(offset >= 8) || ifd + 2 > end) return entries;
   const count = view.getUint16(ifd, little);
   for (let i = 0; i < count; i += 1) {
     const entry = ifd + 2 + i * 12;
     if (entry + 12 > end) break;
-    if (view.getUint16(entry, little) === 0x0112) {
-      const value = view.getUint16(entry + 8, little);
-      return value >= 1 && value <= 8 ? value : 0;
-    }
+    const tag = view.getUint16(entry, little);
+    if (entries.has(tag)) continue;
+    entries.set(tag, {
+      type: view.getUint16(entry + 2, little),
+      // A single SHORT sits in the first two bytes of the value field in either byte order.
+      short: view.getUint16(entry + 8, little),
+      long: view.getUint32(entry + 8, little),
+    });
   }
-  return 0;
+  return entries;
 }
 
 /**
@@ -277,17 +395,27 @@ function drawWorkingCanvas(drawable, sourceWidth, sourceHeight, maxSide) {
 }
 
 /**
+ * @typedef {object} Decoded
+ * @property {CanvasImageSource} drawable
+ * @property {number} width
+ * @property {number} height
+ * @property {number|null} focal35mm  EXIF FocalLengthIn35mmFilm, when the header had one
+ * @property {() => void} release
+ */
+
+/**
  * @param {Blob} blob
- * @returns {Promise<{ drawable: CanvasImageSource, width: number, height: number, release: () => void }>}
+ * @returns {Promise<Decoded>}
  */
 async function decodeBlob(blob) {
   if (typeof Blob === 'undefined' || !(blob instanceof Blob)) throw new Error('not a file');
 
   const info = await sniffJpeg(blob);
+  const focal35mm = info && info.focal35mm ? info.focal35mm : null;
   const bitmap = await decodeBitmap(blob, info);
   if (bitmap) {
     if (bitmapIsUpright(bitmap, info)) {
-      return { drawable: bitmap, width: bitmap.width, height: bitmap.height, release: () => closeBitmap(bitmap) };
+      return { drawable: bitmap, width: bitmap.width, height: bitmap.height, focal35mm, release: () => closeBitmap(bitmap) };
     }
     closeBitmap(bitmap);
   }
@@ -295,7 +423,7 @@ async function decodeBlob(blob) {
   const url = URL.createObjectURL(blob);
   try {
     const img = await loadImageElement(url, false);
-    return { drawable: img, width: img.naturalWidth, height: img.naturalHeight, release: () => URL.revokeObjectURL(url) };
+    return { drawable: img, width: img.naturalWidth, height: img.naturalHeight, focal35mm, release: () => URL.revokeObjectURL(url) };
   } catch (error) {
     URL.revokeObjectURL(url);
     throw error;
@@ -303,13 +431,14 @@ async function decodeBlob(blob) {
 }
 
 /**
+ * URL sources (the demo photo) are not sniffed, so they carry no focal length.
  * @param {string} url
- * @returns {Promise<{ drawable: CanvasImageSource, width: number, height: number, release: () => void }>}
+ * @returns {Promise<Decoded>}
  */
 async function decodeUrl(url) {
   if (url.trim() === '') throw new Error('empty url');
   const img = await loadImageElement(url, isCrossOrigin(url), URL_TIMEOUT_MS);
-  return { drawable: img, width: img.naturalWidth, height: img.naturalHeight, release: () => {} };
+  return { drawable: img, width: img.naturalWidth, height: img.naturalHeight, focal35mm: null, release: () => {} };
 }
 
 /**

@@ -4,13 +4,24 @@
  * Loads the (optionally skinned) config, applies the theme, builds the shared `ctx` object and
  * runs the screen router: one screen module is mounted at a time as the sole child of .sm-main,
  * with browser history kept in step so the phone's back button works.
+ *
+ * The customer comes in one of five ways, all from the welcome screen:
+ *   AR (Android + ARCore only)   welcome -> ar -> result
+ *   the live camera              welcome -> capture -> door -> result
+ *   the demo photo               welcome -> door -> result
+ *   a sheet of paper (exact)     welcome -> prepare -> sheet -> door -> result
+ *   a size they already know     welcome -> result
+ * and every way then carries on to quote -> details -> done. `state.method` records which of the
+ * photo ways is in use ('paper', 'estimate' or 'ar'); the door and sheet screens read it.
  */
 
-import { loadConfig, applyTheme } from './theme.js';
+import { loadConfig, applyTheme, measurementMethods } from './theme.js';
 import * as ui from './ui.js';
 import { COMMON, buildStrings, createTranslator } from './strings.js';
 import * as welcome from './screens/welcome.js';
 import * as prepare from './screens/prepare.js';
+import * as capture from './screens/capture.js';
+import * as ar from './screens/ar.js';
 import * as sheet from './screens/sheet.js';
 import * as door from './screens/door.js';
 import * as result from './screens/result.js';
@@ -18,22 +29,136 @@ import * as quote from './screens/quote.js';
 import * as details from './screens/details.js';
 import * as done from './screens/done.js';
 
-const SCREENS = { welcome, prepare, sheet, door, result, quote, details, done };
-const SCREEN_ORDER = ['welcome', 'prepare', 'sheet', 'door', 'result', 'quote', 'details', 'done'];
+const SCREENS = { welcome, prepare, capture, ar, sheet, door, result, quote, details, done };
+
+/**
+ * Every screen, earliest first. The router reads it two ways: a screen that cannot be entered falls
+ * back to the nearest earlier one that can (see resolveScreenId), and moving to an earlier screen
+ * returns to that screen's history entry instead of stacking a new one (see go() in startApp).
+ * @type {ReadonlyArray<string>}
+ */
+export const SCREEN_ORDER = Object.freeze([
+  'welcome',
+  'prepare',
+  'capture',
+  'ar',
+  'sheet',
+  'door',
+  'result',
+  'quote',
+  'details',
+  'done',
+]);
 const TOTAL_STEPS = 4;
 
-/** Used only when a screen module's own `step` / `canEnter` export is missing or malformed. */
-const FALLBACK_STEPS = { welcome: 1, prepare: 1, sheet: 2, door: 2, result: 3, quote: 4, details: 4, done: 4 };
-const FALLBACK_GUARDS = {
+/**
+ * Progress step of each screen. Used only when a screen module's own `step` export is missing or
+ * malformed; tests/app.test.mjs checks that every module agrees with it.
+ * @type {Readonly<Record<string, number>>}
+ */
+export const FALLBACK_STEPS = Object.freeze({
+  welcome: 1,
+  prepare: 1,
+  capture: 1,
+  ar: 2,
+  sheet: 2,
+  door: 2,
+  result: 3,
+  quote: 4,
+  details: 4,
+  done: 4,
+});
+
+/**
+ * Who may enter each screen, given the shared state. Used only when a screen module's own `canEnter`
+ * export is missing; it mirrors those exports (tests/app.test.mjs checks that they agree).
+ * @type {Readonly<Record<string, (state: object) => boolean>>}
+ */
+export const FALLBACK_GUARDS = Object.freeze({
   welcome: () => true,
   prepare: () => true,
-  sheet: (state) => Boolean(state.photo),
-  door: (state) => Boolean(state.photo && state.sheet && state.sheet.points && state.sheet.placed !== false),
+  capture: () => true,
+  ar: () => true,
+  // The sheet of paper belongs to the paper method only; a photo for the estimate has none to mark.
+  sheet: (state) => state.method !== 'estimate' && state.method !== 'ar' && Boolean(state.photo),
+  door: (state) => {
+    // AR measures the opening itself and goes straight to the result.
+    if (state.method === 'ar') return false;
+    if (state.method === 'estimate') return Boolean(state.photo);
+    // The paper method (and a null method, from before the customer chose one) needs a marked sheet.
+    return Boolean(state.photo && state.sheet && state.sheet.points && state.sheet.placed !== false);
+  },
   result: (state) => Boolean(state.measure || state.manualEntry),
   quote: (state) => Boolean(state.size),
   details: (state) => Boolean(state.size && state.quoteInput && state.quoteInput.productId),
   done: (state) => Boolean(state.submission),
-};
+});
+
+/**
+ * Screens that belong to one way in only, and the `state.method` that way sets. None has a guard
+ * (each can always be entered, to start or restart its way in), so without this the fallback in
+ * resolveScreenId would stop at whichever of them sits nearest in SCREEN_ORDER: a paper customer
+ * whose photo is gone would be sent to the AR screen, on a phone that may not even do AR, and a
+ * customer back from the camera or the demo would be sent to the paper method's "Get set up".
+ */
+const METHOD_SCREENS = Object.freeze({ prepare: 'paper', capture: 'estimate', ar: 'ar' });
+
+/**
+ * May `candidate` stand in for a screen that cannot be entered? Any screen but a way in's own may; a way
+ * in's own screen only on that way. "Get set up" is also where the paper method starts, so it may stand
+ * in before any way in is chosen (`state.method` null, the paper method's own convention), as long as
+ * the company offers the paper method at all.
+ */
+function isFallbackFor(candidate, state, methods) {
+  const onlyFor = METHOD_SCREENS[candidate];
+  if (!onlyFor) return true;
+  const method = state ? state.method : null;
+  if (method === onlyFor) return true;
+  return candidate === 'prepare' && method == null && !(methods && methods.paper === false);
+}
+
+/**
+ * Where a request for screen `id` lands: `id` itself if it may be entered, otherwise the furthest
+ * earlier screen that may and that belongs to the way in being used (see METHOD_SCREENS), otherwise
+ * the welcome screen. An unknown id lands on the welcome screen.
+ *
+ * @param {string} id               the requested screen
+ * @param {object} state            the shared state (for `state.method`)
+ * @param {(id: string) => boolean} canEnter  the router's guard check for a screen id
+ * @param {{ paper?: boolean }} [methods]  the ways in the company offers (measurementMethods in
+ *   js/theme.js); left out, every way in counts as offered
+ * @returns {string} a screen id from SCREEN_ORDER
+ */
+export function resolveScreenId(id, state, canEnter, methods) {
+  const index = SCREEN_ORDER.indexOf(id);
+  if (index < 0) return 'welcome';
+  for (let i = index; i > 0; i -= 1) {
+    const candidate = SCREEN_ORDER[i];
+    // Asked for by name, a way in's own screen is always fine; as a fallback only on its own way.
+    if (i < index && !isFallbackFor(candidate, state, methods)) continue;
+    if (canEnter(candidate)) return candidate;
+  }
+  return 'welcome';
+}
+
+/** Screens with a photo picker that the start-up code returns to when the page was lost mid-photo. */
+const RESTORABLE_SCREENS = Object.freeze(['prepare', 'capture']);
+
+/** The string id of each of those screens' "Choose a photo" button, named in the message shown then. */
+const CHOOSE_LABEL_KEYS = Object.freeze({ prepare: 'prepare.choose', capture: 'capture.fallback.choose' });
+
+/**
+ * The screen to pick up again after a reload the customer never asked for, read from the history
+ * entry the page came back to (see "interrupted photo" in startApp), or null for a normal start.
+ *
+ * @param {unknown} entry  history.state
+ * @returns {string | null} 'prepare' or 'capture', or null
+ */
+export function interruptedPhotoScreen(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  if (!RESTORABLE_SCREENS.includes(entry.screen)) return null;
+  return entry.picking && typeof entry.picking === 'object' ? entry.screen : null;
+}
 
 const TOAST_ICONS = { info: 'info', success: 'check', error: 'alert' };
 const MAX_TOASTS = 3;
@@ -59,14 +184,18 @@ function mentionsOwnScript(text) {
 export function createInitialState(config) {
   const measurement = (config && config.measurement) || {};
   return {
+    // The photo way in the customer chose: 'paper' (prepare.js), 'estimate' (capture.js and the welcome
+    // demo) or 'ar' (ar.js, once it has a measurement); null until then. setPhoto() leaves it alone.
+    method: null,
     manualEntry: false,
     referenceId: measurement.defaultReferenceId,
     customReference: { widthMm: null, heightMm: null },
-    // The customer's own sheet choice, set aside while the demo photo is loaded (welcome.js / prepare.js).
+    // The customer's own sheet choice, set aside while the paper demo photo is loaded (js/demo.js).
     ownReference: null,
     photo: null,
     sheet: { points: null, refined: false, detected: false },
-    door: { points: null },
+    // detection: findDoor()'s result for the current photo, or null until it has run (js/door-find.js).
+    door: { points: null, detection: null },
     measure: null,
     size: null,
     quoteInput: { productId: null, selections: {}, includeInstallation: null },
@@ -151,6 +280,7 @@ function startApp(config, els) {
   const strings = buildStrings(SCREEN_ORDER.map((id) => SCREENS[id]));
   const t = createTranslator(config, strings);
   let state = createInitialState(config);
+  const methods = measurementMethods(config);
   const embedded = window.parent !== window;
   const parentOrigin = normaliseOrigin(config.embed && config.embed.parentOrigin);
 
@@ -174,17 +304,10 @@ function startApp(config, els) {
     }
   }
 
-  /** The requested screen if it may be entered, otherwise the furthest earlier screen that may. */
+  /** The requested screen if it may be entered, otherwise the furthest earlier screen that may (resolveScreenId). */
   function resolveScreen(id) {
-    const index = SCREEN_ORDER.indexOf(id);
-    if (index < 0) {
-      console.warn(`${LOG_PREFIX} unknown screen "${id}"`);
-      return 'welcome';
-    }
-    for (let i = index; i > 0; i -= 1) {
-      if (canEnter(SCREEN_ORDER[i])) return SCREEN_ORDER[i];
-    }
-    return 'welcome';
+    if (!SCREEN_ORDER.includes(id)) console.warn(`${LOG_PREFIX} unknown screen "${id}"`);
+    return resolveScreenId(id, state, canEnter, methods);
   }
 
   function stepOf(id) {
@@ -259,7 +382,8 @@ function startApp(config, els) {
   // A phone short of memory can close this page while its camera app is in front. The page then loads
   // afresh when the customer comes back and the photo never arrives. A history entry survives that, so
   // while a photo picker is open the entry carries a note of the sheet the customer chose (`picking`);
-  // the start-up code at the bottom of startApp() looks for it.
+  // the start-up code at the bottom of startApp() looks for it. Both "Get set up" (the paper method) and
+  // the camera screen ("Use your camera app instead") open the phone's camera app this way.
 
   /** True from the tap that opens a photo picker until the page shows it is still here. */
   let pickerOpen = false;
@@ -276,13 +400,15 @@ function startApp(config, els) {
   }
 
   /**
-   * If the page went away while a photo was being taken on "Get set up", put the customer's sheet
-   * choice back into the (fresh) state and report true: that screen is where to pick up again.
+   * If the page went away while a photo was being taken on "Get set up" or the camera screen, put the
+   * customer's sheet choice back into the (fresh) state and return that screen: it is where to pick up
+   * again. Returns null for a normal start.
    */
   function restoreInterruptedPhoto() {
     const entry = history.state;
-    const note = entry && entry.screen === 'prepare' ? entry.picking : null;
-    if (!note || typeof note !== 'object') return false;
+    const screen = interruptedPhotoScreen(entry);
+    if (!screen) return null;
+    const note = entry.picking;
     if (typeof note.referenceId === 'string') state.referenceId = note.referenceId;
     const custom = note.customReference;
     if (custom && typeof custom === 'object') {
@@ -290,7 +416,15 @@ function startApp(config, els) {
         if (Number.isFinite(custom[side])) state.customReference[side] = custom[side];
       }
     }
-    return true;
+    return screen;
+  }
+
+  /** The label of `screen`'s "Choose a photo" button, for the interrupted-photo message. */
+  function chooseLabel(screen) {
+    const key = CHOOSE_LABEL_KEYS[screen] || CHOOSE_LABEL_KEYS.prepare;
+    const label = t(key);
+    // The translator hands back the key itself for copy that does not exist.
+    return label === key ? t(CHOOSE_LABEL_KEYS.prepare) : label;
   }
 
   // ----- chrome -----
@@ -548,9 +682,9 @@ function startApp(config, els) {
       const order = SCREEN_ORDER.indexOf(target);
       let at = trail.lastIndexOf(target, idx - 1);
       if (at < 0) {
-        // The step has no entry of its own (the demo photo and a typed-in size both skip "Get set up").
-        // Take over the first entry that belongs to a later step, so none of those is left underneath
-        // for Back to land on.
+        // The step has no entry of its own: every way in but the paper one skips "Get set up", AR skips
+        // the camera screen, and the camera skips AR. Take over the first entry that belongs to a later
+        // step, so none of those is left underneath for Back to land on.
         at = 1;
         while (at < idx && SCREEN_ORDER.indexOf(trail[at]) <= order) at += 1;
       }
@@ -659,7 +793,7 @@ function startApp(config, els) {
   document.addEventListener('click', (event) => {
     const el = event.target;
     if (event.defaultPrevented || travelling || !el || el.tagName !== 'INPUT' || el.type !== 'file') return;
-    // While the demo photo is loaded, the customer's own sheet choice waits in state.ownReference.
+    // While the paper demo photo is loaded, the customer's own sheet choice waits in state.ownReference.
     const chosen = state.ownReference || state;
     pickerOpen = true;
     setPickerNote({ referenceId: chosen.referenceId, customReference: { ...chosen.customReference } });
@@ -693,11 +827,12 @@ function startApp(config, els) {
   // Start from the first screen: state does not survive a reload, and any incoming hash is ignored.
   // The one exception is a reload the customer never asked for, when the phone closed the page while
   // they were taking the photo: go back to that step, with their sheet choice, and say what happened.
-  if (restoreInterruptedPhoto()) {
+  const restored = restoreInterruptedPhoto();
+  if (restored) {
     // The entries underneath are still the old session's, so Back from here leads to the first screen.
-    writeHistory('prepare', historyIndex(), false);
-    show('prepare', { initial: true });
-    toast(t('common.photoInterrupted', { choose: t('prepare.choose') }), { duration: 12000 });
+    writeHistory(restored, historyIndex(), false);
+    show(restored, { initial: true });
+    toast(t('common.photoInterrupted', { choose: chooseLabel(restored) }), { duration: 12000 });
   } else {
     writeHistory('welcome', 0, false);
     show('welcome', { initial: true });

@@ -1,7 +1,9 @@
 /**
  * Shared pieces of the two "mark" screens (sheet and door): the flush layout
  * (banner, photo stage, action bar), the floating nudge pad and Fit button,
- * hold-to-repeat, and the QuadEditor lifecycle.
+ * hold-to-repeat, and the QuadEditor lifecycle. It also holds the door screen's
+ * small decisions (what its banner says, when its corners count as placed, the
+ * "next outline" cycle), as pure functions so they are tested in Node.
  *
  * This module holds no user-visible copy. Each screen passes its own
  * translated labels in, so every string stays under that screen's `strings`.
@@ -105,16 +107,21 @@ export function sameQuad(a, b) {
   return isQuad(a) && isQuad(b) && a.every((p, i) => p.x === b[i].x && p.y === b[i].y);
 }
 
+// Sizes worked out from marked corners: the paper measurement ('photo') and the no-paper
+// standard-size estimate ('estimate'). A typed-in size ('manual') and an AR measurement ('ar') are not.
+const CORNER_SIZE_SOURCES = new Set(['photo', 'estimate']);
+
 /**
  * Drop everything worked out from the marked corners, because a corner has just
- * changed: the measurement, and the size if it came from that measurement. A
- * size the customer typed in is theirs and stays.
+ * changed: the measurement, and the size if it came from that measurement (the
+ * paper measurement or the standard-size estimate). A size the customer typed in
+ * is theirs and stays.
  * @param {object} state The shared app state (mutated).
  * @returns {void}
  */
 export function invalidateMeasurement(state) {
   state.measure = null;
-  if (state.size && state.size.source === 'photo') state.size = null;
+  if (state.size && CORNER_SIZE_SOURCES.has(state.size.source)) state.size = null;
 }
 
 /**
@@ -236,6 +243,137 @@ export function defaultDoorQuad(imageWidth, imageHeight) {
     { x: right, y: bottom },
     { x: left, y: bottom },
   ];
+}
+
+/**
+ * May the door screen be entered? It depends on the way in the customer chose (`state.method`):
+ *  - 'ar': never. The AR screen measures the door itself and goes straight to the result.
+ *  - 'estimate' (the no-paper photo): a photo is all it needs; there is no sheet to mark.
+ *  - anything else ('paper', or null from callers that predate `method`): a photo and a marked
+ *    sheet. The stand-in rectangle the sheet screen shows after a failed detection does not count
+ *    until the customer has moved a corner (`placed`).
+ * door.js exports this as its `canEnter`; it lives here so it can be tested without loading the
+ * door screen's estimate and detection modules.
+ * @param {object} state
+ * @returns {boolean}
+ */
+export function canEnterDoor(state) {
+  if (!state || !state.photo) return false;
+  if (state.method === 'ar') return false;
+  if (state.method === 'estimate') return true;
+  return Boolean(state.sheet && isQuad(state.sheet.points) && state.sheet.placed !== false);
+}
+
+/**
+ * The outlines the door screen can offer from a findDoor() result, best first: the detected quad
+ * then its alternatives. Detection's main mistake is a neighbouring rectangle (the outer trim, the
+ * transom plus the door, a glass panel), and the right outline is among these three far more often
+ * than it is the first, hence "Not this? Show the next outline". Anything that is not four finite
+ * points, and any repeat of an outline already listed, is left out.
+ *
+ * Given the photo's size, every corner is kept inside it ([0, width] x [0, height]), exactly as
+ * startingQuad() and the editor keep the handles, so an outline can be recognised again from the
+ * handles sitting on it (outlineIndexOf) even when detection put a corner a fraction outside.
+ * @param {{ ok?: boolean, quad?: Point[] | null, alternatives?: Point[][] } | null | undefined} detection
+ * @param {{ width?: number, height?: number }} [bounds] The photo's size; omitted, nothing is clamped.
+ * @returns {Point[][]} Detached copies; empty when nothing was found.
+ */
+export function doorOutlines(detection, bounds = {}) {
+  if (!detection || !detection.ok || !isQuad(detection.quad)) return [];
+  const width = Number(bounds?.width);
+  const height = Number(bounds?.height);
+  const inside = width > 0 && height > 0
+    ? (quad) => quad.map((p) => ({ x: clamp(p.x, 0, width), y: clamp(p.y, 0, height) }))
+    : copyQuad;
+  const outlines = [inside(detection.quad)];
+  const alternatives = Array.isArray(detection.alternatives) ? detection.alternatives : [];
+  for (const quad of alternatives) {
+    if (!isQuad(quad)) continue;
+    const outline = inside(quad);
+    if (!outlines.some((known) => sameQuad(known, outline))) outlines.push(outline);
+  }
+  return outlines;
+}
+
+/**
+ * Which of `outlines` a set of handles is sitting on exactly, or -1 for none (the customer's own
+ * corners, or the fallback starting rectangle).
+ * @param {Point[][]} outlines
+ * @param {unknown} points
+ * @returns {number}
+ */
+export function outlineIndexOf(outlines, points) {
+  if (!Array.isArray(outlines)) return -1;
+  return outlines.findIndex((quad) => sameQuad(quad, points));
+}
+
+/**
+ * The outline "Not this? Show the next outline" moves to: the one after `index`, round to the first
+ * again after the last. From no outline (-1: the customer's own corners or the fallback rectangle)
+ * it starts at the detected one.
+ * @param {number} index The outline shown now, or -1.
+ * @param {number} count How many outlines there are.
+ * @returns {number} -1 when there are none.
+ */
+export function nextOutlineIndex(index, count) {
+  if (!Number.isInteger(count) || count <= 0) return -1;
+  if (!Number.isInteger(index) || index < 0 || index >= count) return 0;
+  return (index + 1) % count;
+}
+
+/**
+ * Have the door corners been placed, so that measuring from them means something? Measuring the
+ * untouched starting rectangle would give a confident-looking but meaningless size, so the handles
+ * count as placed once the customer has:
+ *  - moved a corner (`moved`), or
+ *  - picked an outline with "Not this? Show the next outline" (`chosen`): looking at a few and
+ *    settling on one is a decision about where the door is;
+ * or when the handles are still on the outline detection was confident of (`confident` and
+ * `outline` 0). A detection it was not sure of is only a starting position.
+ * @param {{ moved?: boolean, chosen?: boolean, confident?: boolean, outline?: number }} status
+ * @returns {boolean}
+ */
+export function doorCornersPlaced({ moved = false, chosen = false, confident = false, outline = -1 } = {}) {
+  return moved === true || chosen === true || (confident === true && outline === 0);
+}
+
+/**
+ * What the door screen's banner should say:
+ *  - 'searching': findDoor() is still looking at the photo;
+ *  - 'outline': the customer is stepping through the outlines ("Outline 2 of 3");
+ *  - 'found': the handles start on an outline detection is confident of (`outline` 0). It is still
+ *    only a suggestion: the wording asks the customer to check each corner;
+ *  - 'place': anything else. The customer drags the corners onto the door opening.
+ * @param {{ searching?: boolean, confident?: boolean, chosen?: boolean, outline?: number, outlines?: number }} status
+ *   `outline` is the index of the outline the handles were put on (-1 for none) and `outlines`
+ *   how many there are.
+ * @returns {'searching' | 'outline' | 'found' | 'place'}
+ */
+export function doorBannerKind({ searching = false, confident = false, chosen = false, outline = -1, outlines = 0 } = {}) {
+  if (searching === true) return 'searching';
+  const showing = Number.isInteger(outline) && outline >= 0 && outline < outlines;
+  if (chosen === true && showing && outlines > 1) return 'outline';
+  if (confident === true && showing && outline === 0) return 'found';
+  return 'place';
+}
+
+/**
+ * The corners as the outline the customer sees, in [TL, TR, BR, BL] order. The editor joins its
+ * handles so the outline never crosses itself (see outlineOrder), whichever handle ended up on
+ * which corner; the standard-size estimate needs that outline's corners in reading order, or it
+ * would take the door's height for its width. Clockwise on screen, starting from the corner
+ * nearest the photo's top-left.
+ * @param {Point[]} points Four points (handle order).
+ * @returns {Point[]} Detached copies, reordered; the input unchanged (copied) if it is not a quad.
+ */
+export function cornersInOutlineOrder(points) {
+  if (!isQuad(points)) return Array.isArray(points) ? copyQuad(points.filter(Boolean)) : [];
+  const ordered = outlineOrder(points).map((i) => ({ x: points[i].x, y: points[i].y }));
+  let first = 0;
+  for (let i = 1; i < ordered.length; i += 1) {
+    if (ordered[i].x + ordered[i].y < ordered[first].x + ordered[first].y) first = i;
+  }
+  return [...ordered.slice(first), ...ordered.slice(0, first)];
 }
 
 /**

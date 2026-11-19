@@ -58,12 +58,14 @@ const FALLBACK_ACCENT = '#f59e0b';
 const MANUAL_ZOOM_PAD = 1;
 
 /**
- * The sheet screen needs a photo to work on.
+ * The sheet screen needs a photo to work on, and belongs to the paper method only: a photo taken for
+ * the no-paper estimate or an AR measurement has no sheet in it to mark. A null method (from before
+ * the customer chose a way in) counts as paper.
  * @param {object} state
  * @returns {boolean}
  */
 export function canEnter(state) {
-  return Boolean(state && state.photo);
+  return Boolean(state && state.method !== 'estimate' && state.method !== 'ar' && state.photo);
 }
 
 /**

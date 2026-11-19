@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import baseConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
 import { deepMerge, loadConfig } from '../js/theme.js';
+import { DEFAULT_STANDARD_SIZES } from '../js/estimate.js';
 import { SHIPPED_CONFIG } from './helpers/shipped-config.mjs';
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,8 @@ const SKELETON = {
     fontFamily: 'string',
   },
   measurement: {
+    methods: { ar: 'boolean', camera: 'boolean', paper: 'boolean' },
+    standardSizes: 'array',
     references: 'array',
     defaultReferenceId: 'string',
     allowCustomReference: 'boolean',
@@ -83,6 +86,10 @@ const SKELETON = {
 
 /** Keys allowed on the items of each config list: name -> [type, required]. */
 const ITEM_SHAPES = {
+  standardSize: {
+    widthMm: ['number', true],
+    heightMm: ['number', true],
+  },
   reference: {
     id: ['string', true],
     label: ['string', true],
@@ -316,6 +323,32 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
       );
     });
 
+    test('methods leave the customer a way to a size on every phone', async () => {
+      const { measurement } = await getConfig();
+      // AR works on some Android phones only, so on its own it is no way in for an iPhone customer.
+      assert.ok(
+        measurement.methods.camera || measurement.methods.paper || measurement.allowManualOverride,
+        'turn on methods.camera or methods.paper, or allowManualOverride',
+      );
+    });
+
+    test('standard sizes are door-shaped sizes in mm, each listed once', async () => {
+      const { measurement } = await getConfig();
+      const { standardSizes, plausible } = measurement;
+      assert.ok(standardSizes.length >= 1, 'the no-paper photo needs at least one size to match');
+      assert.deepEqual(standardSizes.flatMap((size, i) => itemErrors(size, 'standardSize', `standardSizes[${i}]`)), []);
+      for (const { widthMm, heightMm } of standardSizes) {
+        const name = `${widthMm} x ${heightMm}`;
+        assert.ok(widthMm > 0 && heightMm > 0, name);
+        assert.ok(widthMm < heightMm, `${name}: widthMm is the side-to-side size, so it is the smaller one`);
+        // A standard size the measuring code would itself call implausible could never be matched.
+        assert.ok(plausible.minWidthMm <= widthMm && widthMm <= plausible.maxWidthMm, `${name}: width outside measurement.plausible`);
+        assert.ok(plausible.minHeightMm <= heightMm && heightMm <= plausible.maxHeightMm, `${name}: height outside measurement.plausible`);
+      }
+      const keys = standardSizes.map(({ widthMm, heightMm }) => `${widthMm}x${heightMm}`);
+      assert.equal(new Set(keys).size, keys.length, `listed more than once: ${keys.join(', ')}`);
+    });
+
     test('measurement numbers are sane', async () => {
       const { measurement } = await getConfig();
       assert.ok(measurement.maxWorkingSizePx >= 1024);
@@ -473,6 +506,11 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
       assert.equal(byId.card.lowAccuracy, true);
     });
 
+    test('the demo door (820 x 2040 mm) is one of the standard sizes, so the no-paper demo can match it', async () => {
+      const { measurement } = await getConfig();
+      assert.ok(measurement.standardSizes.some((size) => size.widthMm === 820 && size.heightMm === 2040));
+    });
+
     test('offers three tiers, cheapest first, with one badge and 3-4 features each', async () => {
       const { products } = (await getConfig()).pricing;
       assert.equal(products.length, 3);
@@ -507,6 +545,21 @@ describe('default config as shipped: contract defaults', () => {
     assert.equal(brand.logoUrl, '');
     assert.equal(brand.radius, '14px');
 
+    assert.deepEqual(measurement.methods, { ar: true, camera: true, paper: true });
+    // The Australian standard opening sizes, the same list js/estimate.js falls back to.
+    assert.deepEqual(
+      measurement.standardSizes.map(({ widthMm, heightMm }) => [widthMm, heightMm]),
+      [
+        [720, 2040], [770, 2040], [820, 2040], [870, 2040], [920, 2040],
+        [820, 2100], [870, 2100], [920, 2100],
+        [820, 2340], [920, 2340],
+      ],
+    );
+    assert.deepEqual(
+      measurement.standardSizes,
+      DEFAULT_STANDARD_SIZES.map(({ widthMm, heightMm }) => ({ widthMm, heightMm })),
+      'js/config.js ships the built-in list that a malformed setting falls back to',
+    );
     assert.equal(measurement.allowCustomReference, true);
     assert.equal(measurement.maxWorkingSizePx, 2560);
     assert.equal(measurement.sigmaDoorPx, 2.5);
@@ -565,6 +618,14 @@ describe('default config as shipped: contract defaults', () => {
     assert.ok(colour.choices.filter((choice) => choice.price > 0).length >= 2, 'a couple of colours carry a surcharge');
     assert.equal(colour.choices.find((choice) => choice.id === colour.default).price, 0, 'the default colour is a free one');
     for (const option of options.slice(1)) assert.equal(option.default, false);
+  });
+
+  test('the price disclaimer fits every way to a size, and promises a check measure', () => {
+    // js/screens/quote.js shows it under every price: AR and typed-in sizes have no photo behind them,
+    // and the no-paper photo estimate reads no measurements from the photo.
+    const { disclaimer } = baseConfig.pricing;
+    assert.match(disclaimer, /check measure/i);
+    assert.doesNotMatch(disclaimer, /photo|measurements from/i);
   });
 
   test('the demo door (820 x 2040 mm) prices as a standard size', () => {

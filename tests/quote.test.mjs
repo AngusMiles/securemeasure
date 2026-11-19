@@ -210,7 +210,8 @@ describe('calculateQuote: oversize surcharge', () => {
     const oversize = line(quote, 'oversize');
     assert.equal(oversize.amount, 49);
     assert.equal(oversize.label, 'Oversize surcharge');
-    assert.equal(oversize.detail, '0.27 m² larger than our standard 870 × 2100 mm');
+    assert.equal(oversize.detail, '0.27 m² larger than the 870 × 2100 mm our base price covers');
+    assert.doesNotMatch(oversize.detail, /standard/i, 'the threshold is not one of the standard sizes the customer was shown');
     assert.deepEqual(ids(quote), ['product', 'oversize', 'option:colour', 'option:lock', 'installation']);
     assert.equal(quote.total, 890 + 49 + 220);
   });
@@ -257,7 +258,7 @@ describe('calculateQuote: oversize surcharge', () => {
     const exact = calculateQuote(toTheCent, { widthMm: 871, heightMm: 2100, productId: 'classic' });
     assertWellFormed(exact, toTheCent);
     assert.equal(line(exact, 'oversize').amount, 0.38);
-    assert.equal(line(exact, 'oversize').detail, '0.002 m² larger than our standard 870 × 2100 mm');
+    assert.equal(line(exact, 'oversize').detail, '0.002 m² larger than the 870 × 2100 mm our base price covers');
   });
 
   test('a product without an oversize rate is not surcharged', () => {

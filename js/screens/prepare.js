@@ -1,8 +1,10 @@
 /**
- * Prepare screen: how to set up the shot, which reference sheet is on the door,
- * and the two ways to hand over a photo (camera or library).
+ * Prepare screen, the start of the paper method (the exact way to measure): how to set up the
+ * shot, which reference sheet is on the door, the two ways to hand over a photo (camera or
+ * library), and the demo photo for anyone who wants to see the method first.
  */
 import { getSheetMm, loadPhoto, setPhoto } from '../photo.js';
+import { demoPhotoUrl, loadDemo } from '../demo.js';
 
 /** Screen id used for routing and for the `sm-screen--prepare` class. */
 export const id = 'prepare';
@@ -13,7 +15,7 @@ export const step = 1;
 /** Default copy for this screen; any key can be overridden through `config.text`. */
 export const strings = {
   'prepare.title': 'Get set up',
-  'prepare.subtitle': 'Three quick steps, then one photo.',
+  'prepare.subtitle': 'Our exact method: a sheet of paper gives your photo its scale. Three quick steps, then one photo.',
   'prepare.steps.label': 'How to set up your photo',
   'prepare.step1.title': 'Tape the sheet to the door',
   'prepare.step1.text':
@@ -49,6 +51,9 @@ export const strings = {
   'prepare.choose': 'Choose a photo',
   'prepare.loading': 'Getting your photo ready…',
   'prepare.error.decode': "We couldn't open that photo. Please use a JPEG or PNG photo.",
+  'prepare.demo': 'Try the paper method with our demo photo',
+  'prepare.demo.loading': 'Loading the demo photo…',
+  'prepare.demo.error': "Sorry, we couldn't load the demo photo. Please try again.",
 };
 
 /** Allowed length of each side of a custom reference, in mm. */
@@ -117,8 +122,8 @@ export function mount(root, ctx) {
   let alive = true;
   let loading = false;
 
-  // While the demo photo is loaded, state.referenceId / customReference describe the demo's own A4
-  // sheet and the customer's choice waits in state.ownReference (see welcome.js). The chooser
+  // While the paper demo photo is loaded, state.referenceId / customReference describe the demo's own
+  // A4 sheet and the customer's choice waits in state.ownReference (see js/demo.js). The chooser
   // always shows and edits the customer's choice, so trying the demo never changes which sheet is
   // selected here, and the demo photo keeps its A4 if the customer goes back or forward into it.
   const choice = () => ctx.state.ownReference || ctx.state;
@@ -134,7 +139,9 @@ export function mount(root, ctx) {
 
   // A photo measurement is only true for the sheet size it was worked out with. The customer can
   // come back here, pick a different sheet and then use the browser's Forward button, so a change
-  // of sheet size has to drop that measurement (the door screen simply measures again).
+  // of sheet size has to drop that measurement (the door screen simply measures again). A no-paper
+  // estimate or an AR measurement (the customer may come here from its result to measure exactly)
+  // never used a sheet, so it stays.
   const sheetKey = () => {
     const sheet = getSheetMm(ctx.state, config);
     return `${sheet.w}x${sheet.h}`;
@@ -145,6 +152,8 @@ export function mount(root, ctx) {
     const key = sheetKey();
     if (key === measuredSheet) return;
     measuredSheet = key;
+    const { measure } = ctx.state;
+    if (measure && (measure.method === 'estimate' || measure.method === 'ar')) return;
     ctx.state.measure = null;
     if (ctx.state.size && ctx.state.size.source === 'photo') ctx.state.size = null;
   }
@@ -353,9 +362,31 @@ export function mount(root, ctx) {
       if (!alive) return;
       useOwnReference();
       setPhoto(ctx.state, photo);
+      // setPhoto leaves the way in alone: this photo is for the paper method, whatever came before.
+      ctx.state.method = 'paper';
       ctx.go('sheet');
     } catch {
       if (alive) ctx.toast(t('prepare.error.decode'), { type: 'error', duration: 6000 });
+    } finally {
+      loading = false;
+    }
+  }
+
+  // The demo photo has its own A4 sheet in it, so neither the sheet chosen here nor an unfinished
+  // custom size has any say: the demo always works, and the customer's choice is kept for their own
+  // photo (js/demo.js sets it aside).
+  async function startDemo() {
+    if (loading) return;
+    loading = true;
+    try {
+      await ctx.busy(
+        () => loadDemo(ctx, { method: 'paper', isCurrent: () => alive }),
+        t('prepare.demo.loading'),
+      );
+      if (!alive) return;
+      ctx.go('sheet');
+    } catch {
+      if (alive) ctx.toast(t('prepare.demo.error'), { type: 'error' });
     } finally {
       loading = false;
     }
@@ -387,8 +418,12 @@ export function mount(root, ctx) {
   takeButton.addEventListener('click', guardPicker, true);
   chooseButton.addEventListener('click', guardPicker, true);
 
+  const demoButton = demoPhotoUrl(config)
+    ? ui.button(t('prepare.demo'), { variant: 'ghost', size: 'sm', icon: 'image', onClick: startDemo })
+    : null;
+
   const header = ui.screenHeader({ title: t('prepare.title'), subtitle: t('prepare.subtitle') });
-  const content = [header, stepList, referenceCard, tipsDisclosure, ui.actionBar(takeButton, chooseButton)];
+  const content = [header, stepList, referenceCard, tipsDisclosure, ui.actionBar(takeButton, chooseButton, demoButton)];
   root.append(...content.filter(Boolean));
 
   return () => {

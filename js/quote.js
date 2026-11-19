@@ -22,7 +22,9 @@ const NO_VALUE = '—';
  */
 export const QUOTE_STRINGS = Object.freeze({
   'pricing.oversizeLabel': 'Oversize surcharge',
-  'pricing.oversizeDetail': '{extraSqm} m² larger than our standard {standardWidthMm} × {standardHeightMm} mm',
+  // Not "standard": pricing.standardSize is only the surcharge threshold, and the customer may just have
+  // been told their door is one of the company's standard sizes (measurement.standardSizes).
+  'pricing.oversizeDetail': '{extraSqm} m² larger than the {standardWidthMm} × {standardHeightMm} mm our base price covers',
   'pricing.optionLabel': '{option}: {choice}',
   'pricing.tooNarrow': 'At {size} wide, your door opening is narrower than the {limit} we can price online.',
   'pricing.tooWide': 'At {size} wide, your door opening is wider than the {limit} we can price online.',
