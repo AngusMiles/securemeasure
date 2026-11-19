@@ -46,6 +46,11 @@
   text-align: center;
 }
 
+/* Email-link mode has no success mark above the header; keep the room the mark's margin gave. */
+.sm-screen--done .sm-screen-header:first-child {
+  margin-top: var(--sm-space-4);
+}
+
 /* ---- Reference ---- */
 
 .sm-screen--done .sm-done-ref {

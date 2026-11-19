@@ -5,6 +5,7 @@
  */
 
 import { detectSheet, refineQuad } from '../vision.js';
+import { outlineOrder } from '../editor.js';
 import { getLuma, getSheetMm } from '../photo.js';
 import {
   copyQuad,
@@ -12,7 +13,8 @@ import {
   defaultSheetQuad,
   invalidateMeasurement,
   isQuad,
-  sheetOutlineIsPlausible,
+  sameQuad,
+  sheetDetectionOutcome,
   themeColor,
 } from './mark-common.js';
 
@@ -26,6 +28,8 @@ export const strings = {
   'sheet.title': 'Mark the sheet of paper',
   'sheet.banner.tap': 'Tap the sheet of paper in your photo',
   'sheet.banner.check': 'Check each corner sits exactly on a corner of the paper. Drag to adjust.',
+  'sheet.banner.unsure':
+    "We're not sure about this outline. Drag any corner that isn't exactly on a corner of the paper.",
   'sheet.banner.manual':
     "We couldn't find the sheet automatically. Drag the 4 corners onto the corners of the paper.",
   'sheet.busy': 'Finding the sheet…',
@@ -37,8 +41,9 @@ export const strings = {
   'sheet.snap.fail': "Couldn't snap. Adjust the corners by hand.",
   'sheet.restart': 'Start again',
   'sheet.next': 'Next: mark the door',
+  'sheet.error.untouched': 'Drag the four corners onto the corners of the paper first.',
   'sheet.editor.aria':
-    'Your door photo. Tap the sheet of paper, then drag its four corner handles onto the corners of the paper.',
+    'Your door photo. Tap the sheet of paper, then drag its four corner handles onto the corners of the paper. With a keyboard, press Enter to place the corners, then use Tab and the arrow keys to move them.',
   'sheet.nudge.label': 'Fine-tune the selected corner',
   'sheet.nudge.up': 'Move the corner up',
   'sheet.nudge.down': 'Move the corner down',
@@ -75,8 +80,12 @@ export function mount(root, ctx) {
   let disposed = false;
   let detecting = false;
   let mode = isQuad(state.sheet.points) ? 'adjust' : 'tap';
+  // After a failed detection the handles start as a stand-in rectangle that has nothing to do with
+  // where the paper is. `placed` is false from then until the customer moves a corner; measuring
+  // from the untouched stand-in would give a confident-looking but meaningless size.
+  const unplaced = () => state.sheet.placed === false;
   // Coming back to corners that were placed or moved by hand: offer the snap straight away.
-  let snapAvailable = mode === 'adjust' && !state.sheet.refined;
+  let snapAvailable = mode === 'adjust' && !state.sheet.refined && !unplaced();
 
   const accent = themeColor('--sm-accent', config.brand?.colors?.accent || FALLBACK_ACCENT);
 
@@ -84,7 +93,12 @@ export function mount(root, ctx) {
     iconEnd: 'arrow-right',
     disabled: mode === 'tap',
     onClick: () => {
-      if (isQuad(state.sheet.points)) ctx.go('door');
+      if (!isQuad(state.sheet.points)) return;
+      if (unplaced()) {
+        ctx.toast(t('sheet.error.untouched'), { type: 'info' });
+        return;
+      }
+      ctx.go('door');
     },
   });
 
@@ -108,12 +122,16 @@ export function mount(root, ctx) {
     ui.h('span', { text: t('sheet.restart') }),
   );
 
+  let banner = { text: t('sheet.banner.tap'), tone: 'info' };
+  if (mode === 'adjust') {
+    banner = unplaced()
+      ? { text: t('sheet.banner.manual'), tone: 'warning' }
+      : { text: t('sheet.banner.check'), tone: state.sheet.detected ? 'success' : 'info' };
+  }
+
   const mark = createMarkScreen(root, ctx, {
     title: t('sheet.title'),
-    banner:
-      mode === 'adjust'
-        ? { text: t('sheet.banner.check'), tone: state.sheet.detected ? 'success' : 'info' }
-        : { text: t('sheet.banner.tap'), tone: 'info' },
+    banner,
     labels: {
       nudge: t('sheet.nudge.label'),
       up: t('sheet.nudge.up'),
@@ -131,7 +149,9 @@ export function mount(root, ctx) {
       onTap,
     },
     onReady: (editor) => {
-      if (mode === 'adjust') editor.zoomToQuad(copyQuad(state.sheet.points));
+      if (mode !== 'adjust') return;
+      if (unplaced()) editor.zoomToQuad(copyQuad(state.sheet.points), MANUAL_ZOOM_PAD);
+      else editor.zoomToQuad(copyQuad(state.sheet.points));
     },
   });
   mark.chips.append(chip);
@@ -196,26 +216,31 @@ export function mount(root, ctx) {
     const sheetMm = getSheetMm(state, config);
     // A clean quad is not yet the sheet: a tap on a door panel or the step finds one too. Anything
     // the wrong shape or size for the chosen reference goes the manual way instead of being
-    // announced as found.
-    const found =
-      result &&
-      result.ok &&
-      isQuad(result.quad) &&
-      sheetOutlineIsPlausible(result.quad, sheetMm, photo.width, photo.height, config.measurement?.plausible);
-    if (found) {
-      state.sheet = { points: copyQuad(result.quad), refined: Boolean(result.refined), detected: true };
+    // announced as found, and an outline that detection itself is unsure of is only offered for
+    // checking (see sheetDetectionOutcome).
+    const outcome = sheetDetectionOutcome(result, sheetMm, photo.width, photo.height, config.measurement?.plausible);
+    if (outcome === 'found') {
+      state.sheet = { points: copyQuad(result.quad), refined: true, detected: true };
       showQuad('sheet.banner.check', 'success');
+    } else if (outcome === 'check') {
+      // Roughly where the sheet is, but not checked against its edges well enough to trust: a
+      // starting position for the handles, measured as hand-placed corners (refined: false).
+      state.sheet = { points: copyQuad(result.quad), refined: false, detected: false };
+      showQuad('sheet.banner.unsure', 'warning');
     } else {
       const quad = defaultSheetQuad(point, sheetMm, photo.width, photo.height);
-      state.sheet = { points: quad, refined: false, detected: false };
+      state.sheet = { points: quad, refined: false, detected: false, placed: false };
       showQuad('sheet.banner.manual', 'warning', MANUAL_ZOOM_PAD);
     }
   }
 
   function onChange(points, meta) {
     if (!meta.final || mode !== 'adjust') return;
+    // A press on a corner that left it exactly where it was is not an adjustment.
+    if (sameQuad(points, state.sheet.points)) return;
     state.sheet.points = points;
     state.sheet.refined = false;
+    state.sheet.placed = true;
     invalidateMeasurement(state);
     snapAvailable = true;
     render();
@@ -226,9 +251,14 @@ export function mount(root, ctx) {
     if (!editor || mode !== 'adjust') return;
     const points = editor.getPoints();
     if (!isQuad(points)) return;
+    // Handles dragged past one another still draw as a simple outline (see outlineOrder), and that
+    // outline is what the customer sees on the paper. Snap it in that order, then hand each corner
+    // back to its own handle so the selected one stays where it was.
+    const order = outlineOrder(points);
     let result = null;
     try {
-      result = refineQuad(getLuma(photo), points);
+      // The photo itself rather than its luma, so refineQuad has the colour to work with as well.
+      result = refineQuad(photo.image, order.map((handle) => points[handle]));
     } catch {
       result = null;
     }
@@ -236,11 +266,15 @@ export function mount(root, ctx) {
       ctx.toast(t('sheet.snap.fail'), { type: 'info' });
       return;
     }
+    const snapped = copyQuad(points);
+    order.forEach((handle, k) => {
+      snapped[handle] = { x: result.quad[k].x, y: result.quad[k].y };
+    });
     const hadFocus = root.ownerDocument.activeElement === snapBtn;
-    state.sheet.points = copyQuad(result.quad);
+    state.sheet.points = copyQuad(snapped);
     state.sheet.refined = true;
     invalidateMeasurement(state);
-    editor.setPoints(copyQuad(result.quad));
+    editor.setPoints(copyQuad(snapped));
     snapAvailable = false;
     render();
     mark.sync();

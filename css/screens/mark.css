@@ -97,7 +97,7 @@
 
 /* Spans the whole stage (it lets touches through) so the nudge pad can sit at
    the bottom or half-way up a side; mark-common.js picks whichever spot keeps
-   it off the corner handles. */
+   it off the outline and its corner handles. */
 .sm-mark .sm-mark__controls {
   top: 0;
   bottom: 0;
@@ -268,6 +268,38 @@
   content: '';
 }
 
+/* ---------- Nudge pad as a strip ---------- */
+
+/* Wherever the stage is tall enough (mark-common.js sets the class) the same
+   four arrows are stacked in one narrow column. At 44px wide it fits in the
+   margin beside the sheet or the door; the cross is three times as wide and
+   would sit on top of the outline the customer is checking. */
+.sm-mark .sm-mark__controls--strip .sm-mark__pad {
+  grid-template-rows: repeat(4, var(--sm-mark-hit));
+  grid-template-columns: var(--sm-mark-hit);
+  grid-template-areas:
+    'up'
+    'left'
+    'right'
+    'down';
+}
+
+.sm-mark .sm-mark__controls--strip .sm-mark__pad-hub {
+  display: none;
+}
+
+/* The two middle arrows are square, with one line between each pair of
+   neighbours: up and down keep their rounded outer ends from the cross. */
+.sm-mark .sm-mark__controls--strip .sm-mark__nudge--left {
+  border-width: 1px 1px 0;
+  border-radius: 0;
+}
+
+.sm-mark .sm-mark__controls--strip .sm-mark__nudge--right {
+  border-width: 1px;
+  border-radius: 0;
+}
+
 /* No corner selected: dim the pad and let touches through to the photo, so a
    handle underneath it can still be grabbed. */
 .sm-mark .sm-mark__pad--idle {
@@ -345,7 +377,7 @@
   display: inline-flex;
   flex: none;
   margin-top: 2px;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 /* Diagram parts: coloured from the theme so the illustration follows the skin. */

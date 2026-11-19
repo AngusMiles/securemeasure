@@ -29,7 +29,7 @@
   height: 80px;
   border-radius: calc(var(--sm-radius) * 0.7);
   background: var(--sm-bg);
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-screen--prepare .sm-prepare__art svg {

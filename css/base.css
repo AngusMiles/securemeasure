@@ -67,6 +67,11 @@
   /* A skin's accent may be a light colour made for dark text on top (amber, yellow), so on its own
      it is not readable as text: accent-toned labels lean on the text colour instead. */
   --sm-ink-accent: var(--sm-text);
+  /* The primary colour where it is drawn as text or an icon on the surface and page colours (header
+     name, links, outline buttons). A light brand colour cannot be read there, so those uses have a
+     property of their own: js/theme.js can point it at the text colour without touching the fills
+     and borders that use --sm-primary. */
+  --sm-ink-primary: var(--sm-primary);
   --sm-ink-success: var(--sm-success);
   --sm-ink-warning: var(--sm-warning);
   --sm-ink-danger: var(--sm-danger);
@@ -174,7 +179,7 @@ ol {
 }
 
 a {
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
   text-underline-offset: 2px;
 }
 
@@ -272,7 +277,7 @@ h1[tabindex="-1"]:focus {
   border: 0;
   border-radius: 50%;
   background: transparent;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
   cursor: pointer;
 }
 
@@ -289,7 +294,7 @@ h1[tabindex="-1"]:focus {
 
 .sm-brand__name {
   overflow: hidden;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
   font-size: var(--sm-text-lg);
   font-weight: 700;
   letter-spacing: -0.02em;
@@ -356,6 +361,16 @@ h1[tabindex="-1"]:focus {
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+  /* The sticky action bar covers the bottom of this scroller. Without this, a field brought into view by
+     Tab or the keyboard's Next key stops underneath the bar. js/app.js sets --sm-actionbar-h to the
+     height of the bar on screen (0px when there is none); the fallback is a typical two-button bar. */
+  scroll-padding-bottom: calc(var(--sm-actionbar-h, 150px) + var(--sm-space-3));
+}
+
+/* The bar's own buttons sit inside that padded strip and are always in view. With the padding left on,
+   tabbing onto one would scroll the page in an attempt to lift the button out of the strip. */
+.sm-main:has(> .sm-screen > .sm-actionbar:focus-within) {
+  scroll-padding-bottom: 0;
 }
 
 .sm-screen {
@@ -429,7 +444,7 @@ h1[tabindex="-1"]:focus {
 }
 
 .sm-eyebrow {
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -470,7 +485,7 @@ h1[tabindex="-1"]:focus {
   border: 1px solid transparent;
   border-radius: var(--sm-radius);
   background: transparent;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
   font-family: inherit;
   font-size: var(--sm-text-md);
   font-weight: 600;
@@ -536,12 +551,12 @@ h1[tabindex="-1"]:focus {
 .sm-btn--secondary {
   background: var(--sm-surface);
   border-color: var(--sm-line-strong);
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-btn--ghost {
   background: transparent;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-btn--danger {
@@ -688,7 +703,7 @@ h1[tabindex="-1"]:focus {
   flex: none;
   display: inline-flex;
   margin-top: 1px;
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-banner__text {
@@ -965,7 +980,7 @@ h1[tabindex="-1"]:focus {
 }
 
 .sm-seg__input:checked + .sm-seg__body .sm-seg__label {
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 /* ---------- Radio cards ---------- */

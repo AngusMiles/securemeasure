@@ -35,7 +35,7 @@
   height: 44px;
   border-radius: calc(var(--sm-radius) * 0.7);
   background: var(--sm-bg);
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-screen--welcome .sm-welcome__item-text {
@@ -106,7 +106,7 @@
   border: 1px solid var(--sm-border);
   border-radius: 50%;
   background: var(--sm-surface);
-  color: var(--sm-primary);
+  color: var(--sm-ink-primary);
 }
 
 .sm-screen--welcome .sm-welcome__step-num {

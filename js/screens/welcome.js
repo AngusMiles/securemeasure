@@ -19,7 +19,7 @@ export const strings = {
   'welcome.need.paper.fallback': 'A4 paper',
   'welcome.need.paper.detail': 'Any plain sheet. It gives your photo its scale.',
   'welcome.need.tape': 'Tape or Blu Tack',
-  'welcome.need.tape.detail': 'To hold the sheet flat on your door.',
+  'welcome.need.tape.detail': 'To hold the sheet flat on your door, at the corners only.',
   'welcome.need.phone': 'Your phone',
   'welcome.need.phone.detail': 'One photo of the whole door does it.',
   'welcome.how.title': 'How it works',
@@ -205,10 +205,18 @@ function defaultReferenceLabel(measurement) {
  * Point the state at an A4 reference so the demo photo measures correctly even if the customer
  * had chosen another sheet (or the company's default is not A4).
  *
+ * That choice is not lost: it is set aside in state.ownReference for as long as the demo photo is
+ * loaded. The prepare screen shows and edits it there, and puts it back into the state when the
+ * customer's own photo replaces the demo photo.
+ *
  * @param {object} state        shared app state (mutated)
  * @param {object} measurement  config.measurement
  */
 function selectDemoReference(state, measurement) {
+  // A second go at the demo finds the demo's A4 in the state, which is not the customer's choice.
+  if (!state.ownReference) {
+    state.ownReference = { referenceId: state.referenceId, customReference: state.customReference };
+  }
   const references = Array.isArray(measurement.references) ? measurement.references : [];
   const a4 = references.find(
     (ref) =>

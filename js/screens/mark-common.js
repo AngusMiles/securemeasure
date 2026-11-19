@@ -7,7 +7,7 @@
  * translated labels in, so every string stays under that screen's `strings`.
  */
 
-import { QuadEditor } from '../editor.js';
+import { QuadEditor, outlineOrder } from '../editor.js';
 
 const HOLD_DELAY_MS = 350;
 const HOLD_INTERVAL_MS = 80;
@@ -22,12 +22,18 @@ const SHEET_SIZE_ALLOWANCE = 1.3;
 // A door filling under 30% of the photo's long side is too small to measure from in any case.
 const SHEET_MIN_DOOR_SPAN = 0.3;
 const FALLBACK_DOOR_HEIGHT_MM = { min: 1500, max: 2800 };
+// detectSheet's confidence below which even a sub-pixel outline is only a suggestion. A clean sheet
+// scores above about 0.9; 0.5 is what is left when the worst side is ragged or thinly supported.
+const SHEET_FOUND_CONFIDENCE = 0.7;
 // zoomToQuad / resetView animate for about 220 ms and the editor has no "view
 // settled" callback, so the nudge pad is placed again once the photo is at rest.
 const VIEW_SETTLE_MS = 300;
 // Same as the editor's grab radius: with this much room around a handle, every
 // press that would grab it lands on the photo rather than on the pad.
 const PAD_CLEARANCE_PX = 28;
+// The pad as a strip is four 44 px arrows tall. A stage shorter than this (a
+// phone on its side) cannot hold it below the chips, so the pad stays a cross.
+const PAD_STRIP_MIN_STAGE_PX = 260;
 // Where the nudge pad may float, in order of preference: bottom-left,
 // bottom-right, then half-way up either side (see mark.css).
 const PAD_PLACEMENTS = [
@@ -88,6 +94,18 @@ export function isQuad(points) {
 }
 
 /**
+ * True when two quads have the same four points in the same order. The screens use this so that a
+ * "final" change leaving every handle exactly where it was never counts as an edit (js/editor.js
+ * only reports one after a real move, and this keeps the screens right whatever it reports).
+ * @param {unknown} a
+ * @param {unknown} b
+ * @returns {boolean}
+ */
+export function sameQuad(a, b) {
+  return isQuad(a) && isQuad(b) && a.every((p, i) => p.x === b[i].x && p.y === b[i].y);
+}
+
+/**
  * Drop everything worked out from the marked corners, because a corner has just
  * changed: the measurement, and the size if it came from that measurement. A
  * size the customer typed in is theirs and stays.
@@ -111,6 +129,66 @@ export function clearanceFromRect(points, rect) {
     const dx = Math.max(rect.left - p.x, 0, p.x - rect.right);
     const dy = Math.max(rect.top - p.y, 0, p.y - rect.bottom);
     nearest = Math.min(nearest, Math.hypot(dx, dy));
+  }
+  return nearest;
+}
+
+/**
+ * Distance from a rectangle to the straight line between two points; 0 when the line touches it.
+ * @param {Point} a
+ * @param {Point} b
+ * @param {{ left: number, top: number, right: number, bottom: number }} rect
+ * @returns {number}
+ */
+function segmentClearance(a, b, rect) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  // Clip the line to the rectangle (Liang-Barsky): if any of it is left, they touch.
+  let from = 0;
+  let to = 1;
+  let touches = true;
+  for (const [step, room] of [
+    [-dx, a.x - rect.left],
+    [dx, rect.right - a.x],
+    [-dy, a.y - rect.top],
+    [dy, rect.bottom - a.y],
+  ]) {
+    if (step === 0) {
+      if (room < 0) touches = false;
+    } else if (step < 0) {
+      from = Math.max(from, room / step);
+    } else {
+      to = Math.min(to, room / step);
+    }
+  }
+  if (touches && from <= to) return 0;
+  // Apart: the gap is narrowest at an end of the line or at a corner of the rectangle.
+  let nearest = clearanceFromRect([a, b], rect);
+  const lengthSq = dx * dx + dy * dy;
+  for (const cx of [rect.left, rect.right]) {
+    for (const cy of [rect.top, rect.bottom]) {
+      const t = lengthSq > 0 ? clamp(((cx - a.x) * dx + (cy - a.y) * dy) / lengthSq, 0, 1) : 0;
+      nearest = Math.min(nearest, Math.hypot(a.x + t * dx - cx, a.y + t * dy - cy));
+    }
+  }
+  return nearest;
+}
+
+/**
+ * Distance from a rectangle to the outline drawn through some corner points, joined the way the
+ * editor joins them; 0 when the outline runs through the rectangle. Never more than
+ * clearanceFromRect for the same points, since the corners are part of the outline.
+ * @param {Point[]} points
+ * @param {{ left: number, top: number, right: number, bottom: number }} rect Same coordinates as the points.
+ * @returns {number} Infinity when there are no points.
+ */
+export function outlineClearanceFromRect(points, rect) {
+  if (points.length < 2) return clearanceFromRect(points, rect);
+  const order = outlineOrder(points);
+  let nearest = Infinity;
+  for (let i = 0; i < order.length; i += 1) {
+    const next = order[(i + 1) % order.length];
+    nearest = Math.min(nearest, segmentClearance(points[order[i]], points[next], rect));
   }
   return nearest;
 }
@@ -227,6 +305,28 @@ export function sheetOutlineIsPlausible(quad, sheetMm, imageWidth, imageHeight, 
   const reach = Math.max(imageWidth, imageHeight) * Math.max(a, b);
   const longest = Math.max(...sides);
   return longest <= (SHEET_SIZE_ALLOWANCE * reach) / minDoor && longest >= (SHEET_MIN_DOOR_SPAN * reach) / maxDoor;
+}
+
+/**
+ * What the sheet screen makes of detectSheet's answer to a tap:
+ *  - 'found': an outline of the right shape and size whose sides were each located to sub-pixel
+ *    accuracy with good support. Only this is announced as the sheet.
+ *  - 'check': an outline of the right shape and size that detection itself is unsure of, either the
+ *    coarse outline of the tapped region (`refined: false`, never checked against an edge) or a
+ *    refined one with low confidence. A starting position the customer is asked to check.
+ *  - 'manual': nothing usable (see sheetOutlineIsPlausible); the customer places the corners.
+ * @param {{ ok?: boolean, quad?: Point[] | null, refined?: boolean, confidence?: number } | null} result What detectSheet returned.
+ * @param {{ w: number, h: number }} sheetMm Reference side lengths (either way round).
+ * @param {number} imageWidth
+ * @param {number} imageHeight
+ * @param {{ minHeightMm?: number, maxHeightMm?: number }} [plausible] config.measurement.plausible.
+ * @returns {'found' | 'check' | 'manual'}
+ */
+export function sheetDetectionOutcome(result, sheetMm, imageWidth, imageHeight, plausible) {
+  if (!result || !result.ok || !sheetOutlineIsPlausible(result.quad, sheetMm, imageWidth, imageHeight, plausible)) {
+    return 'manual';
+  }
+  return result.refined === true && result.confidence >= SHEET_FOUND_CONFIDENCE ? 'found' : 'check';
 }
 
 /**
@@ -386,7 +486,7 @@ export function holdToRepeat(button, action, options = {}) {
  * @property {string} [editor.ariaLabel]
  * @property {{ points: Point[], color: string } | null} [editor.ghost]
  * @property {(points: Point[], meta: { final: boolean, index: number | null }) => void} [editor.onChange] Receives a detached copy of the points.
- * @property {(point: Point) => void} [editor.onTap]
+ * @property {(point: Point) => void} [editor.onTap] A tap on the photo away from the handles. While there is no quad, Enter or Space on the photo counts as a tap in the middle of the view, so the step can be done from a keyboard.
  * @property {(editor: QuadEditor) => void} [onReady] Called once, right after the editor is created.
  */
 
@@ -534,18 +634,42 @@ export function createMarkScreen(root, ctx, opts) {
   }
 
   /**
-   * Keep the pad off the corner handles. While its arrows are live, a handle
-   * underneath it cannot be grabbed, and a press meant for that handle would
-   * nudge the selected corner instead.
+   * Keep the pad off the outline, so it never hides part of what the customer
+   * is checking, and failing that at least off the corner handles. While its
+   * arrows are live, a handle underneath it cannot be grabbed, and a press
+   * meant for that handle would nudge the selected corner instead.
    */
   function placePad(points) {
     const handles = handlesOnScreen(points);
     if (!handles) return;
-    const clearanceOf = (candidate) => {
-      applyPlacement(candidate);
-      return clearanceFromRect(handles, pad.getBoundingClientRect());
+    const start = placement;
+    // Each spot is laid out and measured at most once per pass.
+    const rects = new Map();
+    const padRectAt = (candidate) => {
+      if (!rects.has(candidate)) {
+        applyPlacement(candidate);
+        rects.set(candidate, pad.getBoundingClientRect());
+      }
+      return rects.get(candidate);
     };
-    applyPlacement(choosePadPlacement(placement, PAD_PLACEMENTS, clearanceOf, PAD_CLEARANCE_PX));
+    const offOutline = (candidate) => outlineClearanceFromRect(handles, padRectAt(candidate));
+    const offHandles = (candidate) => clearanceFromRect(handles, padRectAt(candidate));
+    let next = choosePadPlacement(start, PAD_PLACEMENTS, offOutline, PAD_CLEARANCE_PX);
+    if (offOutline(next) < PAD_CLEARANCE_PX) {
+      // No spot is clear of the whole outline: the photo is zoomed right in, or the quad fills it.
+      next = choosePadPlacement(start, PAD_PLACEMENTS, offHandles, PAD_CLEARANCE_PX);
+    }
+    applyPlacement(next);
+  }
+
+  /** The image point in the middle of the photo stage, as zoomed and panned right now. */
+  function viewCentre() {
+    const view = editor && typeof editor.getView === 'function' ? editor.getView() : null;
+    if (!view || !(view.scale > 0)) return { x: photo.width / 2, y: photo.height / 2 };
+    return {
+      x: clamp((canvasHost.clientWidth / 2 - view.tx) / view.scale, 0, photo.width - 1),
+      y: clamp((canvasHost.clientHeight / 2 - view.ty) / view.scale, 0, photo.height - 1),
+    };
   }
 
   function sync() {
@@ -554,6 +678,10 @@ export function createMarkScreen(root, ctx, opts) {
     const hasQuad = isQuad(points);
     const active = hasQuad ? editor.getActive() : null;
     const enabled = Number.isInteger(active) && active >= 0 && active < 4;
+
+    // A narrow strip wherever the stage is tall enough for one (see mark.css):
+    // it fits in the margin beside the sheet or the door instead of over them.
+    controls.classList.toggle('sm-mark__controls--strip', stage.clientHeight >= PAD_STRIP_MIN_STAGE_PX);
 
     // A quad that has only just appeared is usually still being zoomed to: the
     // pad stays hidden until the view is at rest, so it shows up in its final spot.
@@ -619,6 +747,21 @@ export function createMarkScreen(root, ctx, opts) {
   cleanups.push(() => {
     for (const type of stageEvents) stage.removeEventListener(type, onStageActivity, stageListenerOptions);
   });
+
+  // The editor only reports taps made with a pointer. So that marking the sheet
+  // does not need one, Enter or Space on the photo stands in for a tap in the
+  // middle of the view while there are no corners yet. Once there are, the
+  // editor's own keys (Tab, arrows) take over and this does nothing.
+  const onPhotoKey = (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    // defaultPrevented: an editor that handles the key itself has already made the tap.
+    if (event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!opts.editor.onTap || !editor || isQuad(editor.getPoints())) return;
+    event.preventDefault();
+    opts.editor.onTap(viewCentre());
+  };
+  canvasHost.addEventListener('keydown', onPhotoKey);
+  cleanups.push(() => canvasHost.removeEventListener('keydown', onPhotoKey));
 
   if (typeof ResizeObserver === 'function') {
     const observer = new ResizeObserver(scheduleLayout);

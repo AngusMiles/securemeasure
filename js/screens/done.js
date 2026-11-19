@@ -35,9 +35,15 @@ export const strings = {
   'done.next1': 'We call you to book a free check measure.',
   'done.next2': 'We confirm your final price.',
   'done.next3': 'We make and fit your door.',
+  // Used instead of done.next3 when the enquiry does not include installation.
+  'done.next3Supply': 'We make your door.',
   'done.call': 'Call us on {phone}',
-  'done.mailtoNote': 'One more step: your email app should have opened with your enquiry filled in. Press send there to finish.',
+  // Email-link (lead.mailto) mode: these two replace the title and message until the customer has pressed send.
+  'done.mailtoTitle': 'One more step: send the email',
+  'done.mailtoNote': "Your email app should have opened with your enquiry filled in. Press send there and we'll be in touch.",
   'done.mailtoRetry': 'Open the email again',
+  // Shown when the size came from the bundled demo photo (not the same thing as demo mode below).
+  'done.demoDoor': 'You measured our demo door, not your own, so this enquiry is marked as a demo.',
   'done.demoSummary': 'Demo mode: this is what would be sent to your system',
   'done.demoHint': 'Nothing was sent. Set lead.endpoint or lead.mailto in js/config.js to start receiving enquiries.',
   'done.payloadLabel': 'Enquiry data',
@@ -66,32 +72,36 @@ export function mount(root, ctx) {
   const { payload, result } = ctx.state.submission;
   const mode = result?.mode;
   const phone = String(config.brand?.phone ?? '').trim();
+  // Nothing has reached the company until the customer presses send in their email app, so in
+  // email-link mode the screen asks for that last step instead of saying the enquiry is in.
+  const awaitingEmail = mode === 'mailto';
 
-  const parts = [
-    ui.h('div', { class: 'sm-done-mark', attrs: { 'aria-hidden': 'true' } }, ui.icon('check', 44)),
-    ui.screenHeader({
-      title: config.lead?.successTitle || t('done.title'),
-      subtitle: config.lead?.successMessage || t('done.message'),
-    }),
-  ];
+  // Wording set through config.text wins, as it does for every other id; then the lead setting.
+  const worded = (key, leadSetting) => (hasText(config, key) ? t(key) : leadSetting || t(key));
 
-  if (mode === 'mailto') {
-    // Nothing has reached the company until the customer presses send in their email app.
+  const parts = [];
+  if (awaitingEmail) {
     parts.push(
-      ui.h(
-        'div',
-        { class: 'sm-stack' },
-        ui.banner(t('done.mailtoNote'), { tone: 'info', icon: 'info' }),
-        ui.button(t('done.mailtoRetry'), {
-          variant: 'secondary',
-          size: 'md',
-          onClick: () => {
-            submitLead(config, payload).catch(() => {});
-          },
-        }),
-      ),
+      ui.screenHeader({ title: t('done.mailtoTitle'), subtitle: t('done.mailtoNote') }),
+      ui.button(t('done.mailtoRetry'), {
+        variant: 'secondary',
+        size: 'md',
+        onClick: () => {
+          submitLead(config, payload).catch(() => {});
+        },
+      }),
+    );
+  } else {
+    parts.push(
+      ui.h('div', { class: 'sm-done-mark', attrs: { 'aria-hidden': 'true' } }, ui.icon('check', 44)),
+      ui.screenHeader({
+        title: worded('done.title', config.lead?.successTitle),
+        subtitle: worded('done.message', config.lead?.successMessage),
+      }),
     );
   }
+
+  if (payload.demo === true) parts.push(ui.banner(t('done.demoDoor'), { tone: 'info' }));
 
   if (payload.reference) {
     const refChip = ui.chip(String(payload.reference), { tone: 'neutral' });
@@ -185,6 +195,8 @@ export function mount(root, ctx) {
   }
 
   function buildNextSteps() {
+    // Fitting is only promised when the enquiry includes installation, as the summary above says.
+    const lastStep = installationIncluded(config, payload) ? 'done.next3' : 'done.next3Supply';
     return ui.card(
       { class: 'sm-done-next' },
       ui.h('h2', { class: 'sm-done-heading' }, t('done.nextHeading')),
@@ -192,10 +204,29 @@ export function mount(root, ctx) {
         'ol',
         // Safari drops list semantics once list-style is none; the role restores them.
         { class: 'sm-done-next__list', attrs: { role: 'list' } },
-        ['done.next1', 'done.next2', 'done.next3'].map((key) => ui.h('li', null, ui.h('span', null, t(key)))),
+        ['done.next1', 'done.next2', lastStep].map((key) => ui.h('li', null, ui.h('span', null, t(key)))),
       ),
     );
   }
+}
+
+/** True when the company set this wording through config.text. */
+function hasText(config, key) {
+  const text = config.text;
+  return (
+    text != null && Object.prototype.hasOwnProperty.call(text, key) && typeof text[key] === 'string' && text[key] !== ''
+  );
+}
+
+/**
+ * Whether this enquiry includes installation, resolved the way calculateQuote resolves it
+ * (always when it is not optional; otherwise the customer's choice, or the config default).
+ */
+function installationIncluded(config, payload) {
+  const installation = config.pricing?.installation;
+  if (!installation?.enabled) return false;
+  if (installation.optional === false) return true;
+  return typeof payload.includeInstallation === 'boolean' ? payload.includeInstallation : Boolean(installation.default);
 }
 
 /**
@@ -222,12 +253,7 @@ function selectedOptions(config, payload, t) {
 
   const installation = pricing.installation;
   if (installation?.enabled) {
-    const included =
-      installation.optional === false
-        ? true
-        : typeof payload.includeInstallation === 'boolean'
-          ? payload.includeInstallation
-          : Boolean(installation.default);
+    const included = installationIncluded(config, payload);
     rows.push([installation.label || t('done.installation'), t(included ? 'done.included' : 'done.notIncluded')]);
   }
   return rows;

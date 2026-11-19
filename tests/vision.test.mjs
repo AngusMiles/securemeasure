@@ -10,6 +10,7 @@ import {
   maxCornerError,
   mulberry32,
   band,
+  shadeBeyond,
   disc,
   offsetQuad,
   homographyFrom4,
@@ -355,6 +356,145 @@ test('refineQuad leaves a side alone when it genuinely steps the other way (shee
   }
 });
 
+// A pale door, and sheets of the kind the app suggests for one. Each is about as dark as the shadow it
+// casts, so in luminance the paper's own edge all but vanishes beside the far edge of that shadow.
+const PALE_DOOR = [236, 233, 226];
+const COLOURED_SHEETS = { blue: [63, 127, 208], kraft: [185, 141, 92], orange: [240, 138, 36], 'light green': [159, 216, 154] };
+
+// Pale, pastel and grey sheets: their shadow is the same sort of colour as the paper, only a little darker.
+// (Cream and a paler grey are too close to this door's colour to be outlined at all.)
+const PALE_SHEETS = { 'pastel pink': [255, 209, 220], lavender: [216, 205, 234], 'light grey': [200, 200, 200] };
+
+/**
+ * A coloured sheet on the pale door with a hard shadow `shadowPx` wide down its right and bottom sides,
+ * the door in it `shade` times as bright.
+ */
+function shadowedSheetShapes(truth, sheetColor, shadowPx, shade = 0.6) {
+  const shadow = truth.map((p) => ({ x: p.x + shadowPx, y: p.y + shadowPx }));
+  return [{ points: shadow, color: PALE_DOOR.map((v) => v * shade) }, { points: truth, color: sheetColor }];
+}
+
+test('refineQuad given the photo refuses a side that settles on the far edge of the sheet\'s shadow', (t) => {
+  const truth = poseQuad({ cx: 400.3, cy: 300.4, w: 168, h: 238, rotDeg: 3, yawDeg: 6 });
+  const rng = mulberry32(71);
+  let refused = 0;
+  let worstAccepted = 0;
+  for (const [name, sheetColor] of Object.entries(COLOURED_SHEETS)) {
+    for (const shadowPx of [4, 6]) {
+      const image = renderSynth({
+        width: 800,
+        height: 600,
+        background: PALE_DOOR,
+        shapes: shadowedSheetShapes(truth, sheetColor, shadowPx),
+        blurSigma: 0.9,
+        noiseSigma: 2,
+        seed: 23,
+      });
+      for (let rep = 0; rep < 2; rep++) {
+        const start = perturbQuad(truth, 3, rng);
+        const res = refineQuad(image, start);
+        // Never "ok" with a side on the shadow: either the paper's own edges were found, or it says so
+        // and hands the corners back untouched.
+        if (res.ok) {
+          worstAccepted = Math.max(worstAccepted, ...cornerErrors(res.quad, truth));
+        } else {
+          refused++;
+          assert.equal(res.reason, 'off_sheet', `${name}, ${shadowPx} px shadow`);
+          assert.deepEqual(res.quad, start);
+        }
+        // A luma plane has no colour to go by; the check can be switched off for the photo as well.
+        const unchecked = refineQuad(image, start, { checkColour: false });
+        assert.ok(unchecked.ok, unchecked.reason);
+        assert.ok(Math.max(...cornerErrors(unchecked.quad, refineQuad(toLuma(image), start).quad)) < 0.02);
+      }
+    }
+    // Without the shadow there is nothing to be wary of.
+    const shapes = [{ points: truth, color: sheetColor }];
+    const plain = renderSynth({ width: 800, height: 600, background: PALE_DOOR, shapes, blurSigma: 0.9, noiseSigma: 2, seed: 24 });
+    const res = refineQuad(plain, perturbQuad(truth, 3, rng));
+    assert.ok(res.ok, `${name}, no shadow: ${res.reason}`);
+    assert.ok(Math.max(...cornerErrors(res.quad, truth)) < 0.25, `${name}, no shadow`);
+  }
+  t.diagnostic(`coloured sheet beside its shadow: ${refused} of 16 snaps refused, worst accepted corner ${worstAccepted.toFixed(3)} px off`);
+  assert.ok(worstAccepted < 0.75, `an accepted snap is ${worstAccepted.toFixed(2)} px off the paper`);
+  assert.ok(refused >= 12, `only ${refused} of 16 refused`);
+});
+
+test('refineQuad given the photo refuses the shadow edge of a pale, pastel or grey sheet too', (t) => {
+  // The shadow is darker than the paper but close to it in colour, so only the paper further in on the
+  // same side tells the two apart.
+  const truth = poseQuad({ cx: 400.3, cy: 300.4, w: 168, h: 238, rotDeg: 3, yawDeg: 6 });
+  const rng = mulberry32(73);
+  let refused = 0;
+  let worstAccepted = 0;
+  for (const [name, sheetColor] of Object.entries(PALE_SHEETS)) {
+    for (const shade of [0.6, 0.8]) {
+      for (const shadowPx of [4, 6]) {
+        const shapes = shadowedSheetShapes(truth, sheetColor, shadowPx, shade);
+        const image = renderSynth({ width: 800, height: 600, background: PALE_DOOR, shapes, blurSigma: 0.9, noiseSigma: 2, seed: 23 });
+        for (let rep = 0; rep < 2; rep++) {
+          const start = perturbQuad(truth, 3, rng);
+          const res = refineQuad(image, start);
+          if (res.ok) {
+            worstAccepted = Math.max(worstAccepted, ...cornerErrors(res.quad, truth));
+          } else {
+            refused++;
+            assert.equal(res.reason, 'off_sheet', `${name}, shadow x${shade}, ${shadowPx} px`);
+          }
+        }
+      }
+    }
+    // Without the shadow the paper's own edges are found as usual.
+    const plain = renderSynth({ width: 800, height: 600, background: PALE_DOOR, shapes: [{ points: truth, color: sheetColor }], blurSigma: 0.9, noiseSigma: 2, seed: 24 });
+    const res = refineQuad(plain, perturbQuad(truth, 3, rng));
+    assert.ok(res.ok, `${name}, no shadow: ${res.reason}`);
+    assert.ok(Math.max(...cornerErrors(res.quad, truth)) < 0.25, `${name}, no shadow`);
+  }
+  t.diagnostic(`pale sheet beside its shadow: ${refused} of 24 snaps refused, worst accepted corner ${worstAccepted.toFixed(3)} px off`);
+  assert.ok(worstAccepted < 0.75, `an accepted snap is ${worstAccepted.toFixed(2)} px off the paper`);
+  assert.ok(refused >= 20, `only ${refused} of 24 refused`);
+});
+
+test('refineQuad given the photo does not take a soft edge on a dark sheet for the sheet\'s shadow', () => {
+  // In a soft photo the door's colour is blurred in across the real edge of a black, grey or navy sheet,
+  // and the strip just inside that edge is then a dimmed version of the pale door, as a shadow would be.
+  const truth = poseQuad({ cx: 400.3, cy: 300.4, w: 168, h: 238, rotDeg: 3, yawDeg: 6 });
+  const rng = mulberry32(72);
+  for (const sheetColor of [[32, 32, 32], [96, 96, 96], [28, 43, 85]]) {
+    for (const blurSigma of [1.5, 2.5, 3, 4]) {
+      const shapes = [{ points: truth, color: sheetColor }];
+      const image = renderSynth({ width: 800, height: 600, background: PALE_DOOR, shapes, blurSigma, noiseSigma: 2, seed: 25 });
+      const res = refineQuad(image, perturbQuad(truth, 3, rng));
+      assert.ok(res.ok, `sheet ${sheetColor}, blur ${blurSigma}: ${res.reason}`);
+      assert.ok(Math.max(...cornerErrors(res.quad, truth)) < 0.25, `sheet ${sheetColor}, blur ${blurSigma}`);
+    }
+  }
+});
+
+test('refineQuad given the photo does not take a sharpening halo round a sheet on a pale door for its shadow', () => {
+  // A sharpened photo: a dark rim just inside the sheet's edge and a light one just outside it, in
+  // proportion to the step (lost to white where the door is already near white). The dark rim is darker
+  // than the paper further in, as a faint shadow would be.
+  const truth = poseQuad({ cx: 400.3, cy: 300.4, w: 168, h: 238, rotDeg: 3, yawDeg: 6 });
+  const rng = mulberry32(74);
+  for (const door of [PALE_DOOR, [250, 249, 246]]) {
+    for (const sheetColor of [[32, 32, 32], [96, 96, 96], [28, 43, 85], [140, 140, 138], [200, 200, 200]]) {
+      for (const strength of [0.15, 0.3]) {
+        const shapes = [
+          { points: offsetQuad(truth, 1.5), color: door.map((v, c) => Math.min(255, v + strength * (v - sheetColor[c]))) },
+          { points: truth, color: sheetColor.map((v, c) => Math.max(0, v - strength * (door[c] - v))) },
+          { points: offsetQuad(truth, -1.5), color: sheetColor },
+        ];
+        const image = renderSynth({ width: 800, height: 600, background: door, shapes, blurSigma: 0.7, noiseSigma: 2, seed: 26 });
+        const res = refineQuad(image, perturbQuad(truth, 3, rng));
+        const what = `sheet ${sheetColor} on door ${door}, halo ${strength}`;
+        assert.ok(res.ok, `${what}: ${res.reason}`);
+        assert.ok(Math.max(...cornerErrors(res.quad, truth)) < 0.25, what);
+      }
+    }
+  }
+});
+
 test('refineQuad reports ok:false on featureless regions and returns the input quad unchanged', () => {
   const quad = [
     { x: 100, y: 100 },
@@ -607,6 +747,131 @@ test('detectSheet finds the sheet from a tap right on its edge, and still reject
   }
 });
 
+test('detectSheet does not call a coloured sheet refined when a side will only sit on its shadow', (t) => {
+  const door = poseQuad({ cx: 600, cy: 800, w: 500, h: 1250, yawDeg: -7 });
+  const truth = poseQuad({ cx: 603.3, cy: 640.8, w: 140, h: 198, rotDeg: -4, yawDeg: -7 });
+  let heldBack = 0;
+  let worst = 0;
+  for (const [name, sheetColor] of Object.entries(COLOURED_SHEETS)) {
+    for (const shadowPx of [4, 6]) {
+      const image = renderSynth({
+        width: 1200,
+        height: 1600,
+        background: [170, 160, 150],
+        shapes: [{ points: door, color: PALE_DOOR }, ...shadowedSheetShapes(truth, sheetColor, shadowPx)],
+        blurSigma: 0.9,
+        noiseSigma: 2,
+        seed: 5,
+      });
+      const what = `${name}, ${shadowPx} px shadow`;
+      // With or without the luma plane the sheet screen hands over.
+      for (const opts of [undefined, { luma: toLuma(image) }]) {
+        const res = detectSheet(image, centreOf(truth), opts);
+        assert.ok(res.ok, `${what}: ${res.reason}`);
+        const error = maxCornerError(res.quad, truth);
+        worst = Math.max(worst, error);
+        // The sides are put back on the paper by colour, and the outline is offered as unrefined.
+        assert.ok(error < 1.5, `${what}: corner ${error.toFixed(2)} px off the paper`);
+        if (res.refined) continue;
+        heldBack++;
+        assert.equal(res.reason, 'off_sheet', what);
+        assert.ok(res.confidence < 0.5, `${what}: confidence ${res.confidence}`);
+      }
+    }
+  }
+  t.diagnostic(`coloured sheet beside its shadow: ${heldBack} of 16 outlines held back as unrefined, worst corner ${worst.toFixed(2)} px off`);
+  assert.ok(heldBack >= 12, `only ${heldBack} of 16 were held back`);
+});
+
+test('detectSheet does not call a pale or grey sheet refined when a side will only sit on its shadow', (t) => {
+  // Lavender and light grey: their shadow is darker than the paper but close to it in colour.
+  // (A pastel pink is too close to this door's colour to be outlined at all.)
+  const door = poseQuad({ cx: 600, cy: 800, w: 500, h: 1250, yawDeg: -7 });
+  const truth = poseQuad({ cx: 603.3, cy: 640.8, w: 140, h: 198, rotDeg: -4, yawDeg: -7 });
+  let heldBack = 0;
+  let worst = 0;
+  for (const name of ['lavender', 'light grey']) {
+    for (const shade of [0.6, 0.8]) {
+      for (const shadowPx of [4, 6]) {
+        const image = renderSynth({
+          width: 1200,
+          height: 1600,
+          background: [170, 160, 150],
+          shapes: [{ points: door, color: PALE_DOOR }, ...shadowedSheetShapes(truth, PALE_SHEETS[name], shadowPx, shade)],
+          blurSigma: 0.9,
+          noiseSigma: 2,
+          seed: 5,
+        });
+        const what = `${name}, shadow x${shade}, ${shadowPx} px`;
+        const res = detectSheet(image, centreOf(truth), { luma: toLuma(image) });
+        assert.ok(res.ok, `${what}: ${res.reason}`);
+        const error = maxCornerError(res.quad, truth);
+        worst = Math.max(worst, error);
+        assert.ok(error < 1.5, `${what}: corner ${error.toFixed(2)} px off the paper`);
+        if (res.refined) continue;
+        heldBack++;
+        assert.equal(res.reason, 'off_sheet', what);
+        assert.ok(res.confidence < 0.5, `${what}: confidence ${res.confidence}`);
+      }
+    }
+  }
+  t.diagnostic(`pale sheet beside its shadow: ${heldBack} of 8 outlines held back as unrefined, worst corner ${worst.toFixed(2)} px off`);
+  assert.ok(heldBack >= 6, `only ${heldBack} of 8 were held back`);
+});
+
+test('detectSheet is not put off by a shadow line that misses the sheet, by shade over all of it, or by tape', () => {
+  const door = poseQuad({ cx: 600, cy: 800, w: 520, h: 1300, yawDeg: 5 });
+  const sheet = poseQuad({ cx: 601.3, cy: 650.6, w: 150, h: 212, rotDeg: 2, yawDeg: 5 });
+  const c = centreOf(sheet);
+  // The shadow's edge as a line a -> b, with the shade on its left.
+  const level = (y) => [{ x: 0, y }, { x: 1200, y }];
+  const upright = (x) => [{ x, y: 1600 }, { x, y: 0 }];
+  const lines = {
+    'line 8 px above the sheet': level(sheet[0].y - 8),
+    'line 30 px above the sheet': level(sheet[0].y - 32),
+    'line 8 px below the sheet (all of it in shade)': level(sheet[2].y + 8),
+    'line 40 px below the sheet (all of it in shade)': level(sheet[2].y + 40),
+    'upright line 8 px left of the sheet': upright(sheet[3].x - 8),
+    'upright line 8 px right of the sheet (all of it in shade)': upright(sheet[1].x + 8),
+  };
+  for (const doorColor of [DARK_DOOR, [150, 152, 150]]) {
+    const lit = doorScene({ width: 1200, height: 1600, door, sheet, doorColor, seed: 9 });
+    for (const [name, [a, b]] of Object.entries(lines)) {
+      const image = shadeBeyond({ ...lit, data: new Uint8ClampedArray(lit.data) }, a, b, 0.5);
+      const res = detectSheet(image, c, { luma: toLuma(image) });
+      const what = `door ${doorColor}, ${name}`;
+      assert.ok(res.ok, `${what}: ${res.reason}`);
+      assert.equal(res.refined, true, what);
+      assert.ok(maxCornerError(res.quad, sheet) < 0.5, what);
+    }
+    // Tape across each corner, sticking out over the door: masking tape, parcel tape, duct tape, black tape.
+    for (const tapeColor of [[225, 200, 120], [150, 105, 60], [150, 150, 150], [30, 30, 30]]) {
+      const tape = sheet.map((p) => {
+        const len = Math.hypot(p.x - c.x, p.y - c.y);
+        const ux = (p.x - c.x) / len;
+        const uy = (p.y - c.y) / len;
+        const mx = p.x - ux * 3;
+        const my = p.y - uy * 3;
+        return { points: band({ x: mx + uy * 26, y: my - ux * 26 }, { x: mx - uy * 26, y: my + ux * 26 }, 18), color: tapeColor };
+      });
+      const image = renderSynth({
+        width: 1200,
+        height: 1600,
+        background: WALL,
+        shapes: [{ points: door, color: doorColor }, { points: sheet, color: PAPER }, ...tape],
+        blurSigma: 0.8,
+        noiseSigma: 3,
+        seed: 9,
+      });
+      const res = detectSheet(image, c);
+      const what = `tape ${tapeColor} on door ${doorColor}`;
+      assert.ok(res.ok, `${what}: ${res.reason}`);
+      assert.equal(res.refined, true, what);
+      assert.ok(maxCornerError(res.quad, sheet) < 0.5, what);
+    }
+  }
+});
+
 test('detectSheet failure: no_region when the tap is outside the photo or the input is unusable; never throws', () => {
   const sheet = poseQuad({ cx: 400, cy: 300, w: 120, h: 170 });
   const image = doorScene({ width: 800, height: 600, sheet, wall: [90, 60, 40] });
@@ -681,6 +946,88 @@ test('detectSheet failure: not_quad for shapes that are not four-sided', () => {
     assert.equal(res.ok, false, name);
     assert.equal(res.reason, 'not_quad', name);
     assert.equal(res.quad, null);
+  }
+});
+
+test('detectSheet failure: cut_off when a hard shadow line runs across the sheet', () => {
+  const door = poseQuad({ cx: 600, cy: 800, w: 520, h: 1300, yawDeg: 5 });
+  const sheet = poseQuad({ cx: 601.3, cy: 650.6, w: 150, h: 212, rotDeg: 2, yawDeg: 5 });
+  const tap = centreOf(sheet);
+  const along = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+  // The shadow's edge as a line a -> b right across the door, with the shade on its left: `share` of the
+  // way down (level) or across (upright) the sheet.
+  const across = (p, q) => [along(p, q, -3), along(p, q, 4)];
+  const level = (share) => across(along(sheet[0], sheet[3], share), along(sheet[1], sheet[2], share));
+  const upright = (share) => across(along(sheet[3], sheet[2], share), along(sheet[0], sheet[1], share));
+  const flip = ([a, b]) => [b, a];
+  const cuts = {
+    'top 12% in shade': level(0.12),
+    'top 25% in shade': level(0.25),
+    'left 15% in shade': upright(0.15),
+    // The tap lands on the shaded part when that is most of the sheet.
+    'all but the bottom 15% in shade': level(0.85),
+    'bottom 20% in shade': flip(level(0.8)),
+  };
+  for (const doorColor of [DARK_DOOR, [150, 152, 150], [186, 188, 190]]) {
+    const lit = doorScene({ width: 1200, height: 1600, door, sheet, doorColor, seed: 9 });
+    const shaded = ([a, b], factor) => shadeBeyond({ ...lit, data: new Uint8ClampedArray(lit.data) }, a, b, factor);
+    for (const factor of [0.4, 0.6]) {
+      for (const [name, line] of Object.entries(cuts)) {
+        const image = shaded(line, factor);
+        const res = detectSheet(image, tap, { luma: toLuma(image) });
+        const what = `door ${doorColor}, shade x${factor}, ${name}`;
+        assert.equal(res.ok, false, `${what}: outline accepted (refined ${res.refined}, confidence ${res.confidence})`);
+        assert.equal(res.reason, 'cut_off', what);
+        assert.equal(res.quad, null);
+        assert.equal(res.refined, false);
+      }
+    }
+    // Wherever else the line falls, an outline is never both called refined and wrong. (A sliver of under
+    // about 5% of the sheet on a door close to the paper's colour is too little to go by.)
+    for (const share of [0.06, 0.4, 0.6, 0.94]) {
+      const image = shaded(level(share), 0.5);
+      const res = detectSheet(image, tap, { luma: toLuma(image) });
+      if (res.ok && res.refined) {
+        const error = maxCornerError(res.quad, sheet);
+        assert.ok(error < 1, `door ${doorColor}, top ${share * 100}% in shade: refined, yet ${error.toFixed(1)} px off`);
+      }
+    }
+  }
+});
+
+test('detectSheet failure: cut_off for a coloured or dark sheet on a pale door with a shadow line across it', () => {
+  // The sheet's own shadow sends its outline down the 'off_sheet' path, which must not skip the check
+  // for a shadow line across the paper: put back on the paper, the outline is still only part of it.
+  const door = poseQuad({ cx: 600, cy: 800, w: 500, h: 1250, yawDeg: -7 });
+  const truth = poseQuad({ cx: 603.3, cy: 640.8, w: 140, h: 198, rotDeg: -4, yawDeg: -7 });
+  const tap = centreOf(truth);
+  const along = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+  const across = (p, q) => [along(p, q, -3), along(p, q, 4)];
+  const level = (share) => across(along(truth[0], truth[3], share), along(truth[1], truth[2], share));
+  const upright = (share) => across(along(truth[3], truth[2], share), along(truth[0], truth[1], share));
+  const cuts = { 'top 12% in shade': level(0.12), 'top 25% in shade': level(0.25), 'left 15% in shade': upright(0.15) };
+  const sheets = { ...COLOURED_SHEETS, navy: [28, 43, 85], 'light grey': PALE_SHEETS['light grey'] };
+  for (const [name, sheetColor] of Object.entries(sheets)) {
+    const lit = renderSynth({
+      width: 1200,
+      height: 1600,
+      background: [170, 160, 150],
+      shapes: [{ points: door, color: PALE_DOOR }, ...shadowedSheetShapes(truth, sheetColor, 4)],
+      blurSigma: 0.9,
+      noiseSigma: 2,
+      seed: 5,
+    });
+    // Uncut, the same sheet is outlined (refined, or held back for checking), never refused.
+    const whole = detectSheet(lit, tap, { luma: toLuma(lit) });
+    assert.ok(whole.ok, `${name}, no shadow line: ${whole.reason}`);
+    assert.ok(maxCornerError(whole.quad, truth) < 2, `${name}, no shadow line`);
+    for (const [cut, [a, b]] of Object.entries(cuts)) {
+      const image = shadeBeyond({ ...lit, data: new Uint8ClampedArray(lit.data) }, a, b, 0.5);
+      const res = detectSheet(image, tap, { luma: toLuma(image) });
+      const what = `${name}, ${cut}`;
+      assert.equal(res.ok, false, `${what}: outline accepted (refined ${res.refined}, reason ${res.reason})`);
+      assert.equal(res.reason, 'cut_off', what);
+    }
   }
 });
 

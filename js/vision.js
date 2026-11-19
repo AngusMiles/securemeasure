@@ -745,6 +745,263 @@ function fitSide(side, radius, cfg, polarity) {
   return result;
 }
 
+/** Bilinear Y, Cb, Cr of an RGBA image at a point in continuous image coordinates, written to out[0..2]. */
+function sampleYCC(image, x, y, out) {
+  const { data, width, height } = image;
+  let fx = x - 0.5;
+  let fy = y - 0.5;
+  if (!(fx > 0)) fx = 0;
+  else if (fx > width - 1) fx = width - 1;
+  if (!(fy > 0)) fy = 0;
+  else if (fy > height - 1) fy = height - 1;
+  const x0 = fx | 0;
+  const y0 = fy | 0;
+  const x1 = x0 + 1 < width ? x0 + 1 : x0;
+  const y1 = y0 + 1 < height ? y0 + 1 : y0;
+  fx -= x0;
+  fy -= y0;
+  const w00 = (1 - fx) * (1 - fy);
+  const w10 = fx * (1 - fy);
+  const w01 = (1 - fx) * fy;
+  const w11 = fx * fy;
+  const a = (y0 * width + x0) * 4;
+  const b = (y0 * width + x1) * 4;
+  const c = (y1 * width + x0) * 4;
+  const d = (y1 * width + x1) * 4;
+  const red = data[a] * w00 + data[b] * w10 + data[c] * w01 + data[d] * w11;
+  const green = data[a + 1] * w00 + data[b + 1] * w10 + data[c + 1] * w01 + data[d + 1] * w11;
+  const blue = data[a + 2] * w00 + data[b + 2] * w10 + data[c + 2] * w01 + data[d + 2] * w11;
+  const luma = 0.299 * red + 0.587 * green + 0.114 * blue;
+  out[0] = luma;
+  out[1] = 0.564 * (blue - luma);
+  out[2] = 0.713 * (red - luma);
+}
+
+// Two colours count as the same surface when one lies inside an ellipse around the other: generous in luma,
+// so a lighting gradient across the paper is tolerated, tighter in chroma.
+const lumaTolerance = (y) => clamp(0.3 * y, 30, 70);
+const chromaTolerance = (y) => 12 + 0.05 * y;
+
+/** Is `colour` the same surface as `reference`? Both are [Y, Cb, Cr]. */
+function sameSurface(reference, colour) {
+  const tolC = chromaTolerance(reference[0]);
+  const dy = (colour[0] - reference[0]) / lumaTolerance(reference[0]);
+  const db = (colour[1] - reference[1]) / tolC;
+  const dr = (colour[2] - reference[2]) / tolC;
+  return dy * dy + db * db + dr * dr <= 1;
+}
+
+/** Could `colour` be `surface` in shade: no lighter, and the same hue dimmed? Both are [Y, Cb, Cr]. */
+function isShadeOf(surface, colour) {
+  const dim = colour[0] / Math.max(1, surface[0]);
+  const tolC = chromaTolerance(colour[0]);
+  return dim <= 1.05 && Math.abs(colour[1] - dim * surface[1]) <= tolC && Math.abs(colour[2] - dim * surface[2]) <= tolC;
+}
+
+// The strips compared with the sheet's own colour lie this far to either side of a fitted side: near enough
+// to be inside a shadow only a few pixels wide. A third strip, further out and clear of the edge's own
+// blur, shows the door undisturbed. A fourth, further in (this share of the shortest side, and at least
+// SIDE_PAPER_MIN_PX), shows the paper on the same side, clear of such a shadow but lit as the side is.
+const SIDE_STRIP_PX = 2;
+const SIDE_CLEAR_PX = 7.5;
+const SIDE_PAPER_FRAC = 0.08;
+const SIDE_PAPER_MIN_PX = 8;
+const SIDE_PROBES = 16;
+const INTERIOR_GRID = [0.2, 0.35, 0.5, 0.65, 0.8];
+
+// How much darker than the paper beside it a strip inside a side must be to count as a shadow there:
+// well clear of noise, print and the lighting across a few pixels of paper.
+const dipTolerance = (y) => Math.max(8, 0.06 * y);
+// The faint shadows that test is for leave the door at least this share of its light. (A darker one is
+// far enough from a pale sheet's colour for sameSurface to tell.)
+const SHADOW_MIN_SHARE = 0.55;
+
+/**
+ * Find the sides of a fitted quad that lie on the far edge of the sheet's shadow instead of on the paper.
+ *
+ * Edges are found from luminance alone. A coloured sheet on a pale door can be as dark as the shadow it
+ * casts, so its own edge is a faint step (or none) beside the strong one at the shadow's far edge, and a
+ * side settles there, a shadow-width outside the paper, with a perfectly straight and well supported fit.
+ * Colour gives it away: the strip just inside such a side is not the sheet's colour but that of the door
+ * just outside it, in shade (and not merely the edge's own blur). The sheet's colour is the median over the
+ * middle of the quad and each strip's the median along the middle of its side, so print, a crease or tape
+ * covering part of them does not matter.
+ *
+ * That comparison allows for the light changing across the paper, so it misses a pale, pastel or grey
+ * sheet, whose shadow is the same sort of colour only a little darker. Such a side gives itself away
+ * locally instead: somewhere between it and the paper a little further in on the same side there is a
+ * band darker than that paper and no lighter than the door outside the side, and blur alone never makes
+ * a dip like that. (A sharpening halo can, but it puts a matching bright rim on the door's side, which is
+ * allowed for.) A sheet about as dark as its own shadow, and no different in colour, still gets past.
+ *
+ * @param {Image} image  RGBA
+ * @param {Point[]} quad
+ * @returns {{ sheet: number[], shadow: (number[] | null)[] }}  sheet: the sheet's colour as [Y, Cb, Cr];
+ *   shadow[i]: the shadow's colour found inside the side from corner i to corner i+1 when that side lies
+ *   on the shadow's edge, null when it is on the sheet
+ */
+function sidesOnShadow(image, quad) {
+  const ycc = [0, 0, 0];
+  const samples = [0, 1, 2].map(() => new Float32Array(25));
+  let n = 0;
+  for (const u of INTERIOR_GRID) {
+    for (const v of INTERIOR_GRID) {
+      const topX = quad[0].x + (quad[1].x - quad[0].x) * u;
+      const topY = quad[0].y + (quad[1].y - quad[0].y) * u;
+      const bottomX = quad[3].x + (quad[2].x - quad[3].x) * u;
+      const bottomY = quad[3].y + (quad[2].y - quad[3].y) * u;
+      sampleYCC(image, topX + (bottomX - topX) * v, topY + (bottomY - topY) * v, ycc);
+      for (let c = 0; c < 3; c++) samples[c][n] = ycc[c];
+      n++;
+    }
+  }
+  const sheet = samples.map((values) => medianOf(values, n));
+
+  let shortest = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const p = quad[i];
+    const q = quad[(i + 1) % 4];
+    shortest = Math.min(shortest, Math.hypot(q.x - p.x, q.y - p.y));
+  }
+  const paperDepth = Math.max(SIDE_PAPER_MIN_PX, SIDE_PAPER_FRAC * shortest);
+
+  const inward = signedArea(quad) >= 0 ? 1 : -1;
+  const shadow = [null, null, null, null];
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % 4];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    // Unit normal pointing into the quad.
+    const nx = (-inward * dy) / len;
+    const ny = (inward * dx) / len;
+    // The colour along the side, `depth` px in from it (out from it when negative).
+    const strip = (depth) => {
+      for (let k = 0; k < SIDE_PROBES; k++) {
+        const t = 0.2 + (0.6 * (k + 0.5)) / SIDE_PROBES;
+        sampleYCC(image, a.x + dx * t + nx * depth, a.y + dy * t + ny * depth, ycc);
+        for (let c = 0; c < 3; c++) samples[c][k] = ycc[c];
+      }
+      return samples.map((values) => medianOf(values, SIDE_PROBES));
+    };
+    // Strips just inside the side, just outside it, and further out.
+    const inside = strip(SIDE_STRIP_PX);
+    const outside = strip(-SIDE_STRIP_PX);
+    const beyond = strip(-SIDE_CLEAR_PX);
+    // In a soft photo the door's colour is blurred in across the sheet's real edge, and takes as much
+    // out of the strip on the door's side: what the strip inside would be if that were all.
+    const blurred = sheet.map((value, c) => value + beyond[c] - outside[c]);
+    if (!sameSurface(sheet, inside) && isShadeOf(outside, inside) && !sameSurface(blurred, inside)) {
+      shadow[i] = inside;
+      continue;
+    }
+    // A shadow darker than the paper, anywhere between the side and the paper further in. (A soft one can
+    // be lighter at its far edge, where the side settled, than nearer the paper.) Blur only ever blends the
+    // door into the paper, never makes the paper darker than both. A sharpening halo can: it darkens the
+    // paper's side of an edge as much as it lightens the door's side, so that much is let off, and a band
+    // darker than any such shadow (where the light rim is lost to white) is left to the test above.
+    const paper = strip(paperDepth);
+    const tolerance = dipTolerance(paper[0]);
+    let darkest = null;
+    for (let depth = SIDE_STRIP_PX; depth <= paperDepth - SIDE_STRIP_PX; depth++) {
+      const band = depth === SIDE_STRIP_PX ? inside : strip(depth);
+      if (!(paper[0] - band[0] > tolerance) || band[0] < SHADOW_MIN_SHARE * beyond[0] || !isShadeOf(outside, band)) continue;
+      // The light rim a halo would leave on the door's side, the same distance out.
+      const halo = Math.max(0, (depth === SIDE_STRIP_PX ? outside : strip(-depth))[0] - beyond[0]);
+      if (paper[0] - band[0] - halo > tolerance && !(darkest && darkest[0] <= band[0])) darkest = band;
+    }
+    if (darkest) shadow[i] = darkest;
+  }
+  return { sheet, shadow };
+}
+
+/**
+ * Move the sides of a fitted quad that lie on the far edge of the sheet's shadow (see sidesOnShadow) in to
+ * where the sheet's own colour begins: along each such side, walk inwards to the point half-way between
+ * the shadow's colour and the sheet's, and put a line through those points.
+ *
+ * @param {Image} image  RGBA
+ * @param {Point[]} quad
+ * @param {number[]} sheet  the sheet's colour, [Y, Cb, Cr]
+ * @param {(number[] | null)[]} shadow  per side, the shadow's colour, or null for a side to leave alone
+ * @returns {Point[] | null}  the corrected quad in the same corner order; null when the paper's edge was
+ *   not found that way
+ */
+function ontoSheet(image, quad, sheet, shadow) {
+  const inward = signedArea(quad) >= 0 ? 1 : -1;
+  const tolY = lumaTolerance(sheet[0]);
+  const tolC = chromaTolerance(sheet[0]);
+  let shortest = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const p = quad[i];
+    const q = quad[(i + 1) % 4];
+    shortest = Math.min(shortest, Math.hypot(q.x - p.x, q.y - p.y));
+  }
+  const deepest = clamp(0.25 * shortest, 8, 40);
+  // As far in as sidesOnShadow looks for the shadow.
+  const shadowReach = Math.max(SIDE_PAPER_MIN_PX, SIDE_PAPER_FRAC * shortest) - SIDE_STRIP_PX;
+  const ycc = [0, 0, 0];
+  const us = new Float64Array(SIDE_PROBES);
+  const ss = new Float64Array(SIDE_PROBES);
+  const lines = [];
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % 4];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    if (!shadow[i]) {
+      lines.push({ x: a.x, y: a.y, dx, dy });
+      continue;
+    }
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = (-inward * dy) / len;
+    const ny = (inward * dx) / len;
+    // Axis from the sheet's colour to the shadow's, weighted like sameSurface. A colour's place along it:
+    // 0 = sheet, 1 = shadow.
+    const ay = (shadow[i][0] - sheet[0]) / (tolY * tolY);
+    const ab = (shadow[i][1] - sheet[1]) / (tolC * tolC);
+    const ar = (shadow[i][2] - sheet[2]) / (tolC * tolC);
+    const span = ay * (shadow[i][0] - sheet[0]) + ab * (shadow[i][1] - sheet[1]) + ar * (shadow[i][2] - sheet[2]);
+    let count = 0;
+    for (let k = 0; k < SIDE_PROBES; k++) {
+      const t = 0.2 + (0.6 * (k + 0.5)) / SIDE_PROBES;
+      const px = a.x + dx * t;
+      const py = a.y + dy * t;
+      // A soft shadow can be lighter at its far edge than nearer the paper, so the walk may start on a
+      // colour nearer the sheet's and only then reach the shadow. A probe that does not reach it within
+      // the reach sidesOnShadow looked in (print, tape) has no crossing and is skipped.
+      let before = null;
+      for (let depth = SIDE_STRIP_PX; depth <= deepest; depth += STEP) {
+        sampleYCC(image, px + nx * depth, py + ny * depth, ycc);
+        const now = (ay * (ycc[0] - sheet[0]) + ab * (ycc[1] - sheet[1]) + ar * (ycc[2] - sheet[2])) / span;
+        if (now >= 0.5) {
+          before = now;
+        } else if (before !== null) {
+          us[count] = t * len;
+          ss[count] = depth - (STEP * (0.5 - now)) / (before - now);
+          count++;
+          break;
+        } else if (depth >= shadowReach) {
+          break;
+        }
+      }
+    }
+    const fit = robustLine(us, ss, count, 1.5);
+    if (!fit || fit.inliers < 0.6 * SIDE_PROBES) return null;
+    lines.push({ x: a.x + nx * fit.a, y: a.y + ny * fit.a, dx: dx / len + nx * fit.b, dy: dy / len + ny * fit.b });
+  }
+  const moved = [];
+  for (let i = 0; i < 4; i++) {
+    const corner = intersectLines(lines[(i + 3) % 4], lines[i]);
+    if (!corner) return null;
+    moved.push(corner);
+  }
+  if (!isConvex(moved) || signedArea(moved) * inward <= 0) return null;
+  // What comes back must itself pass the test the fitted quad failed.
+  return sidesOnShadow(image, moved).shadow.some(Boolean) ? null : moved;
+}
+
 /**
  * Snap a roughly placed quad onto the real edges of a sheet with sub-pixel precision.
  *
@@ -753,6 +1010,11 @@ function fitSide(side, radius, cfg, polarity) {
  * the corners are the intersections of adjacent lines. Works for a light sheet on a dark surface and the
  * reverse: the polarity is detected per side, and a lone side that disagrees with the other three without
  * good reason is overruled (see agreePolarities).
+ *
+ * Luminance cannot tell the edge of a coloured sheet from the far edge of the shadow it casts on a pale
+ * door. Given the RGBA image, the result is therefore checked against colour as well and refused
+ * ('off_sheet') when a side has settled on the shadow (see sidesOnShadow). A luma plane carries no colour,
+ * so pass the photo itself wherever that matters.
  *
  * @param {Image | Luma} source  RGBA image or precomputed luma plane
  * @param {Point[]} quad         4 corners in order around the quad (continuous image coordinates)
@@ -763,6 +1025,7 @@ function fitSide(side, radius, cfg, polarity) {
  * @param {number} [opts.cornerMarginFrac=0.15]  fraction of each side ignored at both ends
  * @param {number} [opts.iterations=2]     passes; the search radius shrinks after the first
  * @param {number} [opts.minContrast=6]    smallest luminance step (grey levels) accepted as an edge
+ * @param {boolean} [opts.checkColour=true]  false skips the colour check made on an RGBA source
  * @returns {{ ok: boolean, quad: Point[], shiftsPx: number[], edgeRmsPx: number[], inlierRatio: number[], reason?: string }}
  *   quad: refined corners in the input order (the unchanged input when ok is false).
  *   shiftsPx[i]: how far corner i moved. edgeRmsPx[i] / inlierRatio[i]: fit quality of the side from corner i
@@ -770,7 +1033,8 @@ function fitSide(side, radius, cfg, polarity) {
  *   it). When ok is false these describe the attempt that was rejected.
  *   reason (when not ok): 'bad_input' | 'degenerate' (unusable quad) | 'weak_edge' (a side with inlierRatio
  *   under 0.6) | 'ragged_edge' (edge RMS over 1.5 px) | 'corner_moved' (a corner moved more than 1.5 x the
- *   search radius) | 'not_convex'.
+ *   search radius) | 'not_convex' | 'off_sheet' (RGBA source only: a side lies on the far edge of the
+ *   sheet's shadow, not on the paper).
  */
 
 export function refineQuad(source, quad, opts) {
@@ -845,6 +1109,10 @@ export function refineQuad(source, quad, opts) {
     radius = Math.min(radius, Math.max(2.5, radius * (iter === 0 ? 0.35 : 0.6)));
   }
 
+  // Luminance cannot tell the sheet's edge from the far edge of its shadow; with the photo's colour we can.
+  if (opts.checkColour !== false && !isLumaSource(source) && sidesOnShadow(source, current).shadow.some(Boolean)) {
+    return fail('off_sheet');
+  }
   return { ok: true, quad: current, ...stats };
 }
 
@@ -1285,6 +1553,90 @@ function quadContains(quad, p, slack) {
   return true;
 }
 
+// Probe points along the middle half of a side, and again just beyond each of its ends.
+const RUN_ON_PROBES = 9;
+
+/**
+ * True when a side of the quad carries on past one of its corners under different light: the quad is one
+ * part of a sheet that a hard shadow line runs across (the edge of a porch roof's shade), not the whole
+ * sheet.
+ *
+ * The region grown from the tap stops where the paper's brightness changes abruptly, and a shadow line is
+ * as straight and sharp as a paper edge, so the outline of the lit (or the shaded) part passes every other
+ * check. But the sheet's real edges do not end at the two corners on the shadow line. Just past such a
+ * corner, on the side's own line, there is still an edge with the sheet's colour inside it and the door
+ * outside it, both of them darker, or both lighter, than along the side itself. Tape over a corner, the
+ * sheet's own shadow and a door moulding each fail one of those tests: the door beside tape is lit as
+ * before, tape and shadow are not the paper's colour dimmed, and paper-coloured tape is simply more paper.
+ *
+ * @param {Image} image  RGBA
+ * @param {Point[]} quad
+ * @returns {boolean}
+ */
+function runsOnPastCorner(image, quad) {
+  const inward = signedArea(quad) >= 0 ? 1 : -1;
+  const ycc = [0, 0, 0];
+  const inner = [0, 0, 0];
+  const along = [0, 1, 2, 3].map(() => new Float32Array(RUN_ON_PROBES));
+  let outer = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % 4];
+    const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const ux = (b.x - a.x) / len;
+    const uy = (b.y - a.y) / len;
+    const nx = -inward * uy;
+    const ny = inward * ux;
+    // Colours either side of the side's line, a distance s along it from corner a: each the mean of three
+    // taps 2, 3 and 4 px off the line. The inside colour goes to `inner`, the outside luma to `outer`.
+    const probe = (s) => {
+      const x = a.x + ux * s;
+      const y = a.y + uy * s;
+      outer = 0;
+      inner[0] = inner[1] = inner[2] = 0;
+      for (let o = 2; o <= 4; o++) {
+        sampleYCC(image, x + nx * o, y + ny * o, ycc);
+        for (let c = 0; c < 3; c++) inner[c] += ycc[c] / 3;
+        sampleYCC(image, x - nx * o, y - ny * o, ycc);
+        outer += ycc[0] / 3;
+      }
+    };
+    for (let k = 0; k < RUN_ON_PROBES; k++) {
+      probe(len * (0.25 + (0.5 * k) / (RUN_ON_PROBES - 1)));
+      for (let c = 0; c < 3; c++) along[c][k] = inner[c];
+      along[3][k] = outer;
+    }
+    // The sheet and what lies beside it, along this side.
+    const sheet = [0, 1, 2].map((c) => medianOf(along[c], RUN_ON_PROBES));
+    const beside = medianOf(along[3], RUN_ON_PROBES);
+    const own = sheet[0] - beside;
+    const sign = own >= 0 ? 1 : -1;
+    const tolC = chromaTolerance(sheet[0]);
+    const margin = Math.max(4, 0.15 * beside);
+    const reach = clamp(0.06 * len, 8, 16);
+    for (const dir of [-1, 1]) {
+      let hits = 0;
+      for (let k = 0; k < RUN_ON_PROBES; k++) {
+        const past = 4 + (reach * k) / (RUN_ON_PROBES - 1);
+        probe(dir > 0 ? len + past : -past);
+        // How much lighter (or darker) than the sheet the inside of the line is out here.
+        const gain = inner[0] / Math.max(1, sheet[0]);
+        // The edge carries on, about as strong as an edge lit that much would be ...
+        if (sign * (inner[0] - outer) < Math.max(6, 0.5 * gain * Math.abs(own))) continue;
+        // ... its inside is not simply more of the sheet (or tape the colour of the paper) ...
+        if (sameSurface(sheet, inner)) continue;
+        // ... but it is the sheet's own colour, lighter or darker ...
+        if (Math.abs(inner[1] - gain * sheet[1]) > tolC || Math.abs(inner[2] - gain * sheet[2]) > tolC) continue;
+        // ... and what lies beside it has gone lighter or darker with it.
+        if (gain < 1 ? outer > beside - margin : outer < beside + margin) continue;
+        hits++;
+      }
+      if (2 * hits > RUN_ON_PROBES) return true;
+    }
+  }
+  return false;
+}
+
 /** One detection attempt from one seed, on planes prepared once per photo (see detectSheetImpl). */
 function detectFromSeed(image, planes, seed, opts, fail) {
   const W = image.width;
@@ -1316,8 +1668,8 @@ function detectFromSeed(image, planes, seed, opts, fail) {
 
   // Similar colour = inside an ellipse around the reference; generous in luma so a lighting gradient across
   // the paper is tolerated.
-  const invTolY = 1 / clamp(0.3 * y0, 30, 70);
-  const invTolC = 1 / (12 + 0.05 * y0);
+  const invTolY = 1 / lumaTolerance(y0);
+  const invTolC = 1 / chromaTolerance(y0);
   const similar = (i) => {
     const dy = (Y[i] - y0) * invTolY;
     const db = (Cb[i] - cb0) * invTolC;
@@ -1412,20 +1764,32 @@ function detectFromSeed(image, planes, seed, opts, fail) {
   const radii = smallRefined ? [clamp(1.25 * scale + 1.5, 4, 14), clamp(3 * scale, 8, 24)] : [clamp(2.5 * scale, 6, 24)];
   const coarseArea = Math.abs(signedArea(coarse));
   let refined = null;
+  // What to offer instead when a side will only settle on the far edge of the sheet's shadow.
+  let offSheet = null;
   for (const searchRadiusPx of radii) {
-    const attempt = refineQuad(source, coarse, { searchRadiusPx, iterations: 3 });
+    const attempt = refineQuad(source, coarse, { searchRadiusPx, iterations: 3, checkColour: false });
     // A refinement that changes the outline's area a lot has latched onto something other than the region.
     const areaRatio = Math.abs(signedArea(attempt.quad)) / coarseArea;
-    if (attempt.ok && areaRatio > 0.7 && areaRatio < 1.4) {
+    if (!attempt.ok || !(areaRatio > 0.7 && areaRatio < 1.4)) continue;
+    const { sheet, shadow } = sidesOnShadow(image, attempt.quad);
+    if (!shadow.some(Boolean)) {
       refined = attempt;
       break;
     }
+    // Those sides moved in to where the sheet's own colour begins or, failing that, the outline of the
+    // region, which was grown by colour (the small-image fit may sit on the shadow as well).
+    offSheet = offSheet || ontoSheet(image, attempt.quad, sheet, shadow) || coarseSmall.map((p) => ({ x: p.x * sx, y: p.y * sy }));
   }
 
   const rectScore = clamp(1 - Math.abs(fill - 1) / 0.15, 0, 1);
   if (!refined) {
-    return { ok: true, quad: orderCorners(coarse), confidence: 0.2 + 0.2 * rectScore, refined: false };
+    // Put back on the paper, the outline can still be only the lit (or the shaded) part of the sheet.
+    if (offSheet && runsOnPastCorner(image, offSheet)) return fail('cut_off');
+    const outline = { ok: true, quad: orderCorners(offSheet || coarse), confidence: 0.2 + 0.2 * rectScore, refined: false };
+    if (offSheet) outline.reason = 'off_sheet';
+    return outline;
   }
+  if (runsOnPastCorner(image, refined.quad)) return fail('cut_off');
   // Judge by the worst side: one side with patchy support or a ragged fit (something touching the sheet's
   // edge, heavy blur) is enough to make the corners at its ends less trustworthy.
   const worstInliers = Math.min(...refined.inlierRatio);
@@ -1451,13 +1815,17 @@ function detectSheetImpl(image, seed, opts, fail) {
   const planes = downscaleYCC(image);
   planes.G = gradientMagnitude(planes.Y, planes.w, planes.h);
   const first = detectFromSeed(image, planes, seed, opts, fail);
-  if (first.ok && first.refined) return first;
+  // A sheet cut in two by a shadow line, or one whose shadow hides its edge, looks the same from any point
+  // on it: there is nothing to gain from looking again.
+  if ((first.ok && first.refined) || first.reason === 'cut_off' || first.reason === 'off_sheet') return first;
 
   // A tap within a few pixels of the sheet's edge reads a blend of paper and door as its reference
   // colour, and the region grown from that is a sliver, the whole door, or nothing. So look again from
   // a little further out in each direction, and believe only an outline that has the tap inside it:
   // then the customer did tap that shape. Of several (the sheet, and the door panel around it), the
-  // smallest is the one they tapped. A coarse first outline only ever gives way to a refined one.
+  // smallest is the one they tapped. A coarse first outline only ever gives way to a refined one, or to
+  // one whose edges were found and put back on the paper by colour ('off_sheet').
+  const rank = (result) => (result.refined ? 2 : result.reason === 'off_sheet' ? 1 : 0);
   const scale = Math.max(planes.sx, planes.sy);
   const slack = Math.max(2, 0.5 * scale);
   let best = null;
@@ -1466,14 +1834,14 @@ function detectSheetImpl(image, seed, opts, fail) {
     const moved = { x: seed.x + dx * RETRY_REACH * planes.sx, y: seed.y + dy * RETRY_REACH * planes.sy };
     const attempt = detectFromSeed(image, planes, moved, opts, fail);
     if (!attempt.ok || !quadContains(attempt.quad, seed, slack)) continue;
-    if (best && best.refined && !attempt.refined) continue;
+    if (best && rank(best) > rank(attempt)) continue;
     const area = Math.abs(signedArea(attempt.quad));
-    if (!best || (attempt.refined && !best.refined) || area < bestArea) {
+    if (!best || rank(attempt) > rank(best) || area < bestArea) {
       best = attempt;
       bestArea = area;
     }
   }
-  if (best && (best.refined || !first.ok)) return best;
+  if (best && (rank(best) > rank(first) || !first.ok)) return best;
   return first;
 }
 
@@ -1486,6 +1854,14 @@ function detectSheetImpl(image, seed, opts, fail) {
  * sheet's edge), it looks again from a few pixels away in each direction and accepts an outline that has
  * the tap inside it. Never throws.
  *
+ * The refined outline is then checked against the photo's colour for the two things a luminance edge
+ * cannot tell from the paper's own edge. A side that has settled on the far edge of the shadow the sheet
+ * casts (a coloured, pastel or grey sheet on a pale door) is moved back to where the sheet's colour
+ * begins, and the outline is handed over as unrefined. An outline that is only the lit, or only the
+ * shaded, part of a sheet with a hard shadow line across it is refused, whether or not a side was moved
+ * back. A sheet about as dark as its own shadow, and no different in colour, can still be outlined on the
+ * shadow's far edge (see sidesOnShadow).
+ *
  * @param {Image} image          full-resolution RGBA photo
  * @param {Point} seed           where the customer tapped (continuous image coordinates, full resolution)
  * @param {object} [opts]
@@ -1493,8 +1869,13 @@ function detectSheetImpl(image, seed, opts, fail) {
  *        around the sheet again)
  * @returns {{ ok: boolean, quad: Point[] | null, confidence: number, refined: boolean, reason?: string }}
  *   quad: [TL, TR, BR, BL] in full-resolution image coordinates, or null when ok is false.
- *   refined: true when the corners are sub-pixel refined; false = coarse outline only (lower confidence).
- *   confidence: 0..1; above ~0.9 for a clean sheet, lower when a side is ragged or poorly supported.
+ *   refined: true when the corners are sub-pixel refined; false = coarse outline only (lower confidence),
+ *     for the customer to check rather than to rely on.
+ *   confidence: 0..1; above ~0.9 for a clean sheet, lower when a side is ragged or poorly supported, and
+ *     no more than 0.4 for an unrefined outline.
+ *   reason (when ok and not refined): 'off_sheet' when a side would only settle on the far edge of the
+ *     sheet's shadow and was put back on the paper by colour; absent when the edges could not be fitted at
+ *     all and the quad is just the outline of the tapped region.
  *   reason (when not ok):
  *     'no_region'       the tap is outside the photo, or nothing coherent lies under it
  *     'too_large'       the region covers over 30% of the photo or spans over a third of its width or height:
@@ -1502,6 +1883,8 @@ function detectSheetImpl(image, seed, opts, fail) {
  *     'touches_border'  the region runs off the edge of the photo
  *     'too_small'       the region is under 0.05% of the photo
  *     'not_quad'        the region is not a four-sided, roughly rectangular shape
+ *     'cut_off'         a hard shadow line runs across the sheet, and the outline found is only the part of
+ *                       it on the tapped side of that line
  */
 export function detectSheet(image, seed, opts = {}) {
   const fail = (reason) => ({ ok: false, quad: null, confidence: 0, refined: false, reason });

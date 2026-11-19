@@ -353,6 +353,38 @@ export function band(a, b, widthPx) {
 }
 
 /**
+ * Put part of an image in shade, like the hard-edged shadow of a porch roof: every pixel to the left of the
+ * line a -> b (as seen on screen when travelling from a to b) is multiplied by `factor`, with the change
+ * spread linearly over `softPx` pixels across the line. Modifies the image in place and returns it.
+ *
+ * @param {{ data: Uint8ClampedArray, width: number, height: number }} image
+ * @param {{x:number,y:number}} a
+ * @param {{x:number,y:number}} b
+ * @param {number} factor  brightness of the shaded side relative to the lit side (0..1)
+ * @param {number} [softPx]
+ * @returns {{ data: Uint8ClampedArray, width: number, height: number }}
+ */
+export function shadeBeyond(image, a, b, factor, softPx = 1.5) {
+  const { data, width, height } = image;
+  const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const nx = (b.y - a.y) / len;
+  const ny = -(b.x - a.x) / len;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const d = (x + 0.5 - a.x) * nx + (y + 0.5 - a.y) * ny;
+      const shade = Math.min(1, Math.max(0, d / softPx + 0.5));
+      if (shade === 0) continue;
+      const k = 1 - (1 - factor) * shade;
+      const i = (y * width + x) * 4;
+      data[i] *= k;
+      data[i + 1] *= k;
+      data[i + 2] *= k;
+    }
+  }
+  return image;
+}
+
+/**
  * Regular polygon approximating a disc.
  * @returns {{x:number,y:number}[]}
  */

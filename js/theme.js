@@ -36,8 +36,36 @@ const COLOR_PROPERTIES = {
 const HEX_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const CSS_LENGTH_PATTERN = /^\d*\.?\d+(?:px|rem|em)$/;
 const BARE_NUMBER_PATTERN = /^\d*\.?\d+$/;
+/** A language tag such as 'en-AU', 'en', 'de' or 'zh-Hant-TW': a 2 or 3 letter language, then optional dash-separated parts. */
+const LANGUAGE_TAG_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{1,8})*$/i;
 
 const LOG_PREFIX = '[SecureMeasure]';
+
+/** Lowest WCAG contrast ratio at which the primary colour is still used as a text colour. */
+const MIN_TEXT_CONTRAST = 4.5;
+
+/**
+ * @param {string} hex a colour accepted by toHexColor (#rgb, #rgba, #rrggbb or #rrggbbaa; alpha is ignored)
+ * @returns {number} WCAG relative luminance, from 0 (black) to 1 (white)
+ */
+function luminance(hex) {
+  const digits = hex.length <= 5 ? hex.slice(1).replace(/./g, '$&$&') : hex.slice(1);
+  const [r, g, b] = [0, 2, 4].map((at) => {
+    const channel = parseInt(digits.slice(at, at + 2), 16) / 255;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * @param {string} a hex colour
+ * @param {string} b hex colour
+ * @returns {number} WCAG contrast ratio between the two, from 1 to 21
+ */
+function contrastRatio(a, b) {
+  const [lighter, darker] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (lighter + 0.05) / (darker + 0.05);
+}
 
 /**
  * @param {unknown} value
@@ -184,16 +212,34 @@ function toFontFamily(value) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {string | null} a trimmed language tag, or null when the value is not one
+ */
+function toLanguageTag(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return LANGUAGE_TAG_PATTERN.test(trimmed) ? trimmed : null;
+}
+
+/**
  * Applies the brand to the page: the 14 `--sm-*` custom properties on `root`,
- * the document title, and `<meta name="theme-color">` (created if absent).
+ * the page language (`brand.lang`, as the `lang` attribute of `root`), the
+ * document title, and `<meta name="theme-color">` (created if absent).
  *
  * A setting that is missing or malformed (for example a typo in a hex colour)
  * is skipped with a console warning rather than written, so the default from
  * css/base.css stays in force instead of an invalid value blanking the colour.
+ * A missing `brand.lang` is skipped silently: the language written in
+ * index.html then stays.
+ *
+ * One more property, `--sm-ink-primary`, is written only when the primary
+ * colour is too light (or too dark) to read as text on the surface and
+ * background colours: labels drawn in the primary colour then use the text
+ * colour instead, and a console warning says so.
  *
  * @param {object} config the merged config from loadConfig
- * @param {{ style?: { setProperty: Function }, ownerDocument?: object | null }} [root]
- *   element that receives the custom properties; defaults to the <html> element
+ * @param {{ style?: { setProperty: Function }, setAttribute?: Function, ownerDocument?: object | null }} [root]
+ *   element that receives the custom properties and the language; defaults to the <html> element
  * @returns {void}
  */
 export function applyTheme(config, root = globalThis.document?.documentElement) {
@@ -213,8 +259,35 @@ export function applyTheme(config, root = globalThis.document?.documentElement) 
     for (const [key, property] of Object.entries(COLOR_PROPERTIES)) {
       set(property, toHexColor(colors[key]), `brand.colors.${key}`);
     }
+
+    // The primary colour is also drawn as text and icons on the surface and page colours (header name,
+    // links, outline buttons: --sm-ink-primary in css/base.css). A light brand colour cannot be read
+    // there, so those labels take the text colour instead; fills and borders keep the primary colour.
+    const [primary, text, surface, background] = ['primary', 'text', 'surface', 'background'].map((key) => toHexColor(colors[key]));
+    if (primary && text && surface && background) {
+      const onPage = (colour) => Math.min(contrastRatio(colour, surface), contrastRatio(colour, background));
+      const contrast = onPage(primary);
+      if (contrast < MIN_TEXT_CONTRAST && onPage(text) > contrast) {
+        style.setProperty('--sm-ink-primary', text);
+        console.warn(
+          `${LOG_PREFIX} brand.colors.primary is hard to read as text on the surface and background colours (contrast ${contrast.toFixed(1)} to 1; ${MIN_TEXT_CONTRAST} is needed), so labels in that colour use brand.colors.text instead. To keep a light brand colour, put it in accent and choose a dark primary.`,
+        );
+      }
+    }
+
     set('--sm-radius', toCssLength(brand.radius), 'brand.radius');
     set('--sm-font', toFontFamily(brand.fontFamily), 'brand.fontFamily');
+  }
+
+  // The language the wording is written in. Screen readers pick their voice from it, so a translated
+  // config or skin has to be able to change it; index.html only knows the language of the default wording.
+  if (brand.lang !== undefined && brand.lang !== null && brand.lang !== '') {
+    const lang = toLanguageTag(brand.lang);
+    if (lang === null) {
+      console.warn(`${LOG_PREFIX} brand.lang is not a language tag such as 'en-AU' or 'de'; keeping the page's own language.`);
+    } else if (typeof root?.setAttribute === 'function') {
+      root.setAttribute('lang', lang);
+    }
   }
 
   const doc = root?.ownerDocument ?? globalThis.document;

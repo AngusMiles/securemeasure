@@ -7,6 +7,7 @@ import {
   formatLength,
   formatMoney,
   QUOTE_STRINGS,
+  roundPrice,
 } from '../js/quote.js';
 
 /** Recursively freeze so any accidental mutation of the config by the module fails loudly. */
@@ -995,6 +996,44 @@ describe('formatLength', () => {
   });
 });
 
+describe('roundPrice', () => {
+  test('rounds a configured price to pricing.roundTo, halves away from zero', () => {
+    assert.equal(roundPrice(89.5, { pricing: { roundTo: 1 } }), 90);
+    assert.equal(roundPrice(1299, { pricing: { roundTo: 10 } }), 1300);
+    assert.equal(roundPrice(1294.99, { pricing: { roundTo: 10 } }), 1290);
+    assert.equal(roundPrice(-20.5, { pricing: { roundTo: 1 } }), -21);
+    assert.equal(roundPrice('89.5', { pricing: { roundTo: 1 } }), 90, 'a numeric string, as the engine reads the config');
+    assert.ok(Object.is(roundPrice(0.4, { pricing: { roundTo: 1 } }), 0), 'never -0');
+  });
+
+  test('a missing, zero or negative roundTo means cents', () => {
+    for (const config of [{}, { pricing: {} }, { pricing: { roundTo: 0 } }, { pricing: { roundTo: -5 } }, null]) {
+      assert.equal(roundPrice(89.506, config), 89.51);
+      assert.equal(roundPrice(19.99, config), 19.99);
+      assert.equal(roundPrice(0.1 + 0.2, config), 0.3);
+    }
+  });
+
+  test('gives the same figure as the line calculateQuote charges for it', () => {
+    for (const roundTo of [1, 5, 10, 0.05, 0.01]) {
+      const config = configWith({
+        roundTo,
+        options: [{ id: 'extra', label: 'Extra', type: 'checkbox', price: 87.55, description: '', default: true }],
+      });
+      const quote = calculateQuote(config, { ...STANDARD, productId: 'classic' });
+      assert.equal(quote.status, 'ok', `roundTo ${roundTo}`);
+      assert.equal(line(quote, 'option:extra').amount, roundPrice(87.55, config), `roundTo ${roundTo}`);
+      assert.equal(line(quote, 'product').amount, roundPrice(config.pricing.products[0].basePrice, config), `roundTo ${roundTo}`);
+    }
+  });
+
+  test('is NaN when the price is not a usable number', () => {
+    for (const amount of ['abc', '', null, undefined, NaN, Infinity, {}]) {
+      assert.ok(Number.isNaN(roundPrice(amount, {})), `roundPrice(${String(amount)})`);
+    }
+  });
+});
+
 describe('module purity', () => {
   test('exports exactly the contract functions plus the default strings', async () => {
     const module = await import('../js/quote.js');
@@ -1004,6 +1043,7 @@ describe('module purity', () => {
       'calculateQuote',
       'formatLength',
       'formatMoney',
+      'roundPrice',
     ]);
   });
 });

@@ -43,6 +43,10 @@ export const COMMON = {
   'common.crashTitle': 'Sorry, that screen didn’t load',
   'common.crashBody': 'Nothing has been sent. Start again and it should come good.',
   'common.bootFailed': 'Sorry, the measuring tool couldn’t load. Check your connection, then refresh this page.',
+  // Shown on "Get set up" after the phone closed the page while its camera was open. {choose} is the
+  // label of that screen's "Choose a photo" button.
+  'common.photoInterrupted':
+    'Your phone closed this page while the camera was open, so the photo was lost. Take the photo with your phone’s camera app first, then tap “{choose}” here.',
 };
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);

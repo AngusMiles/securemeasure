@@ -8,6 +8,7 @@ import {
   LOUPE_MARGIN_PX,
   LOUPE_MIN_SCALE,
   MAX_SCALE,
+  PINCH_START_MS,
   TAP_MAX_MS,
   TAP_SLOP_PX,
   backingStoreSize,
@@ -18,6 +19,7 @@ import {
   fitView,
   hitTestHandle,
   imageToScreen,
+  isPinchStart,
   isTap,
   lerpView,
   loupeCorner,
@@ -675,6 +677,20 @@ test('isTap: short and still', () => {
   assert.ok(!isTap(2, TAP_MAX_MS + 1));
 });
 
+test('isPinchStart: the second finger came quickly, or the first has barely left its spot', () => {
+  // Quick second finger: a pinch however far the first one slid meanwhile.
+  assert.ok(isPinchStart(0, 0));
+  assert.ok(isPinchStart(17, 64));
+  assert.ok(isPinchStart(200, PINCH_START_MS - 1));
+  // Later than that, only a first finger that is still where it pressed.
+  assert.ok(isPinchStart(TAP_SLOP_PX, PINCH_START_MS));
+  assert.ok(isPinchStart(6, 5000));
+  // A finger that has been somewhere for a while is dragging.
+  assert.ok(!isPinchStart(TAP_SLOP_PX + 0.5, PINCH_START_MS));
+  assert.ok(!isPinchStart(41, 400));
+  assert.ok(PINCH_START_MS < TAP_MAX_MS, 'tighter than a tap: a short deliberate drag must still count');
+});
+
 test('settledPoint: ignores the roll of a lifting fingertip, keeps deliberate movement', () => {
   const sample = (t, x, sx) => ({ t, point: { x, y: 0 }, sx, sy: 0 });
 
@@ -1188,6 +1204,93 @@ test('QuadEditor: tapping a handle selects it without moving it', () => {
   editor.destroy();
 });
 
+test('QuadEditor: a tap or click on a handle that wobbles out of the dead zone reports nothing', () => {
+  // Touch: the fingertip rolls 5 px during a 90 ms tap.
+  {
+    const { env, editor, changes, taps, actives, handleAt } = setup();
+    const s = handleAt(2);
+    env.down(1, s.x + 3, s.y - 2);
+    env.advance(30);
+    env.move(1, s.x + 8, s.y - 2);
+    env.advance(60);
+    env.up(1, s.x + 8, s.y - 2);
+    assert.equal(changes.length, 0, 'touch tap');
+    assert.deepEqual(editor.getPoints(), QUAD());
+    assert.equal(editor.getActive(), 2, 'the tap still selects the handle');
+    assert.deepEqual(actives, [2]);
+    assert.equal(taps.length, 0);
+    editor.destroy();
+  }
+  // Mouse: the pointer travels 2.8 px during the click.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const mouse = { pointerType: 'mouse' };
+    const s = handleAt(0);
+    env.down(1, s.x, s.y, mouse);
+    env.move(1, s.x + 2, s.y + 2, mouse);
+    env.up(1, s.x + 2, s.y + 2, mouse);
+    assert.equal(changes.length, 0, 'mouse click');
+    assert.deepEqual(editor.getPoints(), QUAD());
+    editor.destroy();
+  }
+  // The same wobble ended by the browser taking the gesture away.
+  for (const ending of ['pointercancel', 'lostpointercapture']) {
+    const { env, editor, changes, handleAt } = setup();
+    const s = handleAt(1);
+    env.down(1, s.x, s.y);
+    env.move(1, s.x, s.y + 6);
+    env.fire(ending, { pointerId: 1 });
+    assert.equal(changes.length, 0, ending);
+    assert.deepEqual(editor.getPoints(), QUAD());
+    editor.destroy();
+  }
+  // A handle already against the edge of the photo, pulled further out: it cannot move.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const corner = QUAD();
+    corner[0] = { x: 0, y: 0 };
+    editor.setPoints(corner);
+    const s = handleAt(0);
+    env.down(1, s.x, s.y, { pointerType: 'mouse' });
+    env.move(1, s.x - 3, s.y, { pointerType: 'mouse' });
+    env.move(1, s.x - 40, s.y - 15, { pointerType: 'mouse' });
+    env.up(1, s.x - 40, s.y - 15, { pointerType: 'mouse' });
+    assert.equal(changes.length, 0, 'clamped drag');
+    assert.deepEqual(editor.getPoints(), corner);
+    editor.destroy();
+  }
+});
+
+test('QuadEditor: a handle that lift-off jitter leaves where it started is shown going back, not committed', () => {
+  const { env, editor, changes, handleAt } = setup();
+  const s = handleAt(0);
+  env.down(1, s.x, s.y);
+  env.advance(10);
+  env.move(1, s.x + 5, s.y); // out of the dead zone
+  env.advance(40);
+  env.move(1, s.x + 5.7, s.y); // the handle follows by a hair
+  assert.equal(changes.length, 1);
+  assert.deepEqual(changes[0].meta, { final: false, index: 0 });
+  assert.notDeepEqual(changes[0].points, QUAD());
+  env.advance(50);
+  env.up(1, s.x + 5.7, s.y); // the roll of the lifting fingertip is taken back out
+  assert.deepEqual(editor.getPoints(), QUAD(), 'the corner is exactly where it started');
+  assert.equal(changes.length, 2);
+  assert.deepEqual(changes[1].meta, { final: false, index: 0 }, 'nothing changed, so nothing is final');
+  assert.deepEqual(changes[1].points, QUAD(), 'listeners that followed the drag see the corner back in place');
+
+  // A real move of the same handle afterwards is committed as usual.
+  env.advance(500);
+  env.down(1, s.x, s.y);
+  env.move(1, s.x + 6, s.y);
+  env.move(1, s.x + 26, s.y + 10);
+  env.advance(400);
+  env.up(1, s.x + 26, s.y + 10);
+  assert.deepEqual(changes.at(-1).meta, { final: true, index: 0 });
+  assert.notDeepEqual(changes.at(-1).points, QUAD());
+  editor.destroy();
+});
+
 test('QuadEditor: a tap on empty image fires onTap with the image point', () => {
   const { env, editor, taps, changes } = setup();
   const view = editor.getView();
@@ -1271,7 +1374,7 @@ test('QuadEditor: no onTap for a drag, a long press, a cancelled press or a tap 
   editor.destroy();
 });
 
-test('QuadEditor: a second finger during a handle drag commits the drag and starts a pinch', () => {
+test('QuadEditor: a second finger during an established handle drag commits the drag and starts a pinch', () => {
   const { env, editor, changes, handleAt } = setup();
   const s = handleAt(1);
   env.down(1, s.x, s.y);
@@ -1281,6 +1384,8 @@ test('QuadEditor: a second finger during a handle drag commits the drag and star
   assert.equal(changes[0].meta.final, false);
   const dragged = editor.getPoints();
 
+  // The corner has been carried well away from where it was grabbed, and not just now: a drag.
+  env.advance(400);
   env.down(2, s.x - 100, s.y + 200);
   assert.equal(changes.length, 2, 'drag committed when the second finger lands');
   assert.deepEqual(changes[1].meta, { final: true, index: 1 });
@@ -1298,6 +1403,123 @@ test('QuadEditor: a second finger during a handle drag commits the drag and star
   env.up(2, s.x - 150, s.y + 200);
   assert.equal(changes.length, 2);
   editor.destroy();
+});
+
+test('QuadEditor: the first finger of a pinch that lands on a handle does not move it', () => {
+  const { env, editor, changes, handleAt } = setup();
+  const s = handleAt(1);
+  // Finger 1 lands 18 px from the corner, already sliding as the hand spreads.
+  env.down(1, s.x - 14, s.y + 11);
+  env.advance(16);
+  env.move(1, s.x - 9, s.y + 8);
+  env.advance(16);
+  env.move(1, s.x - 2, s.y + 3);
+  env.advance(16);
+  env.move(1, s.x + 3, s.y - 1);
+  assert.equal(changes.length, 2, 'the corner follows the finger meanwhile');
+  assert.notDeepEqual(editor.getPoints(), QUAD());
+
+  // Finger 2 lands 64 ms after the first: the two were a pinch all along.
+  env.advance(16);
+  env.down(2, s.x - 120, s.y + 180);
+  assert.deepEqual(editor.getPoints(), QUAD(), 'the corner is back where it was');
+  assert.equal(changes.length, 3);
+  assert.deepEqual(changes[2].meta, { final: false, index: 1 });
+  assert.deepEqual(changes[2].points, QUAD(), 'listeners are shown the corner going back');
+  assert.ok(changes.every((c) => c.meta.final === false), 'and nothing is committed');
+
+  // The pair pinches as usual and no handle moves.
+  const before = editor.getView();
+  env.move(1, s.x + 43, s.y - 31);
+  env.move(2, s.x - 160, s.y + 220);
+  assert.ok(editor.getView().scale > before.scale, 'zoomed in');
+  env.up(1, s.x + 43, s.y - 31);
+  env.up(2, s.x - 160, s.y + 220);
+  assert.equal(changes.length, 3);
+  assert.deepEqual(editor.getPoints(), QUAD());
+  assert.equal(editor.getActive(), 1);
+  editor.destroy();
+});
+
+test('QuadEditor: a finger resting on a handle that only wobbles is not a drag when a second finger joins', () => {
+  // However late the second finger comes, the first has stayed within a tap's travel of its spot.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const s = handleAt(3);
+    env.down(1, s.x + 6, s.y + 4);
+    env.advance(500);
+    env.move(1, s.x + 11, s.y + 4);
+    env.advance(100);
+    env.move(1, s.x + 13, s.y + 7);
+    assert.equal(changes.length, 1);
+    assert.notDeepEqual(editor.getPoints(), QUAD());
+    env.advance(300);
+    env.down(2, 300, 100);
+    assert.deepEqual(editor.getPoints(), QUAD());
+    assert.deepEqual(changes.at(-1).meta, { final: false, index: 3 });
+    assert.deepEqual(changes.at(-1).points, QUAD());
+    assert.ok(changes.every((c) => c.meta.final === false));
+    env.up(1, s.x + 13, s.y + 7);
+    env.up(2, 300, 100);
+    assert.equal(changes.length, 2);
+    editor.destroy();
+  }
+  // One move out of the dead zone and then the second finger: the corner never moved, so there
+  // is nothing to report at all.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const s = handleAt(0);
+    env.down(1, s.x, s.y);
+    env.advance(20);
+    env.move(1, s.x + 5, s.y);
+    env.advance(20);
+    env.down(2, 300, 400);
+    env.up(1, s.x + 5, s.y);
+    env.up(2, 300, 400);
+    assert.equal(changes.length, 0);
+    assert.deepEqual(editor.getPoints(), QUAD());
+    editor.destroy();
+  }
+});
+
+test('QuadEditor: a pinch start puts the handle back where the host last had it', () => {
+  // The host replaced the points while the finger was down.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const s = handleAt(0);
+    env.down(1, s.x, s.y);
+    env.move(1, s.x + 6, s.y);
+    env.move(1, s.x + 16, s.y + 8);
+    const snapped = QUAD();
+    snapped[0] = { x: 640, y: 610 };
+    editor.setPoints(snapped);
+    env.move(1, s.x + 21, s.y + 8);
+    assert.notDeepEqual(editor.getPoints(), snapped);
+    env.down(2, 300, 400);
+    assert.deepEqual(editor.getPoints(), snapped, 'back to the corner the host set, not the one before it');
+    assert.deepEqual(changes.at(-1).meta, { final: false, index: 0 });
+    assert.deepEqual(changes.at(-1).points, snapped);
+    assert.ok(changes.every((c) => c.meta.final === false));
+    editor.destroy();
+  }
+  // A nudge while the finger was down was reported as final: that much stays.
+  {
+    const { env, editor, changes, handleAt } = setup();
+    const s = handleAt(0);
+    env.down(1, s.x, s.y);
+    env.move(1, s.x + 6, s.y);
+    env.move(1, s.x + 16, s.y + 8);
+    editor.nudge(1, 0);
+    const nudged = editor.getPoints();
+    assert.deepEqual(changes.at(-1), { points: nudged, meta: { final: true, index: 0 } });
+    env.move(1, s.x + 26, s.y + 8);
+    assert.notDeepEqual(editor.getPoints(), nudged);
+    env.down(2, 300, 400);
+    assert.deepEqual(editor.getPoints(), nudged, 'what the host was told for good is kept');
+    assert.deepEqual(changes.at(-1), { points: nudged, meta: { final: false, index: 0 } });
+    assert.equal(changes.filter((c) => c.meta.final).length, 1, 'only the nudge was final');
+    editor.destroy();
+  }
 });
 
 test('QuadEditor: a second finger on a handle that was grabbed but not moved commits nothing', () => {
@@ -2225,6 +2447,31 @@ test('QuadEditor: random gesture storms never throw or break the invariants', ()
       return { x: random() * (vw + 80) - 40, y: random() * (vh + 80) - 40 };
     };
     let epoch = 0;
+    // What the host knows for good: the points it gave the editor, then every final change.
+    let committed = editor.getPoints();
+    let audited = 0;
+    const byNudge = new Set();
+    const backInPlace = new Set();
+    const nudging = (act) => {
+      const from = changes.length;
+      act();
+      for (let i = from; i < changes.length; i++) byNudge.add(i);
+    };
+    const audit = () => {
+      for (; audited < changes.length; audited++) {
+        const { points, meta } = changes[audited];
+        const p = points[meta.index];
+        const unmoved = committed !== null && p.x === committed[meta.index].x && p.y === committed[meta.index].y;
+        if (meta.final) {
+          // The end of a drag is only final when it moved the handle. (A nudge always moves it,
+          // but during a drag it may happen to land on the spot the host already had.)
+          assert.ok(!unmoved || byNudge.has(audited), `seed ${seed}: final change ${audited} left handle ${meta.index} where it was`);
+          committed = points;
+        } else if (unmoved) {
+          backInPlace.add(audited);
+        }
+      }
+    };
     const actions = [
       () => { const p = where(); env.down(pick([1, 2, 3]), p.x, p.y, { pointerType: pick(['touch', 'touch', 'mouse', 'pen']) }); },
       () => { const p = where(); env.move(pick([1, 2, 3]), p.x, p.y); },
@@ -2249,14 +2496,15 @@ test('QuadEditor: random gesture storms never throw or break the invariants', ()
         if (random() < 0.7) env.up(id, p.x + 28, p.y + 20);
       },
       () => { const p = where(); env.fire('wheel', { x: p.x, y: p.y, deltaY: (random() - 0.5) * 1500, deltaMode: pick([0, 0, 1]), ctrlKey: random() < 0.2 }); },
-      () => env.key(pick(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Tab', '+', '-', '0', 'a']), { shiftKey: random() < 0.3 }),
-      () => editor.nudge(Math.round((random() - 0.5) * 60), Math.round((random() - 0.5) * 60)),
+      () => nudging(() => env.key(pick(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Tab', '+', '-', '0', 'a']), { shiftKey: random() < 0.3 })),
+      () => nudging(() => editor.nudge(Math.round((random() - 0.5) * 60), Math.round((random() - 0.5) * 60))),
       () => editor.setActive(pick([null, 0, 1, 2, 3, 7])),
       () => {
         // Replacing or clearing the points is the host's doing: any drag in progress is the host's to
         // reconcile, so start a fresh epoch for the "every drag ends with a final change" check.
         editor.setPoints(pick([null, QUAD(), [{ x: -50, y: 10 }, { x: 99999, y: 10 }, { x: 700, y: 99999 }, { x: 5, y: 900 }]]));
-        if (editor.getPoints() === null) epoch = changes.length;
+        committed = editor.getPoints();
+        if (committed === null) epoch = changes.length;
       },
       () => editor.zoomToQuad(pick([QUAD(), [{ x: 10, y: 10 }, { x: 60, y: 10 }, { x: 60, y: 80 }, { x: 10, y: 80 }]]), random()),
       () => editor.resetView(),
@@ -2270,6 +2518,7 @@ test('QuadEditor: random gesture storms never throw or break the invariants', ()
 
     for (let step = 0; step < 400; step++) {
       pick(actions)();
+      audit();
 
       const pts = editor.getPoints();
       if (pts) {
@@ -2302,12 +2551,18 @@ test('QuadEditor: random gesture storms never throw or break the invariants', ()
       assert.equal(typeof change.meta.final, 'boolean');
       assert.ok(Number.isInteger(change.meta.index) && change.meta.index >= 0 && change.meta.index < 4);
     }
-    // A drag always ends with a final change: the last report for any handle is final once
-    // every pointer has been lifted.
+    // A drag never leaves its listeners hanging: once every pointer has been lifted, the last
+    // report for any handle is final, or it shows the handle back where the host already had it
+    // (a drag that came to nothing, or the first finger of a pinch).
     for (const id of [1, 2, 3]) env.cancel(id);
+    audit();
     const lastByIndex = new Map();
-    for (const change of changes.slice(epoch)) lastByIndex.set(change.meta.index, change.meta.final);
-    for (const [index, final] of lastByIndex) assert.equal(final, true, `seed ${seed}: last change for handle ${index} is final`);
+    changes.forEach((change, i) => {
+      if (i >= epoch) lastByIndex.set(change.meta.index, change.meta.final || backInPlace.has(i));
+    });
+    for (const [index, settled] of lastByIndex) {
+      assert.equal(settled, true, `seed ${seed}: last change for handle ${index} is final or shows it back in place`);
+    }
 
     totals.live += changes.filter((c) => !c.meta.final).length;
     totals.final += changes.filter((c) => c.meta.final).length;

@@ -473,3 +473,18 @@ export function formatLength(mm) {
   if (!Number.isFinite(value)) return NO_VALUE;
   return `${Math.round(value) + 0} mm`;
 }
+
+/**
+ * A configured price as calculateQuote() charges it on a line: whole cents, then the nearest
+ * multiple of pricing.roundTo, halves away from zero. The quote screen shows its price tags
+ * through this, so a tag beside a door or option always equals the line it adds to the quote.
+ *
+ * @param {number} amount  In currency units (a numeric string is accepted, as in the config).
+ * @param {object} config  The merged app config.
+ * @returns {number} In currency units, or NaN when the amount is not a usable number.
+ */
+export function roundPrice(amount, config) {
+  const pricing = isObject(config) && isObject(config.pricing) ? config.pricing : {};
+  const cents = toCents(amount);
+  return cents === null ? NaN : roundToStep(cents, roundingStepCents(pricing)) / 100;
+}

@@ -35,6 +35,9 @@ export const TAP_SLOP_PX = 10;
 /** ...and lasts less than this (ms) is a tap. Generous: a slow, deliberate press on the sheet must
  * still count, and the editor has no long-press gesture to tell it apart from. */
 export const TAP_MAX_MS = 700;
+/** A second finger landing within this long (ms) of a press on a handle makes the two a pinch from
+ * the start: the first finger was never dragging that handle. */
+export const PINCH_START_MS = 300;
 /** Deepest zoom, in screen px per image px. */
 export const MAX_SCALE = 8;
 /** Loupe diameter in CSS px. */
@@ -518,6 +521,19 @@ export function isTap(distancePx, elapsedMs) {
 }
 
 /**
+ * A second finger has landed while the first is holding a handle: was the first one the start of
+ * a pinch rather than a drag the customer meant? Yes when the second finger followed quickly, or
+ * when the first is still no further from where it pressed than a tap may travel. The handle then
+ * goes back where it was instead of keeping whatever the first finger did to it on the way.
+ * @param {number} travelPx    how far the first finger is from where it pressed (CSS px)
+ * @param {number} elapsedMs   how long ago it pressed
+ * @returns {boolean}
+ */
+export function isPinchStart(travelPx, elapsedMs) {
+  return elapsedMs < PINCH_START_MS || travelPx <= TAP_SLOP_PX;
+}
+
+/**
  * The handle position to commit when a finger lifts.
  * A fingertip rolls as it leaves the glass and drags the contact point a pixel or two with it.
  * If the finger was all but still during the last moments before release, the position from just
@@ -693,6 +709,11 @@ function rectDistance(p, x, y, w, h) {
  * @property {string} [ariaLabel]               accessible name of the canvas
  * @property {{ points: Point[], color?: string } | null} [ghost]   second, non-editable outline
  * @property {(points: Point[], meta: { final: boolean, index: number | null }) => void} [onChange]
+ *   final: false while a handle is being dragged; final: true once it has been let go somewhere
+ *   new, and for every nudge. final: true always means the handle moved. A drag that leaves the
+ *   handle where it started (a tap that wobbled, or the first finger of a pinch landing on it)
+ *   never reports final: true; if it reported movement on the way, its last report is a
+ *   final: false one showing the handle back in place.
  * @property {(imagePoint: Point) => void} [onTap]   a tap on the image that is not on a handle
  * @property {(index: number | null) => void} [onActiveChange]   the customer (not setActive) changed the active handle
  * @property {'corner' | 'center'} [pixelOrigin]
@@ -884,7 +905,7 @@ export class QuadEditor {
         this._mode = 'idle';
       }
     } else if (this._mode === 'handle') {
-      this._rebaseDrag();
+      this._rebaseDrag(true);
     }
     this._requestDraw();
   }
@@ -952,7 +973,7 @@ export class QuadEditor {
     const next = clampPoint({ x: current.x + stepX, y: current.y + stepY }, this._iw, this._ih, this._origin);
     if (next.x === current.x && next.y === current.y) return;
     this._points[index] = next;
-    this._rebaseDrag();
+    this._rebaseDrag(true);
     this._keepHandleVisible(index);
     this._showLoupeBriefly();
     this._requestDraw();
@@ -1160,13 +1181,18 @@ export class QuadEditor {
    * Re-measure the grab offset of a handle drag. Needed whenever something other than the
    * dragging finger moves the handle on screen (zoom, resize, setPoints, nudge), otherwise the
    * handle would jump on the next pointer move.
+   * @param {boolean} [placed]   true when the host has just placed the handles (setPoints) or been
+   *   told for good where they are (nudge): the drag then counts as starting from there, which is
+   *   where _endDrag looks for movement and where a pinch start puts the handle back.
    */
-  _rebaseDrag() {
+  _rebaseDrag(placed = false) {
     const drag = this._drag;
     if (this._mode !== 'handle' || !drag || !this._points) return;
-    const handle = imageToScreen(this._pointView(), this._points[drag.index]);
+    const point = this._points[drag.index];
+    const handle = imageToScreen(this._pointView(), point);
     drag.offset = { x: handle.x - drag.finger.x, y: handle.y - drag.finger.y };
     drag.trail.length = 0;
+    if (placed) drag.origin = { x: point.x, y: point.y };
   }
 
   _keepHandleVisible(index) {
@@ -1360,7 +1386,7 @@ export class QuadEditor {
     this._cancelAnimation();
     this._focusVisible = false;
 
-    let committed = null;
+    let ended = null;
     let activated = null;
     if (this._pointers.size === 1) {
       const pv = this._pointView();
@@ -1376,11 +1402,16 @@ export class QuadEditor {
           // handle never jumps to sit under the finger.
           offset: { x: handle.x - pos.x, y: handle.y - pos.y },
           start: pos,
+          startTime: this._time(e),
           finger: pos,
           moved: false,
           // Dead zone so that tapping a handle to select it cannot shift it.
           slop: e.pointerType === 'touch' ? 4 : 2,
           trail: [],
+          // Where the handle was when it was grabbed, and whether onChange has been told it moved:
+          // together they decide what, if anything, the end of the drag reports (see _endDrag).
+          origin: { x: this._points[hit].x, y: this._points[hit].y },
+          reported: false,
         };
         this._loupeSide = null;
         if (this._active !== hit) activated = hit;
@@ -1392,7 +1423,15 @@ export class QuadEditor {
       }
     } else {
       // A second finger: whatever the first was doing ends here and the pair becomes a pinch.
-      if (this._mode === 'handle') committed = this._endDrag();
+      if (this._mode === 'handle') {
+        const drag = this._drag;
+        // The first finger of a pinch often lands on a handle and slides it before the second one
+        // arrives. That was never a drag: put the handle back instead of keeping the slide.
+        if (drag && this._points && isPinchStart(distance(drag.finger, drag.start), this._time(e) - drag.startTime)) {
+          this._points[drag.index] = { x: drag.origin.x, y: drag.origin.y };
+        }
+        ended = this._endDrag();
+      }
       this._pan = null;
       this._startPinch();
     }
@@ -1400,7 +1439,7 @@ export class QuadEditor {
     this._updateCursor(pos);
     this._requestDraw();
     if (activated != null && this._onActiveChange) this._onActiveChange(activated);
-    if (committed != null) this._emitChange(true, committed);
+    if (ended) this._emitChange(ended.final, ended.index);
   }
 
   _onPointerMove(e) {
@@ -1465,16 +1504,30 @@ export class QuadEditor {
     while (trail.length > 2 && trail[1].t <= time - 250) trail.shift();
 
     this._requestDraw();
-    if (changed) this._emitChange(false, drag.index);
+    if (changed) {
+      drag.reported = true;
+      this._emitChange(false, drag.index);
+    }
   }
 
-  /** Leave handle-drag mode. @returns {number | null} the handle index when it actually moved */
+  /**
+   * Leave handle-drag mode and say what onChange is owed:
+   *  - a final change when the handle ended somewhere other than where the drag found it;
+   *  - a last non-final one when it is back where it was but onChange saw it move on the way
+   *    (lift-off jitter taken back out, or a pinch start undone), so listeners see it return and
+   *    nothing is committed;
+   *  - nothing when it never moved (a press that only left the dead zone).
+   * @returns {{ index: number, final: boolean } | null}
+   */
   _endDrag() {
     const drag = this._drag;
     this._drag = null;
     this._mode = 'idle';
     this._loupeSide = null;
-    return drag && drag.moved ? drag.index : null;
+    if (!drag || !this._points) return null;
+    const point = this._points[drag.index];
+    if (point.x !== drag.origin.x || point.y !== drag.origin.y) return { index: drag.index, final: true };
+    return drag.reported ? { index: drag.index, final: false } : null;
   }
 
   _startPinch() {
@@ -1489,7 +1542,7 @@ export class QuadEditor {
     this._pointers.delete(e.pointerId);
     this._releaseCapture(e.pointerId);
 
-    let committed = null;
+    let ended = null;
     let tapPoint = null;
     if (this._mode === 'handle' && this._drag && this._drag.pointerId === e.pointerId) {
       const drag = this._drag;
@@ -1497,7 +1550,7 @@ export class QuadEditor {
         const settled = settledPoint(drag.trail, this._time(e));
         if (settled) this._points[drag.index] = clampPoint(settled, this._iw, this._ih, this._origin);
       }
-      committed = this._endDrag();
+      ended = this._endDrag();
     } else if (this._mode === 'pan' && this._pan && this._pan.pointerId === e.pointerId) {
       const pan = this._pan;
       this._pan = null;
@@ -1520,7 +1573,7 @@ export class QuadEditor {
 
     this._updateCursor(pos);
     this._requestDraw();
-    if (committed != null) this._emitChange(true, committed);
+    if (ended) this._emitChange(ended.final, ended.index);
     if (tapPoint && this._onTap) this._onTap(tapPoint);
   }
 

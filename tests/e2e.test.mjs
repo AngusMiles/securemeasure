@@ -1,8 +1,8 @@
 // End-to-end test of the real measuring pipeline under Node, with no DOM: a synthetic door photo goes
 // through exactly the calls the screens make, in the same order and with the same arguments.
 //
-//   sheet screen    detectSheet(photo.image, tap, { luma }) -> sheetOutlineIsPlausible
-//                   (refineQuad for "Snap to edges")
+//   sheet screen    detectSheet(photo.image, tap, { luma }) -> sheetDetectionOutcome
+//                   (refineQuad(photo.image, corners) for "Snap to edges")
 //   door screen     measureDoor({ ...config sigmas }) -> applyMeasurementRules
 //   result screen   warpToRect(photo.image, measure.planeToImage, ...)
 //   quote screen    calculateQuote(config, { ...size, productId, selections, includeInstallation })
@@ -11,6 +11,11 @@
 // The photos come from tools/scene.mjs, which knows where every corner really is. The scenes are rendered
 // in the canvas pixel convention (DEMO_SCENE's pixelOrigin: 'corner'), the frame js/vision.js and the
 // corner editor work in, so truth and detection are directly comparable.
+//
+// Which settings: every group but the last runs on tests/helpers/shipped-config.mjs, a fixed copy of the
+// settings this repo ships. js/config.js is there to be edited (sheet sizes, a fitting allowance, prices,
+// where enquiries go, wording), and none of that may fail a test of the measuring code. The last group
+// puts js/config.js itself through the same steps and pins nothing in it.
 
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,10 +27,12 @@ import { detectSheet, refineQuad, warpToRect } from '../js/vision.js';
 import { applyHomography, measureDoor } from '../js/geometry.js';
 import { applyMeasurementRules, calculateQuote } from '../js/quote.js';
 import { buildLeadPayload, leadMode, submitLead, validateCustomer } from '../js/lead.js';
-import { deepMerge, loadConfig } from '../js/theme.js';
+import { deepMerge } from '../js/theme.js';
 import { getLuma, getSheetMm } from '../js/photo.js';
-import { sheetOutlineIsPlausible } from '../js/screens/mark-common.js';
-import baseConfig from '../js/config.js';
+import { sheetDetectionOutcome } from '../js/screens/mark-common.js';
+import liveConfig from '../js/config.js';
+import acmeSkin from '../skins/acme.js';
+import { SHIPPED_CONFIG as baseConfig } from './helpers/shipped-config.mjs';
 import { mulberry32 } from './helpers/synth.mjs';
 
 const TRUE_WIDTH_MM = 820;
@@ -54,7 +61,7 @@ const DOOR_RGB = [34, 63, 94]; //         tools/scene.mjs default door colour #2
 const ARCHITRAVE_RGB = [241, 238, 231]; // tools/scene.mjs default architrave colour #f1eee7
 const COLOUR_TOL = 25; // lighting, lens blur and sensor noise move a flat colour by up to about 10 levels
 
-const DETECT_FAILURE_REASONS = ['no_region', 'touches_border', 'too_large', 'too_small', 'not_quad'];
+const DETECT_FAILURE_REASONS = ['no_region', 'touches_border', 'too_large', 'too_small', 'not_quad', 'cut_off'];
 
 const CUSTOMER = {
   name: 'Alex Taylor',
@@ -121,8 +128,11 @@ function assertColour(actual, expected, label) {
 /* The pipeline, call for call as the screens run it                                                      */
 /* ------------------------------------------------------------------------------------------------------ */
 
-/** What loadPhoto (js/photo.js) hands the screens, minus the canvas. */
-const asPhoto = (image) => ({ canvas: null, image, width: image.width, height: image.height, isDemo: true, _luma: null });
+/**
+ * What loadPhoto (js/photo.js) hands the screens, minus the canvas. A rendered scene stands for the
+ * customer's own photo; only the bundled demo photo is loaded with isDemo.
+ */
+const asPhoto = (image, { isDemo = false } = {}) => ({ canvas: null, image, width: image.width, height: image.height, isDemo, _luma: null });
 
 /** The slice of the app state the measuring code reads. */
 const initialState = (config) => ({
@@ -133,20 +143,32 @@ const initialState = (config) => ({
 /** js/screens/sheet.js: the customer taps the sheet. */
 const tapSheet = (photo, point) => detectSheet(photo.image, point, { luma: getLuma(photo) });
 
-/** js/screens/sheet.js: is a detected outline shown as the sheet, or does the screen ask for manual corners? */
-const sheetAccepted = (config, state, photo, sheet) =>
-  Boolean(sheet.ok) &&
-  sheetOutlineIsPlausible(sheet.quad, getSheetMm(state, config), photo.width, photo.height, config.measurement.plausible);
+/** js/screens/sheet.js: what the screen makes of the tap: 'found', 'check' (kept, but not trusted) or 'manual'. */
+const sheetOutcome = (config, state, photo, sheet) =>
+  sheetDetectionOutcome(sheet, getSheetMm(state, config), photo.width, photo.height, config.measurement.plausible);
 
-/** js/screens/door.js: "Measure my door". */
-function measure(config, state, photo, sheet, doorPx) {
+/** js/screens/sheet.js: is a detected outline announced as the sheet (the green "Auto-detected" state)? */
+const sheetAccepted = (config, state, photo, sheet) => sheetOutcome(config, state, photo, sheet) === 'found';
+
+/**
+ * js/screens/sheet.js: what the screen keeps in state.sheet after the tap. Only an outline announced as
+ * found counts as snapped corners; one the screen is unsure of is kept for the customer to check and is
+ * measured as hand-placed. Null when the customer is sent to place the corners by hand.
+ */
+function markedSheet(config, state, photo, sheet) {
+  const outcome = sheetOutcome(config, state, photo, sheet);
+  return outcome === 'manual' ? null : { points: sheet.quad, refined: outcome === 'found' };
+}
+
+/** js/screens/door.js: "Measure my door", from the corners kept in state.sheet and the marked door corners. */
+function measure(config, state, photo, marked, doorPx) {
   const m = config.measurement;
   return measureDoor({
-    sheetPx: sheet.quad,
+    sheetPx: marked.points,
     doorPx,
     sheetMm: getSheetMm(state, config),
     imageSize: { width: photo.width, height: photo.height },
-    sigmaSheetPx: sheet.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
+    sigmaSheetPx: marked.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
     sigmaDoorPx: m.sigmaDoorPx,
     plausible: m.plausible,
   });
@@ -177,6 +199,9 @@ const leadMeasurement = (size, result) => ({
   sigmaHeightMm: result.sigmaHeightMm,
 });
 
+/** js/screens/details.js: is the size being sent the bundled demo door's, not the customer's own? */
+const isDemoDoor = (size, photo) => size.source !== 'manual' && photo.isDemo === true;
+
 /**
  * Photograph a scene and take it as far as a size, the way a customer would: one tap in the middle of
  * the sheet, then four door corners placed a couple of pixels out. Never asserts and never throws for a
@@ -187,10 +212,11 @@ function runPipeline(sceneOptions, config = baseConfig) {
   const photo = asPhoto(image);
   const state = initialState(config);
   const sheet = tapSheet(photo, centroid(truth.sheetPx));
+  const marked = markedSheet(config, state, photo, sheet);
   const doorPx = slipQuad(truth.doorPx, DOOR_SEED, DOOR_SLIP_PX);
-  const result = sheet.ok ? measure(config, state, photo, sheet, doorPx) : null;
+  const result = marked ? measure(config, state, photo, marked, doorPx) : null;
   const size = result && result.ok ? toSize(config, result) : null;
-  return { config, photo, truth, state, sheet, doorPx, result, size };
+  return { config, photo, truth, state, sheet, marked, doorPx, result, size };
 }
 
 /** Colour of the flattened preview at a door-plane position (mm from the opening's top-left corner). */
@@ -263,7 +289,7 @@ function sweepDoorSlips(run, { widthTolMm, heightTolMm }) {
   let sumZ2 = 0;
   let measured = 0;
   for (let seed = 1; seed <= SWEEP_SEEDS; seed++) {
-    const result = measure(run.config, run.state, run.photo, run.sheet, slipQuad(run.truth.doorPx, seed, DOOR_SLIP_PX));
+    const result = measure(run.config, run.state, run.photo, run.marked, slipQuad(run.truth.doorPx, seed, DOOR_SLIP_PX));
     if (!result.ok) {
       stats.failed++;
       continue;
@@ -361,21 +387,24 @@ function optionCombinations(options) {
   return combos;
 }
 
+/** Whole cents, the unit js/quote.js adds up in: amounts in currency units pick up float noise once cents are involved. */
+const cents = (amount) => Math.round(amount * 100);
+
 function assertQuoteAddsUp(quote, config, label) {
   assert.equal(quote.ok, true, `${label}: ok (${quote.messages.join(' ')})`);
   assert.equal(quote.status, 'ok', label);
   assert.ok(quote.total > 0, `${label}: positive total`);
   const lineTotal = sum(quote.lineItems.map((item) => item.amount));
   const expected = config.pricing.pricesIncludeTax ? lineTotal : lineTotal + quote.taxAmount;
-  assert.equal(quote.total, expected, `${label}: total equals the sum of its line items`);
-  assert.equal(quote.subtotal + quote.taxAmount, quote.total, `${label}: subtotal + tax = total`);
+  assert.equal(cents(quote.total), cents(expected), `${label}: total equals the sum of its line items`);
+  assert.equal(cents(quote.subtotal + quote.taxAmount), cents(quote.total), `${label}: subtotal + tax = total`);
   assert.equal(quote.currency, config.pricing.currency);
   assert.equal(quote.lineItems[0].id, 'product');
 }
 
 async function assertLeadGoesThrough(run, quote, product) {
-  const { config, size, result } = run;
-  assert.equal(leadMode(config), 'demo', 'the shipped config sends nothing anywhere');
+  const { config, size, result, photo } = run;
+  assert.equal(leadMode(config), 'demo', 'the shipped settings send nothing anywhere');
 
   assert.deepEqual(validateCustomer(config, CUSTOMER), { ok: true, errors: {} });
   const refused = validateCustomer(config, { ...CUSTOMER, consent: false });
@@ -391,11 +420,13 @@ async function assertLeadGoesThrough(run, quote, product) {
     includeInstallation: quote.includeInstallation,
     product,
     photoDataUrl: null,
+    demo: isDemoDoor(size, photo),
     now: new Date('2026-03-04T05:06:07Z'),
   });
   assert.match(payload.reference, /^SM-[0-9A-Z]{6}$/);
   assert.equal(payload.createdAt, '2026-03-04T05:06:07.000Z');
   assert.equal(payload.brand, config.brand.name);
+  assert.equal(payload.demo, photo.isDemo, 'marked as a demo only when the size came from the bundled demo photo');
   assert.equal(payload.customer.name, CUSTOMER.name);
   assert.equal(payload.customer.consent, true);
   assert.equal(payload.measurement.widthMm, size.widthMm);
@@ -416,7 +447,7 @@ async function assertLeadGoesThrough(run, quote, product) {
 
 /** The enquiry for a run's size with the first product at its default options, built under `config`. */
 function enquiryFor(config, run) {
-  const { size, result } = run;
+  const { size, result, photo } = run;
   const product = config.pricing.products[0];
   const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
   return buildLeadPayload({
@@ -428,6 +459,7 @@ function enquiryFor(config, run) {
     includeInstallation: quote.includeInstallation,
     product,
     photoDataUrl: null,
+    demo: isDemoDoor(size, photo),
     now: new Date('2026-03-04T05:06:07Z'),
   });
 }
@@ -508,15 +540,41 @@ describe('demo scene, default config: one photo to a price and an enquiry', () =
   test('"Snap to edges" pulls hand-placed sheet corners onto the paper', () => {
     for (let seed = 1; seed <= 20; seed++) {
       const rough = slipQuad(demo.truth.sheetPx, seed, 6);
-      const snapped = refineQuad(getLuma(demo.photo), rough);
+      // The photo itself, as the screen passes it: the snap then has the sheet's colour to check against.
+      const snapped = refineQuad(demo.photo.image, rough);
       assert.equal(snapped.ok, true, `seed ${seed}: ${snapped.reason}`);
       const error = maxCornerError(snapped.quad, demo.truth.sheetPx);
       assert.ok(error <= CLEAN_SHEET_TOL_PX, `seed ${seed}: worst corner ${error.toFixed(3)} px from the truth`);
     }
   });
 
-  test('door corners marked a couple of pixels out still measure 820 x 2040 mm', () => {
+  test('door corners marked a couple of pixels out still measure 820 x 2040 mm', (t) => {
     assertMeasured(demo, { widthTolMm: 4, heightTolMm: 6, orientation: 'portrait' });
+    // The README quotes this result ("Simulated accuracy" and the sample enquiry): if it moves, so must they.
+    const { result, size } = demo;
+    t.diagnostic(
+      `${size.widthMm} x ${size.heightMm} mm, graded ${result.quality.level}, sigma ${result.sigmaWidthMm.toFixed(1)} / ${result.sigmaHeightMm.toFixed(1)} mm`,
+    );
+    assert.equal(result.quality.level, 'good', 'a clean, straight-on photo with snapped sheet corners is a good measurement');
+    assert.deepEqual(result.quality.issues, []);
+  });
+
+  test('an outline the sheet screen is unsure of is kept, but measured as hand-placed corners', () => {
+    const { config, state, photo, sheet, doorPx, result } = demo;
+    // What detectSheet returns when it cannot confirm a side against the paper, or is not confident.
+    for (const unsure of [{ ...sheet, refined: false, confidence: 0.4, reason: 'off_sheet' }, { ...sheet, confidence: 0.65 }]) {
+      assert.equal(sheetOutcome(config, state, photo, unsure), 'check');
+      const marked = markedSheet(config, state, photo, unsure);
+      assert.deepEqual(marked, { points: sheet.quad, refined: false });
+      const rough = measure(config, state, photo, marked, doorPx);
+      assert.equal(rough.ok, true);
+      // The same corners, so much the same size; what changes is how far the app trusts it.
+      assert.ok(Math.abs(rough.widthMm - result.widthMm) < 2 && Math.abs(rough.heightMm - result.heightMm) < 4);
+      assert.ok(rough.sigmaHeightMm > 2 * result.sigmaHeightMm, `sigma ${rough.sigmaHeightMm.toFixed(1)} mm against ${result.sigmaHeightMm.toFixed(1)} mm`);
+      assert.equal(rough.quality.level, 'poor', 'hand-placed sheet corners grade poor (shown as a rough measurement)');
+    }
+    // Nothing usable sends the customer to place the corners by hand: there is nothing to measure yet.
+    assert.equal(markedSheet(config, state, photo, { ok: false, quad: null, refined: false, confidence: 0, reason: 'cut_off' }), null);
   });
 
   test('the answer holds however the door corners are a couple of pixels out', (t) => {
@@ -524,8 +582,8 @@ describe('demo scene, default config: one photo to a price and an enquiry', () =
   });
 
   test('corner order and the way round the sheet size is given make no difference', () => {
-    const { config, photo, sheet, doorPx, result } = demo;
-    const shuffledSheet = { ...sheet, quad: [sheet.quad[2], sheet.quad[0], sheet.quad[3], sheet.quad[1]] };
+    const { config, photo, marked, doorPx, result } = demo;
+    const shuffledSheet = { ...marked, points: [marked.points[2], marked.points[0], marked.points[3], marked.points[1]] };
     const shuffledDoor = [doorPx[3], doorPx[1], doorPx[0], doorPx[2]];
     const sideways = { referenceId: 'custom', customReference: { widthMm: 297, heightMm: 210 } };
     const again = measure(config, sideways, photo, shuffledSheet, shuffledDoor);
@@ -559,10 +617,11 @@ describe('demo scene, default config: one photo to a price and an enquiry', () =
     await assertLeadGoesThrough(demo, quote, product);
   });
 
-  test('with lead.endpoint set, the same enquiry is POSTed to the company as JSON', async (t) => {
+  test('with lead.endpoint set, the same enquiry is POSTed to the company as JSON text, with no preflight', async (t) => {
     const config = deepMerge(baseConfig, { lead: { endpoint: 'https://crm.example/securemeasure-leads' } });
     assert.equal(leadMode(config), 'webhook');
     const payload = enquiryFor(config, demo);
+    assert.equal(payload.demo, false);
 
     const requests = [];
     t.mock.method(globalThis, 'fetch', async (url, init) => {
@@ -573,8 +632,17 @@ describe('demo scene, default config: one photo to a price and an enquiry', () =
     assert.equal(requests.length, 1);
     assert.equal(requests[0].url, 'https://crm.example/securemeasure-leads');
     assert.equal(requests[0].init.method, 'POST');
-    assert.equal(requests[0].init.headers['Content-Type'], 'application/json');
+    // A CORS "simple" request, so a webhook on another domain gets no preflight: text/plain is the only
+    // header, and nothing asks for cookies or credentials.
+    assert.deepEqual(requests[0].init.headers, { 'Content-Type': 'text/plain;charset=UTF-8' });
+    assert.ok(!('credentials' in requests[0].init) && !('mode' in requests[0].init));
     assert.deepEqual(JSON.parse(requests[0].init.body), payload);
+
+    // A company's own server that insists on application/json (and answers the preflight) can ask for it.
+    const asJson = deepMerge(config, { lead: { contentType: 'application/json' } });
+    assert.deepEqual(await submitLead(asJson, payload), { ok: true, mode: 'webhook' });
+    assert.deepEqual(requests[1].init.headers, { 'Content-Type': 'application/json' });
+    assert.equal(requests[1].init.body, requests[0].init.body);
 
     t.mock.method(globalThis, 'fetch', async () => ({ ok: false, status: 500 }));
     assert.deepEqual(await submitLead(config, payload), { ok: false, mode: 'webhook', error: 'http_500' });
@@ -594,6 +662,7 @@ describe('demo scene, default config: one photo to a price and an enquiry', () =
       assert.equal(url.pathname, 'sales@doors.example');
       assert.ok(globalThis.location.href.length < 2000, 'short enough for every mail client');
       assert.ok(url.searchParams.get('subject').includes(payload.reference));
+      assert.ok(!url.searchParams.get('subject').includes('[DEMO]'), "the customer's own door is not tagged as a demo");
       const body = url.searchParams.get('body');
       for (const line of [
         `Reference: ${payload.reference}`,
@@ -631,20 +700,54 @@ describe('bundled demo photo (assets/demo-door.png)', () => {
     assert.equal(truthJson.heightMm, TRUE_HEIGHT_MM);
   });
 
+  /** The demo photo as "Try it with a demo photo" loads it, taken as far as a size with the true door corners. */
+  function runDemoPhoto(config) {
+    const photo = asPhoto(decodePng(pngBytes), { isDemo: true });
+    // js/screens/welcome.js: the demo photo is always measured with its own A4 sheet, whatever is selected.
+    const state = { referenceId: 'custom', customReference: { widthMm: 210, heightMm: 297 } };
+    const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
+    const marked = markedSheet(config, state, photo, sheet);
+    const result = marked ? measure(config, state, photo, marked, truthJson.doorPx) : null;
+    const size = result && result.ok ? toSize(config, result) : null;
+    return { config, photo, state, sheet, marked, doorPx: truthJson.doorPx, result, size };
+  }
+
   test('measures 820 x 2040 mm from one tap and the true door corners', () => {
-    const photo = asPhoto(decodePng(pngBytes));
+    const run = runDemoPhoto(baseConfig);
+    const { photo, sheet, result } = run;
     assert.equal(photo.width, truthJson.imageWidth);
     assert.equal(photo.height, truthJson.imageHeight);
 
-    const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
     assertSheetFound(sheet, truthJson.sheetPx, CLEAN_SHEET_TOL_PX, 'committed photo');
+    assert.equal(sheetAccepted(baseConfig, run.state, photo, sheet), true, 'and the screen accepts it');
 
-    const result = measure(baseConfig, initialState(baseConfig), photo, sheet, truthJson.doorPx);
     assert.equal(result.ok, true);
     assert.ok(Math.abs(result.widthMm - truthJson.widthMm) < 1, `width ${result.widthMm.toFixed(2)} mm`);
     assert.ok(Math.abs(result.heightMm - truthJson.heightMm) < 1, `height ${result.heightMm.toFixed(2)} mm`);
     assert.ok(['good', 'fair'].includes(result.quality.level), `quality ${result.quality.level}`);
-    assert.deepEqual(toSize(baseConfig, result), { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM, source: 'photo' });
+    assert.deepEqual(run.size, { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM, source: 'photo' });
+  });
+
+  test('an enquiry measured from it is marked as a demo, in the data and in the email', async () => {
+    const run = runDemoPhoto(baseConfig);
+    assert.equal(enquiryFor(baseConfig, run).demo, true);
+
+    // A size the customer typed in after trying the demo is their own door, not the demo door.
+    const typed = { ...run, size: { widthMm: 900, heightMm: 2100, source: 'manual' } };
+    assert.equal(enquiryFor(baseConfig, typed).demo, false);
+
+    const config = deepMerge(baseConfig, { lead: { mailto: 'sales@doors.example' } });
+    const payload = enquiryFor(config, run);
+    globalThis.location = { href: 'https://doors.example/measure/' };
+    try {
+      assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'mailto' });
+      const url = new URL(globalThis.location.href);
+      assert.ok(url.searchParams.get('subject').startsWith('[DEMO] '), `subject: ${url.searchParams.get('subject')}`);
+      assert.ok(url.searchParams.get('subject').includes(payload.reference));
+      assert.ok(url.searchParams.get('body').includes('from the built-in demo photo'), 'the body says whose door it is');
+    } finally {
+      delete globalThis.location;
+    }
   });
 });
 
@@ -766,6 +869,30 @@ describe('white paper on a white door', () => {
   });
 });
 
+describe('pale, pastel and grey sheets on a white door', () => {
+  // Their shadow is the same sort of colour as the paper, only a little darker, and its far edge is the
+  // strongest edge about. An outline that settles there makes the door about 5% small, so the sheet screen
+  // must not announce it as found; an outline it is unsure of is measured as hand-placed, whose wider
+  // plus-or-minus still covers the true size.
+  const SHEETS = { cream: '#efe4c8', 'pastel pink': '#ffd1dc', lavender: '#d8cdea', 'pale grey': '#dcdcdc', 'light grey': '#c8c8c8' };
+  for (const [name, color] of Object.entries(SHEETS)) {
+    test(`${name}: not announced as found off the paper, and the size shown covers 820 x 2040 mm`, (t) => {
+      const run = runPipeline({ ...WHITE_DOOR_SCENE, sheet: { ...DEMO_SCENE.sheet, color } });
+      const { config, state, photo, sheet, truth, result } = run;
+      assert.equal(sheet.ok, true, `sheet found (reason: ${sheet.reason})`);
+      const outcome = sheetOutcome(config, state, photo, sheet);
+      const error = maxCornerError(sheet.quad, truth.sheetPx);
+      t.diagnostic(`${outcome} (${sheet.reason ?? 'refined'}), worst corner ${error.toFixed(2)} px; ${result.widthMm.toFixed(0)} x ${result.heightMm.toFixed(0)} mm, ${result.quality.level}`);
+      if (outcome === 'found') assert.ok(error <= PALE_SHEET_TOL_PX, `announced as found ${error.toFixed(2)} px off the paper`);
+      else assert.equal(outcome, 'check');
+      assert.ok(result.ok, result.message);
+      // "Accurate to about +/- N mm" is two standard deviations.
+      assert.ok(Math.abs(result.widthMm - 820) <= 2 * result.sigmaWidthMm, `width ${result.widthMm.toFixed(1)} +/- ${(2 * result.sigmaWidthMm).toFixed(1)}`);
+      assert.ok(Math.abs(result.heightMm - 2040) <= 2 * result.sigmaHeightMm, `height ${result.heightMm.toFixed(1)} +/- ${(2 * result.sigmaHeightMm).toFixed(1)}`);
+    });
+  }
+});
+
 /* ------------------------------------------------------------------------------------------------------ */
 /* Skins                                                                                                  */
 /* ------------------------------------------------------------------------------------------------------ */
@@ -774,17 +901,20 @@ describe('acme skin (?skin=acme): the same photo through a re-skinned config', (
   let acme;
   let demo;
   let run;
-  before(async () => {
-    acme = await loadConfig('?skin=acme');
+  before(() => {
+    // What loadConfig('?skin=acme') builds, laid over the shipped settings rather than over js/config.js.
+    acme = deepMerge(baseConfig, acmeSkin);
     demo = getDemoRun();
     // Same photo and the same marked corners as the default run, measured with the skinned config.
     const { photo, truth, sheet, doorPx } = demo;
     const state = initialState(acme);
-    const result = sheet.ok ? measure(acme, state, photo, sheet, doorPx) : null;
-    run = { config: acme, photo, truth, state, sheet, doorPx, result, size: result && result.ok ? toSize(acme, result) : null };
+    const marked = markedSheet(acme, state, photo, sheet);
+    const result = marked ? measure(acme, state, photo, marked, doorPx) : null;
+    run = { config: acme, photo, truth, state, sheet, marked, doorPx, result, size: result && result.ok ? toSize(acme, result) : null };
   });
 
   test('the skin is merged over the default config', () => {
+    assert.equal(acme.brand.name, acmeSkin.brand.name);
     assert.notEqual(acme.brand.name, baseConfig.brand.name);
     assert.notDeepEqual(acme.pricing.products.map((p) => p.id), baseConfig.pricing.products.map((p) => p.id));
     assert.deepEqual(acme.measurement, baseConfig.measurement, 'measurement settings are inherited');
@@ -852,5 +982,97 @@ describe('acme skin (?skin=acme): the same photo through a re-skinned config', (
     assert.equal(payload.brand, 'Acme Security Doors');
     assert.deepEqual(payload.selections, selections);
     assert.equal(payload.includeInstallation, false);
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------------ */
+/* js/config.js itself                                                                                    */
+/* ------------------------------------------------------------------------------------------------------ */
+
+// Everything above runs on the fixed copy of the shipped settings. This group is the only one that reads
+// js/config.js, and it pins nothing in it: each check holds for any settings the app can run with, so it
+// keeps passing after a door company has put in its own sheets, sizes, prices and form. A failure here
+// is about js/config.js, not about the measuring code.
+describe('js/config.js as it stands: your own settings through the same steps', () => {
+  const pngBytes = readFileSync(new URL('../assets/demo-door.png', import.meta.url));
+  const truthJson = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+  const config = liveConfig;
+
+  /** An answer for every question on the company's own form, valid for its type. */
+  function customerFor(fields) {
+    const byType = { tel: CUSTOMER.phone, email: CUSTOMER.email, textarea: CUSTOMER.notes };
+    return { ...Object.fromEntries(fields.map((field) => [field.id, byType[field.type] ?? 'Alex Taylor'])), consent: true };
+  }
+
+  test('the demo photo measures 820 x 2040 mm with its measurement settings', () => {
+    const photo = asPhoto(decodePng(pngBytes), { isDemo: true });
+    // js/screens/welcome.js: the demo photo is always measured with its own A4 sheet, whatever is selected.
+    const state = { referenceId: 'custom', customReference: { widthMm: 210, heightMm: 297 } };
+    const sheet = tapSheet(photo, centroid(truthJson.sheetPx));
+    const marked = markedSheet(config, state, photo, sheet);
+    assert.ok(marked, 'the sheet in the demo photo is outlined (if not, look at measurement.plausible in js/config.js)');
+
+    const result = measure(config, state, photo, marked, truthJson.doorPx);
+    assert.equal(result.ok, true, `measured with the settings in js/config.js (${result.error}: ${result.message})`);
+    // The corner settings weight the fit; with corners this well placed they barely move the size.
+    assert.ok(Math.abs(result.widthMm - truthJson.widthMm) < 3, `width ${result.widthMm.toFixed(1)} mm with the sigma settings in js/config.js`);
+    assert.ok(Math.abs(result.heightMm - truthJson.heightMm) < 3, `height ${result.heightMm.toFixed(1)} mm with the sigma settings in js/config.js`);
+
+    const size = toSize(config, result);
+    assert.ok(
+      Number.isFinite(size.widthMm) && Number.isFinite(size.heightMm) && size.widthMm > 0 && size.heightMm > 0,
+      `measurement.adjustments and roundToMm in js/config.js give a usable size (${size.widthMm} x ${size.heightMm})`,
+    );
+  });
+
+  test('every door on its price list prices the demo door, or sends it for a custom quote', (t) => {
+    const size = toSize(config, { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM });
+    const products = config.pricing.products;
+    assert.ok(Array.isArray(products) && products.length > 0, 'js/config.js lists at least one door under pricing.products');
+    let priced = 0;
+    for (const product of products) {
+      for (const includeInstallation of [true, false]) {
+        const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id, includeInstallation });
+        const what = `js/config.js, ${product.id}, installation ${includeInstallation}`;
+        if (quote.status === 'out_of_range') {
+          // A legitimate answer: this company does not price an 820 x 2040 mm door on the spot.
+          assert.ok(quote.messages.length > 0, `${what}: the customer is told why there is no instant price`);
+          continue;
+        }
+        assertQuoteAddsUp(quote, config, what);
+        assert.equal(quote.productId, product.id, what);
+        priced++;
+      }
+    }
+    t.diagnostic(`${size.widthMm} x ${size.heightMm} mm: ${priced} of ${products.length * 2} quotes priced, the rest sent for a custom quote`);
+  });
+
+  test('an enquiry for the demo door builds from its own form', () => {
+    const size = toSize(config, { widthMm: TRUE_WIDTH_MM, heightMm: TRUE_HEIGHT_MM });
+    const product = config.pricing.products[0];
+    const quote = calculateQuote(config, { widthMm: size.widthMm, heightMm: size.heightMm, productId: product.id });
+    const customer = customerFor(config.lead.fields);
+    assert.deepEqual(validateCustomer(config, customer), { ok: true, errors: {} }, 'an answer to every question in lead.fields is accepted');
+
+    const payload = buildLeadPayload({
+      config,
+      customer,
+      measurement: { ...size, quality: 'good', sigmaWidthMm: 4.5, sigmaHeightMm: 7.9 },
+      quote,
+      selections: quote.selections,
+      includeInstallation: quote.includeInstallation,
+      product,
+      demo: true,
+    });
+    assert.equal(payload.brand, config.brand.name);
+    assert.equal(payload.demo, true);
+    for (const field of config.lead.fields) assert.equal(payload.customer[field.id], customer[field.id], `the enquiry carries the answer to "${field.id}"`);
+    assert.equal(payload.customer.consent, true);
+    assert.equal(payload.measurement.widthMm, size.widthMm);
+    assert.equal(payload.measurement.heightMm, size.heightMm);
+    assert.deepEqual(payload.product, { id: String(product.id), name: String(product.name) });
+    assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload, 'the enquiry survives JSON unchanged');
+    // Not submitted: with lead.endpoint filled in, that would post a made-up enquiry to the company's own system.
+    assert.ok(['webhook', 'mailto', 'demo'].includes(leadMode(config)));
   });
 });

@@ -2,8 +2,11 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { deepMerge, loadConfig, applyTheme } from '../js/theme.js';
-import baseConfig from '../js/config.js';
+import liveConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
+// js/config.js is there to be edited, so only the loadConfig tests read it (and compare against whatever
+// it holds). The applyTheme tests need known colours and run on the fixed copy of the shipped settings.
+import { SHIPPED_CONFIG as baseConfig } from './helpers/shipped-config.mjs';
 
 /** The exact custom property names from the build contract. */
 const THEME_PROPERTIES = [
@@ -146,28 +149,29 @@ describe('deepMerge', () => {
 
 describe('loadConfig', () => {
   test('with no skin returns the base config', async () => {
-    assert.deepEqual(await loadConfig(''), baseConfig);
-    assert.deepEqual(await loadConfig('?other=1'), baseConfig);
-    assert.deepEqual(await loadConfig('?skin='), baseConfig);
+    assert.deepEqual(await loadConfig(''), liveConfig);
+    assert.deepEqual(await loadConfig('?other=1'), liveConfig);
+    assert.deepEqual(await loadConfig('?skin='), liveConfig);
   });
 
   test('works with no argument where there is no page location (Node)', async () => {
     assert.equal(typeof globalThis.location, 'undefined');
-    assert.deepEqual(await loadConfig(), baseConfig);
+    assert.deepEqual(await loadConfig(), liveConfig);
   });
 
   test('returns an independent copy on every call', async () => {
+    const before = structuredClone(liveConfig);
     const first = await loadConfig('');
-    first.brand.name = 'Changed';
+    first.brand.name = `${first.brand.name} (changed)`;
     first.pricing.products.length = 0;
     first.text['welcome.title'] = 'Changed';
 
     const second = await loadConfig('');
     assert.notEqual(second, first);
-    assert.equal(second.brand.name, baseConfig.brand.name);
+    assert.equal(second.brand.name, before.brand.name);
     assert.ok(second.pricing.products.length > 0);
-    assert.deepEqual(second.text, {});
-    assert.deepEqual(baseConfig.text, {}, 'the default export itself must not be touched');
+    assert.deepEqual(second.text, before.text);
+    assert.deepEqual(liveConfig, before, 'the default export itself must not be touched');
   });
 
   test('with ?skin=acme merges the skin over the base', async (t) => {
@@ -175,7 +179,7 @@ describe('loadConfig', () => {
     const config = await loadConfig('?skin=acme');
 
     assert.equal(warnings.callCount(), 0);
-    assert.deepEqual(config, deepMerge(baseConfig, acmeSkin));
+    assert.deepEqual(config, deepMerge(liveConfig, acmeSkin));
 
     // Overridden by the skin.
     assert.equal(config.brand.name, 'Acme Security Doors');
@@ -185,13 +189,13 @@ describe('loadConfig', () => {
     assert.equal(config.text['welcome.title'], acmeSkin.text['welcome.title']);
 
     // Inherited untouched from the base.
-    assert.equal(config.brand.fontFamily, baseConfig.brand.fontFamily);
-    assert.equal(config.brand.colors.success, baseConfig.brand.colors.success);
-    assert.deepEqual(config.measurement, baseConfig.measurement);
-    assert.deepEqual(config.pricing.options, baseConfig.pricing.options);
-    assert.deepEqual(config.pricing.limits, baseConfig.pricing.limits);
-    assert.deepEqual(config.lead, baseConfig.lead);
-    assert.deepEqual(config.embed, baseConfig.embed);
+    assert.equal(config.brand.fontFamily, liveConfig.brand.fontFamily);
+    assert.equal(config.brand.colors.success, liveConfig.brand.colors.success);
+    assert.deepEqual(config.measurement, liveConfig.measurement);
+    assert.deepEqual(config.pricing.options, liveConfig.pricing.options);
+    assert.deepEqual(config.pricing.limits, liveConfig.pricing.limits);
+    assert.deepEqual(config.lead, liveConfig.lead);
+    assert.deepEqual(config.embed, liveConfig.embed);
   });
 
   test('finds the skin among other query parameters', async () => {
@@ -219,7 +223,7 @@ describe('loadConfig', () => {
     test(`with ${label} warns and returns the base config`, async (t) => {
       const warnings = captureWarnings(t);
       const config = await loadConfig(search);
-      assert.deepEqual(config, baseConfig);
+      assert.deepEqual(config, liveConfig);
       assert.equal(warnings.callCount(), 1);
       // The "invalid name" warning proves the name was rejected before any import was attempted.
       assert.match(warningText(warnings), /invalid skin name/i);
@@ -229,7 +233,7 @@ describe('loadConfig', () => {
   test('accepts the longest allowed name shape (and falls back when the file is missing)', async (t) => {
     const warnings = captureWarnings(t);
     const config = await loadConfig(`?skin=${'a'.repeat(40)}`);
-    assert.deepEqual(config, baseConfig);
+    assert.deepEqual(config, liveConfig);
     assert.equal(warnings.callCount(), 1);
     assert.match(warningText(warnings), /could not load skin/i);
   });
@@ -237,14 +241,14 @@ describe('loadConfig', () => {
   test('with a missing skin warns and returns the base config', async (t) => {
     const warnings = captureWarnings(t);
     const config = await loadConfig('?skin=no-such-skin-9');
-    assert.deepEqual(config, baseConfig);
+    assert.deepEqual(config, liveConfig);
     assert.equal(warnings.callCount(), 1);
     assert.match(warningText(warnings), /could not load skin "no-such-skin-9"/i);
   });
 
   test('tolerates a non-string argument', async () => {
-    assert.deepEqual(await loadConfig(null), baseConfig);
-    assert.deepEqual(await loadConfig(12345), baseConfig);
+    assert.deepEqual(await loadConfig(null), liveConfig);
+    assert.deepEqual(await loadConfig(12345), liveConfig);
     const viaParams = await loadConfig(new URLSearchParams('skin=acme'));
     assert.equal(viaParams.brand.name, 'Acme Security Doors');
   });
@@ -323,8 +327,8 @@ describe('applyTheme', () => {
     }
   });
 
-  test('sets all 14 custom properties from the acme-skinned config', async () => {
-    const config = await loadConfig('?skin=acme');
+  test('sets all 14 custom properties from the acme-skinned config', () => {
+    const config = deepMerge(baseConfig, acmeSkin);
     const { root, properties } = fakeDom();
     applyTheme(config, root);
 
@@ -335,6 +339,18 @@ describe('applyTheme', () => {
     assert.equal(properties.get('--sm-accent-contrast'), acmeSkin.brand.colors.accentContrast);
     assert.equal(properties.get('--sm-radius'), acmeSkin.brand.radius);
     assert.equal(properties.get('--sm-success'), baseConfig.brand.colors.success);
+  });
+
+  test('writes every brand setting in js/config.js as it stands: none is skipped as not valid', (t) => {
+    // The one applyTheme test that reads js/config.js. It pins no colour: it only checks that each of the
+    // 14 settings is usable. (A primary colour too light to read as text is allowed: that is handled, with
+    // a console warning, and adds --sm-ink-primary.)
+    captureWarnings(t);
+    const { root, properties } = fakeDom();
+    applyTheme(liveConfig, root);
+    for (const name of THEME_PROPERTIES) {
+      assert.ok(properties.has(name), `${name} was not set: the matching brand setting in js/config.js is missing or not valid`);
+    }
   });
 
   test('sets the document title from the brand', () => {
@@ -394,6 +410,64 @@ describe('applyTheme', () => {
     const rem = fakeDom();
     applyTheme(deepMerge(baseConfig, { brand: { radius: '0.75rem' } }), rem.root);
     assert.equal(rem.properties.get('--sm-radius'), '0.75rem');
+  });
+
+  test('a primary colour too light to read as text hands its labels to the text colour', (t) => {
+    const warnings = captureWarnings(t);
+    const { root, properties } = fakeDom();
+    applyTheme(deepMerge(baseConfig, { brand: { colors: { primary: '#ffd400', primaryContrast: '#111111' } } }), root);
+    assert.equal(properties.get('--sm-primary'), '#ffd400', 'fills and borders keep the brand colour');
+    assert.equal(properties.get('--sm-ink-primary'), baseConfig.brand.colors.text);
+    assert.equal(properties.size, 15);
+    assert.equal(warnings.callCount(), 1);
+    assert.match(warningText(warnings), /brand\.colors\.primary/);
+  });
+
+  test('a light primary on a dark page is readable, so it is left alone', (t) => {
+    const warnings = captureWarnings(t);
+    const { root, properties } = fakeDom();
+    const dark = { primary: '#ffd400', primaryContrast: '#111111', surface: '#1b1b1f', background: '#101014', text: '#f5f5f5' };
+    applyTheme(deepMerge(baseConfig, { brand: { colors: dark } }), root);
+    assert.equal(properties.has('--sm-ink-primary'), false);
+    assert.equal(properties.size, 14);
+    assert.equal(warnings.callCount(), 0);
+  });
+
+  /** fakeDom, with a root that keeps attributes the way <html> does. It starts with the language index.html declares. */
+  function fakeDomWithLang() {
+    const dom = fakeDom();
+    const attributes = new Map([['lang', 'en-AU']]);
+    dom.root.setAttribute = (name, value) => attributes.set(name, String(value));
+    return { ...dom, attributes };
+  }
+
+  test('sets the page language from brand.lang', (t) => {
+    const warnings = captureWarnings(t);
+    for (const [lang, expected] of [[baseConfig.brand.lang, baseConfig.brand.lang], ['de', 'de'], [' fr-CA ', 'fr-CA'], ['zh-Hant-TW', 'zh-Hant-TW']]) {
+      const { root, attributes, properties } = fakeDomWithLang();
+      applyTheme(deepMerge(baseConfig, { brand: { lang } }), root);
+      assert.equal(attributes.get('lang'), expected);
+      assert.equal(properties.size, 14, 'the language is an attribute, not a custom property');
+    }
+    assert.equal(warnings.callCount(), 0);
+  });
+
+  test('keeps the page language when brand.lang is missing, and warns when it is not a language tag', (t) => {
+    const warnings = captureWarnings(t);
+    for (const lang of ['', null]) {
+      const { root, attributes } = fakeDomWithLang();
+      applyTheme(deepMerge(baseConfig, { brand: { lang } }), root);
+      assert.equal(attributes.get('lang'), 'en-AU');
+    }
+    assert.equal(warnings.callCount(), 0, 'not set is not a mistake');
+
+    for (const lang of ['English', 'en_AU', 'de"><script>', 42]) {
+      const { root, attributes } = fakeDomWithLang();
+      applyTheme(deepMerge(baseConfig, { brand: { lang } }), root);
+      assert.equal(attributes.get('lang'), 'en-AU', `${JSON.stringify(lang)} must not reach the page`);
+    }
+    assert.equal(warnings.callCount(), 4);
+    assert.match(warningText(warnings), /brand\.lang/);
   });
 
   test('copes with a root that has no document, and with a missing config', (t) => {

@@ -28,7 +28,7 @@ const FALLBACK_GUARDS = {
   welcome: () => true,
   prepare: () => true,
   sheet: (state) => Boolean(state.photo),
-  door: (state) => Boolean(state.photo && state.sheet && state.sheet.points),
+  door: (state) => Boolean(state.photo && state.sheet && state.sheet.points && state.sheet.placed !== false),
   result: (state) => Boolean(state.measure || state.manualEntry),
   quote: (state) => Boolean(state.size),
   details: (state) => Boolean(state.size && state.quoteInput && state.quoteInput.productId),
@@ -40,6 +40,15 @@ const MAX_TOASTS = 3;
 /** How long to wait for the browser to report a history.go() before navigating without it. */
 const TRAVEL_TIMEOUT_MS = 700;
 const LOG_PREFIX = '[SecureMeasure]';
+
+/** Where the app's own modules are served from. Anything else that runs in the page is somebody else's code. */
+const APP_ROOT = new URL('..', import.meta.url).href;
+const OWN_SCRIPT_ROOTS = [`${APP_ROOT}js/`, `${APP_ROOT}skins/`];
+
+/** True when `text` (a script address or an error's stack) points at one of the app's own modules. */
+function mentionsOwnScript(text) {
+  return typeof text === 'string' && OWN_SCRIPT_ROOTS.some((root) => text.includes(root));
+}
 
 /**
  * Create a fresh shared state object for one measuring session.
@@ -53,6 +62,8 @@ export function createInitialState(config) {
     manualEntry: false,
     referenceId: measurement.defaultReferenceId,
     customReference: { widthMm: null, heightMm: null },
+    // The customer's own sheet choice, set aside while the demo photo is loaded (welcome.js / prepare.js).
+    ownReference: null,
     photo: null,
     sheet: { points: null, refined: false, detected: false },
     door: { points: null },
@@ -61,6 +72,8 @@ export function createInitialState(config) {
     quoteInput: { productId: null, selections: {}, includeInstallation: null },
     quote: null,
     customer: {},
+    // Reference and time of the first send, reused when a failed send is tried again (details.js).
+    leadAttempt: null,
     submission: null,
   };
 }
@@ -241,6 +254,45 @@ function startApp(config, els) {
     if (idx > 0) travel(-idx, 'welcome');
   }
 
+  // ----- interrupted photo -----
+  //
+  // A phone short of memory can close this page while its camera app is in front. The page then loads
+  // afresh when the customer comes back and the photo never arrives. A history entry survives that, so
+  // while a photo picker is open the entry carries a note of the sheet the customer chose (`picking`);
+  // the start-up code at the bottom of startApp() looks for it.
+
+  /** True from the tap that opens a photo picker until the page shows it is still here. */
+  let pickerOpen = false;
+
+  /** Put `note` on the current history entry, or take the note off again when it is null. */
+  function setPickerNote(note) {
+    const entry = history.state;
+    if (!entry || typeof entry.screen !== 'string' || (!note && !entry.picking)) return;
+    try {
+      history.replaceState(note ? { ...entry, picking: note } : { screen: entry.screen, idx: entry.idx }, '');
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} history update failed`, error);
+    }
+  }
+
+  /**
+   * If the page went away while a photo was being taken on "Get set up", put the customer's sheet
+   * choice back into the (fresh) state and report true: that screen is where to pick up again.
+   */
+  function restoreInterruptedPhoto() {
+    const entry = history.state;
+    const note = entry && entry.screen === 'prepare' ? entry.picking : null;
+    if (!note || typeof note !== 'object') return false;
+    if (typeof note.referenceId === 'string') state.referenceId = note.referenceId;
+    const custom = note.customReference;
+    if (custom && typeof custom === 'object') {
+      for (const side of ['widthMm', 'heightMm']) {
+        if (Number.isFinite(custom[side])) state.customReference[side] = custom[side];
+      }
+    }
+    return true;
+  }
+
   // ----- chrome -----
 
   function renderBrand() {
@@ -379,11 +431,35 @@ function startApp(config, els) {
     }
   }
 
+  /** Watches the height of the visible screen's action bar (see trackActionBar). */
+  let barObserver = null;
+
   function unmountCurrent() {
     const previous = current;
     current = null;
+    if (barObserver) barObserver.disconnect();
+    barObserver = null;
     if (previous) runCleanup(previous.cleanup, previous.id);
     ui.closeOpenSheets();
+  }
+
+  /**
+   * Tell the scroller how much of its bottom edge the screen's sticky action bar covers. A field brought
+   * into view by Tab or the keyboard's Next key then stops above the bar instead of underneath it
+   * (scroll-padding-bottom on .sm-main in css/base.css).
+   */
+  function trackActionBar(root) {
+    // On a flush screen nothing scrolls and the bar is not sticky.
+    const bar = root.classList.contains('sm-screen--flush')
+      ? null
+      : Array.from(root.children).find((child) => child.classList.contains('sm-actionbar'));
+    const publish = () => els.main.style.setProperty('--sm-actionbar-h', `${bar ? bar.offsetHeight : 0}px`);
+    publish();
+    // The bar's height can change while it is on screen: the result screen swaps its buttons, labels wrap.
+    if (bar && typeof ResizeObserver === 'function') {
+      barObserver = new ResizeObserver(publish);
+      barObserver.observe(bar);
+    }
   }
 
   function renderCrash(root, id) {
@@ -445,6 +521,7 @@ function startApp(config, els) {
 
     current = { id, root, cleanup };
     updateHeader(id);
+    trackActionBar(root);
     els.main.scrollTop = 0;
     // Do not pull focus into the iframe when a host page first loads it.
     if (!(initial && embedded)) focusScreen(root);
@@ -464,15 +541,26 @@ function startApp(config, els) {
       writeHistory(target, stay ? idx : idx + 1, !stay);
       show(target);
     };
-    // Stepping back to an earlier step that is still in the history ("Adjust corners" on the result,
-    // "Retake photo", "Edit" on the quote) returns to that entry instead of stacking a copy on top.
-    // The history stays one entry per step, so Back always means "the previous step".
+    // Stepping back to an earlier step ("Adjust corners" on the result, "Retake photo", "Edit" on the
+    // quote) returns to that step's history entry instead of stacking a copy on top. The history stays
+    // one entry per step, in step order, so Back always means "the previous step".
     if (!stay && idx > 0 && SCREEN_ORDER.indexOf(target) < SCREEN_ORDER.indexOf(current.id)) {
-      const at = trail.lastIndexOf(target, idx - 1);
-      if (at >= 0) {
-        travel(at - idx, target, arrive);
-        return;
+      const order = SCREEN_ORDER.indexOf(target);
+      let at = trail.lastIndexOf(target, idx - 1);
+      if (at < 0) {
+        // The step has no entry of its own (the demo photo and a typed-in size both skip "Get set up").
+        // Take over the first entry that belongs to a later step, so none of those is left underneath
+        // for Back to land on.
+        at = 1;
+        while (at < idx && SCREEN_ORDER.indexOf(trail[at]) <= order) at += 1;
       }
+      if (at < idx) {
+        travel(at - idx, target, arrive);
+      } else {
+        writeHistory(target, idx, false);
+        show(target);
+      }
+      return;
     }
     arrive();
   }
@@ -548,16 +636,46 @@ function startApp(config, els) {
     if (trip && trip.next) trip.next();
   });
 
+  // Only failures in the app's own code are the customer's business. In-app browsers (Instagram,
+  // Facebook) and third-party tags run their own scripts in this page; when one of those throws, the
+  // screen is fine and the browser's console already has the error.
   window.addEventListener('error', (event) => {
     // Benign and common wherever a ResizeObserver resizes what it observes.
     if (typeof event.message === 'string' && event.message.includes('ResizeObserver loop')) return;
+    if (!mentionsOwnScript(event.filename)) return;
     reportError(event.error || event.message);
   });
 
   window.addEventListener('unhandledrejection', (event) => {
-    if (event.reason && event.reason.name === 'AbortError') return;
-    reportError(event.reason);
+    const reason = event.reason;
+    if (!reason || reason.name === 'AbortError') return;
+    // A rejection carries no script address, only the stack of the error it was rejected with.
+    if (!mentionsOwnScript(reason.stack)) return;
+    reportError(reason);
   });
+
+  // A photo picker is about to open (see "interrupted photo" above). The click reaches the file input
+  // itself, either directly or passed on by its label, unless a screen stopped the picker from opening.
+  document.addEventListener('click', (event) => {
+    const el = event.target;
+    if (event.defaultPrevented || travelling || !el || el.tagName !== 'INPUT' || el.type !== 'file') return;
+    // While the demo photo is loaded, the customer's own sheet choice waits in state.ownReference.
+    const chosen = state.ownReference || state;
+    pickerOpen = true;
+    setPickerNote({ referenceId: chosen.referenceId, customReference: { ...chosen.customReference } });
+  });
+
+  // None of these can happen while a picker or the camera is in front, so each one shows that the page
+  // came through and the note is no longer needed. `change` and `cancel` are the picker's own events;
+  // the page coming back into view, a touch or a key press cover the browsers that never send `cancel`.
+  const pickerClosed = () => {
+    if (!pickerOpen || document.visibilityState === 'hidden') return;
+    pickerOpen = false;
+    setPickerNote(null);
+  };
+  for (const type of ['change', 'cancel', 'visibilitychange', 'pointerdown', 'keydown']) {
+    document.addEventListener(type, pickerClosed, true);
+  }
 
   // iOS can leave the page scrolled up after the keyboard closes; the app itself never scrolls the window.
   document.addEventListener('focusout', () => {
@@ -572,9 +690,18 @@ function startApp(config, els) {
   els.back.addEventListener('click', () => back());
   renderBrand();
 
-  // Always start from the first screen: state does not survive a reload, and any incoming hash is ignored.
-  writeHistory('welcome', 0, false);
-  show('welcome', { initial: true });
+  // Start from the first screen: state does not survive a reload, and any incoming hash is ignored.
+  // The one exception is a reload the customer never asked for, when the phone closed the page while
+  // they were taking the photo: go back to that step, with their sheet choice, and say what happened.
+  if (restoreInterruptedPhoto()) {
+    // The entries underneath are still the old session's, so Back from here leads to the first screen.
+    writeHistory('prepare', historyIndex(), false);
+    show('prepare', { initial: true });
+    toast(t('common.photoInterrupted', { choose: t('prepare.choose') }), { duration: 12000 });
+  } else {
+    writeHistory('welcome', 0, false);
+    show('welcome', { initial: true });
+  }
 }
 
 async function boot() {

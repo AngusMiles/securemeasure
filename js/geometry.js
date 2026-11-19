@@ -30,17 +30,19 @@ export const QUALITY_THRESHOLDS = Object.freeze({
   edgeMarginFrac: 0.02,
   /** 'door_small': door height in px as a fraction of the image height. */
   doorMinHeightFrac: 0.45,
+  // The three sigma grades are tuned for quoting a door, not for making one: a quote is confirmed by
+  // a check measure, so a 1-sigma of 8 mm (shown to the customer as about +-16 mm) is still 'good'.
   /** level 'good' needs both sigmas at or below this. */
-  goodSigmaMm: 4,
+  goodSigmaMm: 8,
   /** 'high_uncertainty': a sigma above this. */
-  highUncertaintySigmaMm: 8,
+  highUncertaintySigmaMm: 12,
   /** level 'poor': a sigma above this. */
-  poorSigmaMm: 10,
+  poorSigmaMm: 16,
   /**
    * Portrait-vs-landscape choice for the sheet: below this score margin (fit.orientationMargin) the
    * choice is unsafe, and half the gap between the two possible answers is folded into the sigmas.
    */
-  orientationMinMargin: 2,
+  orientationMinMargin: 4,
 });
 
 const DEFAULT_PLAUSIBLE = Object.freeze({ minWidthMm: 500, maxWidthMm: 1500, minHeightMm: 1500, maxHeightMm: 2800 });
@@ -732,6 +734,18 @@ function linearStart(uv, a, b, fallbackAspect) {
 // length for some plausible focal length. The wrong assignment breaks that badly (by aspect^4 in the
 // fronto-parallel case). The prior is used ONLY to pick between the two discrete assignments; the
 // reported sizes never depend on any camera assumption.
+//
+// The other clue is how well each assignment fits the corners, and that one has to be handled with
+// care. A sheet that is clearly crooked on the door (ten degrees or more) makes the wrong assignment
+// fit hundreds of times worse, which settles it. But for a sheet taped square both fits explain the
+// same eight corners, so any gap between them is produced by the marking error alone, and it grows
+// with the square of that error: corners marked two or three times worse than the sigmas claim (one
+// screen pixel is several photo pixels) used to let the wrong way round outvote the camera. So:
+// - each fit is scored by its evidence with the unknown real noise level integrated out, which
+//   grows with the log of chi-square rather than with chi-square itself;
+// - a fit lead that marking error could have produced is believed only up to ORIENTATION_NOISE_LEAD;
+// - the choice is only called safe (fit.orientationMargin) if it still stands when the fit evidence
+//   against it counts in full and the fit evidence for it counts only as far as it is believed.
 
 /** Typical phone main-camera focal length as a fraction of the long image side. */
 const NOMINAL_FOCAL_FRAC = 0.72;
@@ -741,6 +755,10 @@ const CAMERA_SHAPE_TOL = 0.15;
 const CAMERA_FOCAL_TOL = 0.6;
 /** Nudge against an assignment whose door size is outside the caller's plausible range. */
 const IMPLAUSIBLE_PENALTY = 3;
+/** The most a fit lead counts for (same units as the camera prior) unless it is decisive. */
+const ORIENTATION_NOISE_LEAD = 6;
+/** A fit lead this big is beyond what marking error does: the other assignment fits ~150 times worse. */
+const ORIENTATION_DECISIVE_LEAD = 30;
 
 /**
  * How badly a plane-to-image homography (metric plane) disagrees with a square-pixel pinhole camera
@@ -896,8 +914,9 @@ function assessQuality({ door, sheet, imageSize, widthMm, heightMm, sigmaWidthMm
   else if (issues.length === 0 && maxSigma <= T.goodSigmaMm) level = 'good';
 
   // Score: driven by the uncertainty, knocked down per issue, then kept inside its level's band so
-  // the number and the label can never contradict each other.
-  let score = clamp(1 - (maxSigma - 1) / 11, 0, 1);
+  // the number and the label can never contradict each other. The slope follows the sigma grades:
+  // about 0.73 at goodSigmaMm and 0.36 at poorSigmaMm.
+  let score = clamp(1 - (maxSigma - 2) / 22, 0, 1);
   for (const code of issues) score *= MAJOR_ISSUES.has(code) ? 0.5 : 0.85;
   if (level === 'good') score = clamp(score, 0.75, 1);
   else if (level === 'fair') score = clamp(score, 0.4, 0.74);
@@ -929,8 +948,10 @@ const isFourPoints = (pts) => Array.isArray(pts) && pts.length === 4 && pts.ever
  *   horizon the lengths are meaningless: `valid` is false and the numbers are null.
  * - doorFitPx / sheetFitPx line up index by index with orderQuad(doorPx) / orderQuad(sheetPx).
  * - fit.orientationMargin: how decisively portrait vs landscape was chosen for the sheet (chi-square-like
- *   units; null for a square sheet). Under QUALITY_THRESHOLDS.orientationMinMargin the choice is unsafe
- *   and the sigmas say so (which for any ordinary sheet means 'high_uncertainty' and level 'poor').
+ *   units, never negative; null for a square sheet). Under QUALITY_THRESHOLDS.orientationMinMargin the
+ *   choice is unsafe: the door may really be the other candidate size, which differs by the sheet's
+ *   aspect ratio. The sigmas then say so (which for any ordinary sheet means 'high_uncertainty' and
+ *   level 'poor'). The corner sigmas weight the fit, so in a borderline photo they can also tip this choice.
  *
  * @param {object} input
  * @param {Point[]} input.sheetPx four sheet corners in image px, any order
@@ -1058,15 +1079,24 @@ function measure(input) {
   if (candidates.length > 1) {
     const other = refine(candidates[1]);
     if (best && other) {
-      // If even the better fit is far worse than the sigmas allow (a mis-marked corner, say), the raw
-      // chi-square difference between the two is mostly an accident of that error. Rescale so the
-      // better fit has chi^2 = dof before weighing it against the camera prior.
-      const noiseScale = Math.max(1, Math.min(best.cost, other.cost) / FIT_DOF);
-      const scoreBest = best.cost / noiseScale + best.prior;
-      const scoreOther = other.cost / noiseScale + other.prior;
-      orientationMargin = Math.abs(scoreOther - scoreBest);
-      runnerUp = scoreOther < scoreBest ? best : other;
-      if (scoreOther < scoreBest) best = other;
+      // See "Choosing which way round the sheet is". Evidence of a fit with the real noise level
+      // unknown: -2 ln of a Student-t likelihood, with the same SIGMA_PRIOR_DOF of trust in the
+      // caller's sigmas as sigmaScale below. Unlike raw chi-square it cannot run away when the corners
+      // were marked worse than the sigmas say.
+      const evidence = (cost) => (SIGMA_PRIOR_DOF + FIT_DOF) * Math.log(1 + cost / SIGMA_PRIOR_DOF);
+      const believed = (lead) =>
+        Math.abs(lead) >= ORIENTATION_DECISIVE_LEAD ? lead : clamp(lead, -ORIENTATION_NOISE_LEAD, ORIENTATION_NOISE_LEAD);
+      let fitLead = evidence(other.cost) - evidence(best.cost); // above zero: `best` fits the corners better
+      let priorLead = other.prior - best.prior; // above zero: the camera prefers `best`
+      runnerUp = other;
+      if (believed(fitLead) + priorLead < 0) {
+        runnerUp = best;
+        best = other;
+        fitLead = -fitLead;
+        priorLead = -priorLead;
+      }
+      // Evidence against the choice counts in full, evidence for it only as far as it is believed.
+      orientationMargin = Math.max(0, Math.min(fitLead, believed(fitLead)) + priorLead);
     } else if (other) {
       best = other;
     }

@@ -34,6 +34,12 @@ export default {
     // One short line that goes with your name, for example in the browser tab.
     tagline: 'Measure your door from one photo',
 
+    // The language the wording is written in, as a language code: 'en-AU',
+    // 'en-US', 'en-GB', 'de', 'fr-CA' and so on. Screen readers use it to choose
+    // the right voice. Change it if you translate the wording under "text" at
+    // the bottom of this file.
+    lang: 'en-AU',
+
     // Your logo image, for example 'assets/logo.svg' (a path inside this folder,
     // with no slash at the start) or a full https:// address.
     // Leave as '' to show your business name in text instead.
@@ -51,6 +57,11 @@ export default {
     // Keep text easy to read: aim for a contrast ratio of at least 4.5 to 1 between
     // every text colour and the colour behind it (search "contrast checker" to test a pair).
     colors: {
+      // primary is also used as TEXT on white: your name in the header, links and
+      // the outline buttons. Keep it dark. If your brand colour is light (yellow,
+      // amber, orange), put it in accent instead, as skins/acme.js does. A primary
+      // that is too light to read is still used for fills, but those labels switch
+      // to the text colour.
       primary: '#14294b', //         your main brand colour (also tints the phone's browser bar)
       primaryContrast: '#ffffff', // text and icons on top of the primary colour
       accent: '#c2410c', //          the main "continue" button on each screen, so it stands out
@@ -107,11 +118,14 @@ export default {
     maxWorkingSizePx: 2560,
 
     // How closely, in photo pixels, we expect each corner to be marked. These
-    // feed the confidence rating and the "plus or minus" figure, not the size
-    // itself. Raise them to make the app more cautious. Best left alone.
+    // weight the fit and feed the confidence rating and the "plus or minus"
+    // figure. They barely move the size, but in a borderline photo they can
+    // decide which way round the sheet is read. Raise them to make the app more
+    // cautious. Best left alone. ("npm run simulate" reads these three numbers,
+    // so its accuracy report always describes the settings you ship.)
     sigmaDoorPx: 2.5, //          door corners dragged into place by hand
     sigmaSheetRefinedPx: 0.5, //  sheet corners found automatically
-    sigmaSheetManualPx: 2, //     sheet corners placed by hand
+    sigmaSheetManualPx: 2, //     sheet corners placed by hand, or an outline the app was unsure of
 
     // A sanity check, in mm. A result outside this range is almost certainly a
     // marking mistake, so the app rates the measurement "poor" and warns the
@@ -134,6 +148,10 @@ export default {
     // The sample photo behind "try it with our example door", so people can see
     // how it works before going to their own door. A path inside this folder
     // (no slash at the start). Set to '' to remove the example.
+    // It is always measured with an A4 sheet, whatever sheet the customer has
+    // chosen. If someone sends an enquiry from it, the customer is told it is
+    // the demo door and the enquiry you receive is marked as a demo
+    // ("demo": true, and "[DEMO]" at the start of the email subject).
     demoPhotoUrl: 'assets/demo-door.png',
   },
 
@@ -239,7 +257,8 @@ export default {
     //   description  one sentence explaining it
     //   default      true to have it switched on to begin with
     //
-    // Each option needs its own unique id. To remove an option, delete its whole
+    // Each option, and each choice within an option, needs its own unique id
+    // (lower-case letters, numbers, dashes). To remove an option, delete its whole
     // { ... } block together with the comma after it.
     options: [
       {
@@ -312,11 +331,29 @@ export default {
   lead: {
     // Where enquiries are sent. Fill in ONE of the next two settings.
     //
-    // endpoint: a web address that accepts the enquiry as a JSON "POST", for
-    // example a Zapier or Make webhook, or your CRM's inbound webhook. Any
-    // "success" (2xx) reply counts as delivered. If it is on a different domain
-    // to this page, it must allow cross-origin (CORS) requests.
+    // endpoint: a web address that accepts the enquiry as a "POST", for example
+    // a Zapier or Make webhook, or your CRM's inbound webhook. Any "success"
+    // (2xx) reply counts as delivered.
+    // The enquiry is sent as JSON text, labelled as plain text
+    // (Content-Type: text/plain). That label lets the customer's browser send it
+    // straight to another domain without asking that server's permission first,
+    // which is what Zapier webhooks need (Make accepts it too). Whatever
+    // receives it must:
+    //   - read the body as JSON, whatever the label says, and
+    //   - if it is on a different domain to this page, add the header
+    //     Access-Control-Allow-Origin (your site's address, or *) to its reply.
+    // Send yourself a test enquiry before you go live.
     endpoint: '',
+
+    // contentType: leave as '' unless your own server insists on a different
+    // label for the enquiry, for example 'application/json'. With any label
+    // other than plain text the browser asks the server's permission first (a
+    // "preflight" OPTIONS request), and the server must answer that with the
+    // headers Access-Control-Allow-Origin and
+    // Access-Control-Allow-Headers: Content-Type. Zapier does not, so keep ''
+    // for Zapier. Make does answer it, so 'application/json' also works with
+    // Make if a scenario does not pick up the fields.
+    contentType: '',
 
     // mailto: your email address. Used only when endpoint is ''. The customer's
     // own email app opens with the enquiry already written, and they press send.
@@ -329,10 +366,12 @@ export default {
     // true attaches a reduced-size copy of the customer's door photo to the
     // enquiry. Works with endpoint only (an email link cannot carry a photo).
     // The customer's photo never leaves their phone unless this is true AND they submit.
+    // The built-in demo photo is only attached to an enquiry marked as a demo.
     includePhoto: false,
 
     // The questions on the contact form, in order.
-    //   id            short unique code. This is the name of the answer in the enquiry you receive.
+    //   id            short unique code (lower-case letters, numbers, dashes). This is the
+    //                 name of the answer in the enquiry you receive.
     //   label         the wording above the box
     //   type          'text', 'tel' (phone number), 'email' or 'textarea' (large box)
     //   required      true means the form cannot be sent with this left empty
@@ -352,6 +391,13 @@ export default {
     consentText: 'I agree to be contacted about my quote.',
 
     // The heading and message shown after the enquiry is sent.
+    // Two things to know:
+    //   - If you also set 'done.title' or 'done.message' under "text" at the
+    //     bottom of this file, that wording is shown instead of these two.
+    //   - With mailto (the email link) these two are not shown. Nothing has been
+    //     sent until the customer presses send in their email app, so the screen
+    //     says "One more step: send the email" instead. Reword that with
+    //     'done.mailtoTitle' and 'done.mailtoNote' under "text".
     successTitle: 'Thanks, your request is in',
     successMessage: 'We will be in touch shortly to book your free check measure.',
   },
@@ -378,5 +424,13 @@ export default {
   //   text: {
   //     'welcome.title': 'Measure your front door in two minutes',
   //   },
+  //
+  // Good to know:
+  //   - The email written for you by lead.mailto can be reworded too. Its ids
+  //     start with 'lead.mail.', for example 'lead.mail.subject'.
+  //   - The last line of "What happens next" on the confirmation screen is
+  //     'done.next3' when the enquiry includes installation and
+  //     'done.next3Supply' when it does not. If you reword one, reword both.
+  //   - If you translate the wording, also set brand.lang at the top of this file.
   text: {},
 };

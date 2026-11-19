@@ -31,6 +31,8 @@ export const strings = {
   'details.consentFallback': 'I agree to be contacted about my quote.',
   'details.privacy': '{brand} only uses your details to prepare your quote and book your check measure.',
   'details.demoChip': 'Demo mode: nothing is sent',
+  // Shown when the size came from the bundled demo photo (not the same thing as demo mode above).
+  'details.demoDoor': "This size and price are for our demo door, not your own door. We'll mark your enquiry as a demo.",
   'details.submit': 'Send my enquiry',
   'details.sending': 'Sending…',
   'details.fixErrors': 'Please check the highlighted details.',
@@ -166,10 +168,14 @@ export function mount(root, ctx) {
     leadMode(config) === 'demo' ? ui.chip(t('details.demoChip'), { tone: 'neutral', icon: 'info' }) : null;
   if (demoChip) demoChip.classList.add('sm-details-demo');
 
+  // The customer tried the demo photo and carried on to here: say plainly whose door this is.
+  const demoDoorNote = isDemoDoor(state) ? ui.banner(t('details.demoDoor'), { tone: 'info' }) : null;
+
   root.append(
     ...[
       ui.screenHeader({ title: t('details.title'), subtitle: t('details.subtitle') }),
       demoChip,
+      demoDoorNote,
       buildSummary(),
       form,
       alertRegion,
@@ -282,6 +288,10 @@ export function mount(root, ctx) {
     let payload = null;
     let result;
     try {
+      // One reference and time per enquiry. A send that looked failed here (a slow or lost reply) may
+      // still have reached the company, so a retry repeats the first attempt's reference instead of
+      // arriving as a second, unrelated lead. "Start again" swaps in a fresh state, and a new reference.
+      const earlier = state.leadAttempt;
       payload = buildLeadPayload({
         config,
         customer,
@@ -291,7 +301,11 @@ export function mount(root, ctx) {
         includeInstallation: effectiveInstallation(config, state.quoteInput.includeInstallation),
         product,
         photoDataUrl: leadPhoto(config, state),
+        demo: isDemoDoor(state),
+        reference: earlier?.reference,
+        now: earlier ? new Date(earlier.createdAt) : undefined,
       });
+      state.leadAttempt = { reference: payload.reference, createdAt: payload.createdAt };
       result = await submitLead(config, payload);
     } catch (error) {
       result = { ok: false, error: String(error?.message ?? error) };
@@ -317,6 +331,14 @@ export function mount(root, ctx) {
   return () => {
     disposed = true;
   };
+}
+
+/**
+ * True when the size being sent was measured from the bundled demo photo, so it is the demo
+ * door's and not the customer's. A size the customer typed in afterwards is their own.
+ */
+function isDemoDoor(state) {
+  return state.size?.source !== 'manual' && state.photo?.isDemo === true;
 }
 
 /**
@@ -357,6 +379,8 @@ function effectiveInstallation(config, chosen) {
 /** The photo is a nice-to-have for the company: never let it block the enquiry. */
 function leadPhoto(config, state) {
   if (!config.lead?.includePhoto || !state.photo) return undefined;
+  // The bundled demo image is not the customer's door: it only goes with an enquiry marked as a demo.
+  if (state.photo.isDemo && !isDemoDoor(state)) return undefined;
   try {
     return photoToJpegDataUrl(state.photo);
   } catch {

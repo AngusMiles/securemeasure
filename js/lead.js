@@ -19,6 +19,14 @@ export const MAILTO_MAX_BODY_CHARS = 1800;
 /** How long a webhook POST may take before it is abandoned. */
 export const WEBHOOK_TIMEOUT_MS = 15000;
 
+/**
+ * Content type of the webhook POST unless config.lead.contentType names another. The body is
+ * always the JSON text. text/plain keeps the request "simple" in CORS terms, so the browser sends
+ * it straight away instead of asking permission first with a preflight OPTIONS request, which
+ * no-code webhooks such as Zapier's refuse.
+ */
+export const WEBHOOK_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+
 /** Demo mode pauses this long so the UI's "sending" state is visible. */
 export const DEMO_DELAY_MS = 400;
 
@@ -38,15 +46,48 @@ export const LEAD_ERROR_STRINGS = Object.freeze({
   'lead.error.consent': 'Please tick the box so we can contact you.',
 });
 
+/**
+ * Default wording of the pre-filled email used when config.lead.mailto is set. A company can
+ * override any of it through config.text using the same keys. {placeholders} are filled in.
+ */
+export const LEAD_MAIL_STRINGS = Object.freeze({
+  'lead.mail.subject': 'Door quote request {reference}',
+  'lead.mail.demoTag': '[DEMO]',
+  'lead.mail.heading': 'New quote request via {brand}',
+  'lead.mail.headingNoBrand': 'New quote request',
+  'lead.mail.reference': 'Reference: {reference}',
+  'lead.mail.doorSize': 'Door size: {size}',
+  'lead.mail.size': '{width} mm wide x {height} mm high',
+  'lead.mail.notProvided': 'not provided',
+  'lead.mail.measuredManual': 'Measured: entered by the customer (not from a photo)',
+  'lead.mail.measuredPhoto': 'Measured: from a photo',
+  'lead.mail.measuredDemo': "Measured: from the built-in demo photo, not the customer's own door",
+  'lead.mail.confidence': 'confidence {quality}',
+  'lead.mail.accuracy': 'about +/- {width} mm wide, +/- {height} mm high',
+  'lead.mail.product': 'Product: {product}',
+  'lead.mail.notSelected': 'not selected',
+  'lead.mail.options': 'Options:',
+  'lead.mail.installation': 'Installation: {answer}',
+  'lead.mail.yes': 'Yes',
+  'lead.mail.no': 'No',
+  'lead.mail.total': 'Total: {total}',
+  'lead.mail.totalWithTax': 'Total: {total} (includes {tax} {taxLabel})',
+  'lead.mail.tax': 'tax',
+  'lead.mail.totalNotQuoted': 'Total: not quoted',
+  'lead.mail.totalCustom': 'Total: no instant price, this size needs a custom quote',
+  'lead.mail.totalUnavailable': 'Total: not available',
+  'lead.mail.shortened': '... [shortened]',
+});
+
 // 32 characters, so each one carries exactly 5 bits. No 0/O/1/I: references get read out over the phone.
 const REFERENCE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+const REFERENCE_PATTERN = new RegExp(`^SM-[${REFERENCE_ALPHABET}]{6}$`);
 
 // 'consent' is reserved for the consent flag; the rest would corrupt a plain object.
 const RESERVED_FIELD_IDS = new Set(['consent', '__proto__', 'constructor', 'prototype']);
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-const TRUNCATION_MARK = ' ... [shortened]';
 const TIMED_OUT = Symbol('timed out');
 
 /* ------------------------------------------------------------------ helpers */
@@ -94,6 +135,15 @@ function errorMessage(config, keys) {
     if (hasOwn(LEAD_ERROR_STRINGS, key)) return LEAD_ERROR_STRINGS[key];
   }
   return LEAD_ERROR_STRINGS['lead.error.required'];
+}
+
+/** Email wording: the company's config.text override when there is one, else the default; then {placeholders} are filled in. */
+function mailText(config, key, vars) {
+  const overrides = config?.text;
+  const override = overrides && typeof overrides === 'object' && hasOwn(overrides, key) ? overrides[key] : undefined;
+  const template = typeof override === 'string' && override !== '' ? override : LEAD_MAIL_STRINGS[key];
+  if (!vars) return template;
+  return template.replace(/\{(\w+)\}/g, (placeholder, name) => (hasOwn(vars, name) ? String(vars[name]) : placeholder));
 }
 
 function requiredMessage(config, field) {
@@ -266,8 +316,10 @@ export function validateCustomer(config, customer) {
  * @param {{ id: string, name: string } | null} [input.product] the chosen product from config.pricing.products
  * @param {boolean | null} [input.includeInstallation] the customer's installation choice; worked out from the quote / config default when omitted
  * @param {string | null} [input.photoDataUrl] attached as 'photo' only when config.lead.includePhoto is true
- * @param {Date} [input.now]
- * @returns {object} { reference, createdAt, brand, customer, measurement, product, selections, includeInstallation, quote, photo? }
+ * @param {boolean} [input.demo] true when the size was measured from the bundled demo photo rather than the customer's own door
+ * @param {string | null} [input.reference] the reference of an earlier attempt at this same enquiry, kept so that a retry is not a second lead; a new one is made when omitted
+ * @param {Date} [input.now] a retry passes the first attempt's time, so createdAt stays the same too
+ * @returns {object} { reference, createdAt, brand, demo, customer, measurement, product, selections, includeInstallation, quote, photo? }
  */
 export function buildLeadPayload({
   config,
@@ -278,6 +330,8 @@ export function buildLeadPayload({
   product = null,
   includeInstallation = null,
   photoDataUrl = null,
+  demo = false,
+  reference = null,
   now = new Date(),
 } = {}) {
   const fields = leadFields(config);
@@ -286,17 +340,22 @@ export function buildLeadPayload({
 
   let when = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(when.getTime())) when = new Date();
-  const reference = makeReference(when.getTime(), fields, customerOut);
+  const kept = typeof reference === 'string' && REFERENCE_PATTERN.test(reference);
+  const referenceOut = kept ? reference : makeReference(when.getTime(), fields, customerOut);
 
   // Recorded as given rather than assumed, so a caller that skipped validation can never fabricate consent.
   customerOut.consent = Boolean(customer) && customer.consent === true;
 
+  const measurementOut = cleanMeasurement(measurement);
+
   const payload = {
-    reference,
+    reference: referenceOut,
     createdAt: when.toISOString(),
     brand: typeof config?.brand?.name === 'string' ? config.brand.name : '',
+    // Only a size taken from a photo can be the demo door's: one the customer typed in is their own.
+    demo: demo === true && measurementOut.source === 'photo',
     customer: customerOut,
-    measurement: cleanMeasurement(measurement),
+    measurement: measurementOut,
     product:
       product && typeof product === 'object' && product.id != null
         ? { id: String(product.id), name: String(product.name ?? product.id) }
@@ -347,10 +406,10 @@ function formatMoney(amount, currency, locale) {
   }
 }
 
-/** Longest prefix of text (plus a marker) whose percent-encoded form fits in maxEncoded characters. */
-function fitEncoded(text, maxEncoded) {
+/** Longest prefix of text (plus the marker) whose percent-encoded form fits in maxEncoded characters. */
+function fitEncoded(text, maxEncoded, mark) {
   if (encode(text).length <= maxEncoded) return text;
-  const budget = maxEncoded - encode(TRUNCATION_MARK).length;
+  const budget = maxEncoded - encode(mark).length;
   let used = 0;
   let kept = '';
   // Iterating by code point keeps surrogate pairs whole; encoding is additive per code point.
@@ -360,7 +419,7 @@ function fitEncoded(text, maxEncoded) {
     used += cost;
     kept += ch;
   }
-  return kept.trimEnd() + TRUNCATION_MARK;
+  return kept.trimEnd() + mark;
 }
 
 function mailtoAddress(raw) {
@@ -382,7 +441,7 @@ function optionLines(config, selections) {
     const option = options.find((candidate) => candidate && candidate.id === id);
     const label = option?.label || id;
     if (typeof value === 'boolean') {
-      lines.push(labelled(label, value ? 'Yes' : 'No'));
+      lines.push(labelled(label, mailText(config, value ? 'lead.mail.yes' : 'lead.mail.no')));
     } else if (value !== null && value !== undefined && value !== '') {
       const choice = Array.isArray(option?.choices) ? option.choices.find((c) => c && c.id === value) : null;
       lines.push(labelled(label, oneLine(choice?.label ?? value)));
@@ -391,46 +450,50 @@ function optionLines(config, selections) {
   return lines;
 }
 
-function measuredLine(measurement) {
-  if (measurement?.source === 'manual') return 'Measured: entered by the customer (not from a photo)';
-  let text = 'Measured: from a photo';
-  if (measurement?.quality) text += `, confidence ${oneLine(measurement.quality)}`;
+function measuredLine(config, payload) {
+  const measurement = payload?.measurement;
+  if (measurement?.source === 'manual') return mailText(config, 'lead.mail.measuredManual');
+  let text = mailText(config, payload?.demo === true ? 'lead.mail.measuredDemo' : 'lead.mail.measuredPhoto');
+  if (measurement?.quality) text += `, ${mailText(config, 'lead.mail.confidence', { quality: oneLine(measurement.quality) })}`;
   const { sigmaWidthMm, sigmaHeightMm } = measurement ?? {};
   if (Number.isFinite(sigmaWidthMm) && Number.isFinite(sigmaHeightMm)) {
     // Two sigma, never claiming better than 2 mm: the same "accurate to about" rule the customer was shown
     // on the result screen, so the company is not told a tighter figure than the customer was.
     const wide = Math.max(2, Math.ceil(2 * sigmaWidthMm));
     const high = Math.max(2, Math.ceil(2 * sigmaHeightMm));
-    text += ` (about +/- ${wide} mm wide, +/- ${high} mm high)`;
+    text += ` (${mailText(config, 'lead.mail.accuracy', { width: wide, height: high })})`;
   }
   return text;
 }
 
 function totalLine(config, quote) {
-  if (!quote) return 'Total: not quoted';
-  if (quote.status === 'out_of_range') return 'Total: no instant price, this size needs a custom quote';
-  if (quote.status !== 'ok' || !Number.isFinite(quote.total)) return 'Total: not available';
+  if (!quote) return mailText(config, 'lead.mail.totalNotQuoted');
+  if (quote.status === 'out_of_range') return mailText(config, 'lead.mail.totalCustom');
+  if (quote.status !== 'ok' || !Number.isFinite(quote.total)) return mailText(config, 'lead.mail.totalUnavailable');
   const locale = config?.pricing?.locale;
   const currency = quote.currency || config?.pricing?.currency;
-  let text = `Total: ${formatMoney(quote.total, currency, locale)}`;
+  const total = formatMoney(quote.total, currency, locale);
   if (Number.isFinite(quote.taxAmount) && quote.taxAmount > 0) {
-    const taxLabel = oneLine(config?.pricing?.taxLabel || 'tax');
-    text += ` (includes ${formatMoney(quote.taxAmount, currency, locale)} ${taxLabel})`;
+    const taxLabel = oneLine(config?.pricing?.taxLabel || mailText(config, 'lead.mail.tax'));
+    const tax = formatMoney(quote.taxAmount, currency, locale);
+    return mailText(config, 'lead.mail.totalWithTax', { total, tax, taxLabel });
   }
-  return text;
+  return mailText(config, 'lead.mail.total', { total });
 }
 
-function sizeText(measurement) {
+function sizeText(config, measurement) {
   const { widthMm, heightMm } = measurement ?? {};
   if (!Number.isFinite(widthMm) || !Number.isFinite(heightMm)) return '';
-  return `${Math.round(widthMm)} mm wide x ${Math.round(heightMm)} mm high`;
+  return mailText(config, 'lead.mail.size', { width: Math.round(widthMm), height: Math.round(heightMm) });
 }
 
-function mailSubject(payload) {
+function mailSubject(config, payload) {
   const customer = payload?.customer ?? {};
   const name = oneLine(customer.name);
   const { widthMm, heightMm } = payload?.measurement ?? {};
-  let subject = `Door quote request ${oneLine(payload?.reference)}`;
+  let subject = mailText(config, 'lead.mail.subject', { reference: oneLine(payload?.reference) });
+  // Up front, where the company's inbox shows it: this size is the demo door's, not the customer's.
+  if (payload?.demo === true) subject = `${mailText(config, 'lead.mail.demoTag')} ${subject}`;
   if (name) subject += ` - ${name}`;
   if (Number.isFinite(widthMm) && Number.isFinite(heightMm)) {
     subject += ` (${Math.round(widthMm)} x ${Math.round(heightMm)} mm)`;
@@ -442,8 +505,9 @@ function mailBody(config, payload) {
   const customer = payload?.customer && typeof payload.customer === 'object' ? payload.customer : {};
   const fields = leadFields(config);
   const brand = oneLine(payload?.brand || config?.brand?.name);
-  const lines = [brand ? `New quote request via ${brand}` : 'New quote request', ''];
-  lines.push(`Reference: ${oneLine(payload?.reference)}`, '');
+  const heading = brand ? mailText(config, 'lead.mail.heading', { brand }) : mailText(config, 'lead.mail.headingNoBrand');
+  const lines = [heading, ''];
+  lines.push(mailText(config, 'lead.mail.reference', { reference: oneLine(payload?.reference) }), '');
 
   const contact = [];
   for (const field of fields) {
@@ -453,14 +517,17 @@ function mailBody(config, payload) {
   }
   if (contact.length > 0) lines.push(...contact, '');
 
-  lines.push(`Door size: ${sizeText(payload?.measurement) || 'not provided'}`);
-  lines.push(measuredLine(payload?.measurement));
-  lines.push(`Product: ${oneLine(payload?.product?.name) || 'not selected'}`);
+  const size = sizeText(config, payload?.measurement) || mailText(config, 'lead.mail.notProvided');
+  lines.push(mailText(config, 'lead.mail.doorSize', { size }));
+  lines.push(measuredLine(config, payload));
+  const productName = oneLine(payload?.product?.name) || mailText(config, 'lead.mail.notSelected');
+  lines.push(mailText(config, 'lead.mail.product', { product: productName }));
   const options = optionLines(config, payload?.selections);
-  if (options.length > 0) lines.push('Options:', ...options.map((line) => `- ${line}`));
+  if (options.length > 0) lines.push(mailText(config, 'lead.mail.options'), ...options.map((line) => `- ${line}`));
   const installation = config?.pricing?.installation;
   if (installation && installation.enabled) {
-    lines.push(`Installation: ${payload?.includeInstallation ? 'Yes' : 'No'}`);
+    const answer = mailText(config, payload?.includeInstallation ? 'lead.mail.yes' : 'lead.mail.no');
+    lines.push(mailText(config, 'lead.mail.installation', { answer }));
   }
   lines.push(totalLine(config, payload?.quote));
 
@@ -479,7 +546,9 @@ function mailBody(config, payload) {
  * options, total, notes). Everything is percent-encoded, so customer text can
  * never add headers such as bcc. The encoded body is capped at
  * MAILTO_MAX_BODY_CHARS (long notes are shortened) and the photo is never
- * included.
+ * included. The wording comes from LEAD_MAIL_STRINGS and can be changed
+ * through config.text. A lead measured from the demo photo (payload.demo) has
+ * a subject that starts with '[DEMO] '.
  *
  * @param {object} config merged app config
  * @param {object} payload a buildLeadPayload result
@@ -487,8 +556,9 @@ function mailBody(config, payload) {
  */
 export function buildMailtoUrl(config, payload) {
   const to = mailtoAddress(config?.lead?.mailto);
-  const subject = encode(mailSubject(payload));
-  const body = encode(fitEncoded(mailBody(config, payload), MAILTO_MAX_BODY_CHARS));
+  const subject = encode(mailSubject(config, payload));
+  const mark = ` ${mailText(config, 'lead.mail.shortened')}`;
+  const body = encode(fitEncoded(mailBody(config, payload), MAILTO_MAX_BODY_CHARS, mark));
   return `mailto:${to}?subject=${subject}&body=${body}`;
 }
 
@@ -517,7 +587,13 @@ function positiveOr(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-async function postToWebhook(endpoint, payload, timeoutMs) {
+/** config.lead.contentType when the company set one (their own server may insist on application/json), else text/plain. */
+function webhookContentType(config) {
+  const chosen = config?.lead?.contentType;
+  return typeof chosen === 'string' && chosen.trim() !== '' ? chosen.trim() : WEBHOOK_CONTENT_TYPE;
+}
+
+async function postToWebhook(endpoint, payload, timeoutMs, contentType) {
   const fail = (error) => ({ ok: false, mode: 'webhook', error });
   if (typeof globalThis.fetch !== 'function') return fail('network');
 
@@ -541,9 +617,11 @@ async function postToWebhook(endpoint, payload, timeoutMs) {
   });
 
   try {
+    // Content-Type is the only header and no credentials mode is asked for: with the default
+    // text/plain this is a CORS "simple" request, which the browser sends without a preflight.
     const request = globalThis.fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': contentType },
       body,
       signal: controller?.signal,
     });
@@ -563,9 +641,12 @@ async function postToWebhook(endpoint, payload, timeoutMs) {
 /**
  * Deliver a lead. Never throws.
  *
- * - webhook: POSTs the payload as JSON to config.lead.endpoint; ok only on a
- *   2xx response. error is 'http_<status>', 'network', 'timeout' or
+ * - webhook: POSTs the payload as JSON text to config.lead.endpoint; ok only
+ *   on a 2xx response. error is 'http_<status>', 'network', 'timeout' or
  *   'invalid_payload'. Customer data only ever travels in the request body.
+ *   The body is sent as text/plain (WEBHOOK_CONTENT_TYPE), so a cross-origin
+ *   endpoint gets no preflight request; config.lead.contentType overrides
+ *   that, for example 'application/json' for a server that answers preflights.
  * - mailto: opens the customer's email app with a pre-filled message (it
  *   cannot know whether they then press send). error 'unavailable' when there
  *   is no location to navigate.
@@ -581,7 +662,7 @@ export async function submitLead(config, payload, options = {}) {
   try {
     if (mode === 'webhook') {
       const timeoutMs = positiveOr(options?.timeoutMs, WEBHOOK_TIMEOUT_MS);
-      return await postToWebhook(config.lead.endpoint.trim(), payload, timeoutMs);
+      return await postToWebhook(config.lead.endpoint.trim(), payload, timeoutMs, webhookContentType(config));
     }
     if (mode === 'mailto') {
       if (!globalThis.location) return { ok: false, mode, error: 'unavailable' };

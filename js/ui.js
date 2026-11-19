@@ -572,10 +572,19 @@ export function field({
  */
 export function checkbox({ id, label, checked = false, onChange } = {}) {
   const inputId = id || uid('sm-check');
+  const labelId = `${inputId}-label`;
   const errorId = `${inputId}-error`;
   const input = h('input', { class: 'sm-check__input', type: 'checkbox', id: inputId, checked: Boolean(checked) });
   input.name = inputId;
   if (typeof onChange === 'function') input.addEventListener('change', () => onChange(input.checked));
+
+  // The visible text is the checkbox's name. Being inside the <label> is not enough for everything
+  // that reads the page: some tools announce the checkbox's value ("on") instead. aria-labelledby
+  // ties the two together outright; aria-label says the same for anything that does not follow it.
+  const labelEl = h('span', { class: 'sm-check__label', id: labelId }, label);
+  input.setAttribute('aria-labelledby', labelId);
+  const labelText = labelEl.textContent.trim();
+  if (labelText) input.setAttribute('aria-label', labelText);
 
   const errorEl = h('p', { class: 'sm-field__error', id: errorId, hidden: true, attrs: { 'aria-live': 'polite' } });
   const el = h(
@@ -586,7 +595,7 @@ export function checkbox({ id, label, checked = false, onChange } = {}) {
       { class: 'sm-check__row', attrs: { for: inputId } },
       input,
       h('span', { class: 'sm-check__box', attrs: { 'aria-hidden': 'true' } }, icon('check', 16)),
-      h('span', { class: 'sm-check__label' }, label),
+      labelEl,
     ),
     errorEl,
   );

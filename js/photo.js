@@ -284,7 +284,7 @@ async function decodeBlob(blob) {
   if (typeof Blob === 'undefined' || !(blob instanceof Blob)) throw new Error('not a file');
 
   const info = await sniffJpeg(blob);
-  const bitmap = await decodeBitmap(blob);
+  const bitmap = await decodeBitmap(blob, info);
   if (bitmap) {
     if (bitmapIsUpright(bitmap, info)) {
       return { drawable: bitmap, width: bitmap.width, height: bitmap.height, release: () => closeBitmap(bitmap) };
@@ -314,20 +314,35 @@ async function decodeUrl(url) {
 
 /**
  * @param {Blob} blob
- * @returns {Promise<ImageBitmap|null>} null when this engine cannot decode the blob this way
+ * @param {{ orientation: number, width: number|null, height: number|null }|null} info  what sniffJpeg read
+ * @returns {Promise<ImageBitmap|null>} null when this engine cannot be relied on to decode the blob upright this way
  */
-async function decodeBitmap(blob) {
+async function decodeBitmap(blob, info) {
   if (typeof createImageBitmap !== 'function') return null;
   try {
     return await createImageBitmap(blob, { imageOrientation: 'from-image' });
   } catch {
-    // Older Safari and Chrome reject the options bag (or this value); try the plain call.
+    // Older Safari and Chrome reject the options bag (or this value).
   }
+  // The plain call cannot be trusted with a rotated photo: Safari 15.0-16.3 returns a bitmap that
+  // has the rotated size but unrotated, cut-off pixels, and nothing about its shape gives that
+  // away. So it is used only when the header says no rotation is needed; the rest go to <img>.
+  if (!isStoredUpright(info)) return null;
   try {
     return await createImageBitmap(blob);
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether the header was read as a JPEG that needs no rotation. A file we could not read that far
+ * (not a JPEG, such as HEIC, or a header cut short) may still carry a rotation, so it does not count.
+ *
+ * @param {{ orientation: number, width: number|null, height: number|null }|null} info
+ */
+function isStoredUpright(info) {
+  return Boolean(info && info.orientation === 1 && info.width && info.height);
 }
 
 /** @param {ImageBitmap} bitmap */
@@ -336,9 +351,12 @@ function closeBitmap(bitmap) {
 }
 
 /**
- * Whether a decoded bitmap already has the rotation the camera recorded applied. Engines that
- * fall back to the plain createImageBitmap call do not all honour EXIF, which would leave a
- * portrait phone photo lying on its side; <img> decoding is reliable, so we defer to it when unsure.
+ * Second check on a bitmap from decodeBitmap: whether the rotation the camera recorded really was
+ * applied. Not every engine that accepts the 'from-image' request honours EXIF, which would leave
+ * a portrait phone photo lying on its side; <img> decoding is reliable, so we defer to it when unsure.
+ *
+ * The shape test is only good enough because decodeBitmap never makes the plain createImageBitmap
+ * call for a rotated photo: on Safari 15.0-16.3 that bitmap has the right shape and the wrong pixels.
  *
  * @param {ImageBitmap} bitmap
  * @param {{ orientation: number, width: number|null, height: number|null }|null} info

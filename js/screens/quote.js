@@ -4,7 +4,9 @@
  * Every change re-runs calculateQuote() against the company's pricing config, mirrors the
  * choices into state.quoteInput / state.quote and updates the price panel in place.
  */
-import { calculateQuote, formatLength, formatMoney } from '../quote.js';
+// roundPrice is the engine's per-line rounding: the price tags on the choosers are shown through it,
+// so a switch tagged "+$90" adds exactly the "$90" line calculateQuote() charges for it.
+import { calculateQuote, formatLength, formatMoney, roundPrice } from '../quote.js';
 
 /** Screen id used by the router. */
 export const id = 'quote';
@@ -167,9 +169,12 @@ export function mount(root, ctx) {
   const remembered = state.quoteInput ?? {};
   const size = state.size;
 
-  /** '+$60' for a surcharge, '-$20' for a discount, '' when there is nothing extra to pay. */
+  /**
+   * '+$60' for a surcharge, '-$20' for a discount, '' when there is nothing extra to pay. Rounded
+   * first, so the tag always equals the line it adds to the estimate.
+   */
   const extra = (price) => {
-    const amount = Number(price) || 0;
+    const amount = roundPrice(price, config) || 0;
     if (amount > 0) return t('quote.price.extra', { price: money(amount) });
     return amount < 0 ? money(amount) : '';
   };
@@ -230,7 +235,7 @@ export function mount(root, ctx) {
         description: product.description,
         features: asArray(product.features),
         badge: product.badge,
-        price: t('quote.product.from', { price: money(product.basePrice) }),
+        price: t('quote.product.from', { price: money(roundPrice(product.basePrice, config)) }),
       })),
       value: productId,
       onChange: (value) => {

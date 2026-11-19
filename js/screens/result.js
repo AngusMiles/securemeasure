@@ -8,6 +8,8 @@
  *    the two numbers.
  * Either way the screen leaves state.size holding the size the quote is priced from.
  */
+import { QUALITY_THRESHOLDS } from '../geometry.js';
+import { getSheetMm } from '../photo.js';
 import { warpToRect } from '../vision.js';
 import { applyMeasurementRules, formatLength } from '../quote.js';
 
@@ -55,8 +57,10 @@ export const strings = {
     'This is an unusual size for a door. Check the markers sit on the door opening and that you picked the right paper size.',
   'result.issue.sheet_off_door':
     'The paper does not seem to be on the door. Tape it flat on the door itself, or adjust the corners if a marker has slipped.',
+  'result.issue.orientation_unclear':
+    'We could not tell whether the paper is upright or on its side in this photo, so the size could be a long way out. Stand square to the door and retake the photo.',
   'result.issue.high_uncertainty':
-    'This photo does not let us measure very precisely. A sharper, straight-on photo with the paper flat on the door will tighten it up.',
+    'This photo does not let us measure very precisely. Tape the paper about halfway up the door, step in until the door just fills the photo, and retake it.',
   'result.issue.generic':
     'For a tighter measurement, retake the photo straight-on with the whole door in the frame and the paper taped flat.',
 
@@ -115,12 +119,14 @@ const QUALITY = {
   poor: { tone: 'danger', icon: 'alert' },
 };
 
-// measureDoor grades a photo 'poor' for two very different reasons. These issues mean a marker is
-// probably on the wrong thing, so the size cannot be trusted and the customer is steered back to
-// fix it. A wide "plus or minus" on its own (sheet corners placed by hand, a distant or angled
-// photo) is common with honest photos, is still an estimate a check measure will confirm, and is
-// often not something a retake would improve: that one is shown as 'rough' and lets them go on.
-const UNTRUSTED_ISSUES = new Set(['high_residual', 'implausible_size', 'methods_disagree']);
+// measureDoor grades a photo 'poor' for two very different reasons. These issues mean the size
+// cannot be trusted (a marker is probably on the wrong thing, or the paper could be either way
+// round, which makes the answer one of two sizes a long way apart), so the customer is steered
+// back to fix it. A wide "plus or minus" on its own (sheet corners placed by hand, a distant or
+// angled photo) is common with honest photos, is still an estimate a check measure will confirm,
+// and is often not something a retake would improve: that one is shown as 'rough' and lets them
+// go on.
+const UNTRUSTED_ISSUES = new Set(['high_residual', 'implausible_size', 'methods_disagree', 'orientation_unclear']);
 
 const DEFAULT_PLAUSIBLE = { minWidthMm: 500, maxWidthMm: 1500, minHeightMm: 1500, maxHeightMm: 2800 };
 
@@ -167,6 +173,42 @@ function hasAdjustment(config) {
   return Boolean(Number(adj.widthMm) || Number(adj.heightMm));
 }
 
+/**
+ * True when measureDoor could not safely tell an upright sheet from one on its side, and the two
+ * possible sizes are far enough apart to matter. Under QUALITY_THRESHOLDS.orientationMinMargin it
+ * folds half the gap between them into the sigmas, and that is read here from what it leaves
+ * behind: a 'poor' grade with 'high_uncertainty' and a low fit.orientationMargin. Unlike an honest
+ * wide "plus or minus", the size is then a coin flip between two answers, and a square-on retake
+ * does fix it. A nearly square sheet (a custom 300 x 302 mm, say) can never be told either way
+ * round, but its two answers are only millimetres apart: when that half-gap is within
+ * QUALITY_THRESHOLDS.poorSigmaMm the wide "plus or minus" comes from somewhere else (sheet corners
+ * placed by hand) and the result stays an ordinary rough one.
+ *
+ * @param {object} measure  measureDoor's result
+ * @param {string} graded  measure.quality.level
+ * @param {string[]} issueCodes  measure.quality.issues
+ * @param {{ w: number, h: number }} sheetMm  the reference sheet it was measured with (getSheetMm)
+ * @returns {boolean}
+ */
+export function orientationUnclear(measure, graded, issueCodes, sheetMm) {
+  // Nothing to work out if the measurement names the problem itself.
+  if (issueCodes.includes('orientation_unclear')) return true;
+  const margin = measure.fit?.orientationMargin;
+  const undecided =
+    graded === 'poor' &&
+    issueCodes.includes('high_uncertainty') &&
+    // null for a square sheet, where there is no choice to make: only a real number counts.
+    typeof margin === 'number' &&
+    margin < QUALITY_THRESHOLDS.orientationMinMargin;
+  if (!undecided) return false;
+  // Turning the sheet round scales the door by about the sheet's long-to-short ratio, so the two
+  // answers are about (ratio - 1) x the door's longer side apart.
+  const ratio = Math.max(Number(sheetMm?.w), Number(sheetMm?.h)) / Math.min(Number(sheetMm?.w), Number(sheetMm?.h));
+  const halfGapMm = ((ratio - 1) * Math.max(Number(measure.widthMm), Number(measure.heightMm))) / 2;
+  // An unknown sheet size (NaN) keeps the cautious answer.
+  return !(halfGapMm <= QUALITY_THRESHOLDS.poorSigmaMm);
+}
+
 /** "±N mm" figure: two sigma of the worse dimension, never claiming better than 2 mm. */
 function accuracyFromSigmas(measure) {
   const sigma = Math.max(Number(measure.sigmaWidthMm), Number(measure.sigmaHeightMm));
@@ -193,6 +235,8 @@ function announceMeasured(ctx) {
     payload.quality = measure.quality?.level;
     payload.sigmaWidthMm = measure.sigmaWidthMm;
     payload.sigmaHeightMm = measure.sigmaHeightMm;
+    // The bundled demo door, not the customer's own: said here as it is on the enquiry.
+    if (ctx.state.photo?.isDemo === true) payload.demo = true;
   }
   ctx.emit?.('measured', payload);
 }
@@ -319,7 +363,12 @@ function mountMeasured(root, ctx) {
   const { h } = ui;
   const measure = state.measure;
   const graded = ['good', 'fair', 'poor'].includes(measure.quality?.level) ? measure.quality.level : 'fair';
-  const issueCodes = Array.isArray(measure.quality?.issues) ? [...new Set(measure.quality.issues)] : [];
+  const reportedCodes = Array.isArray(measure.quality?.issues) ? [...new Set(measure.quality.issues)] : [];
+  // An undecided sheet orientation is why the "plus or minus" is wide, so its own tip goes first
+  // and stands in for the general one.
+  const issueCodes = orientationUnclear(measure, graded, reportedCodes, getSheetMm(state, config))
+    ? ['orientation_unclear', ...reportedCodes.filter((code) => code !== 'orientation_unclear' && code !== 'high_uncertainty')]
+    : reportedCodes;
   // What the screen shows: the grade, with 'poor' split into 'poor' (do not trust it) and 'rough'.
   const level = graded === 'poor' && !issueCodes.some((code) => UNTRUSTED_ISSUES.has(code)) ? 'rough' : graded;
 
@@ -403,8 +452,8 @@ function mountMeasured(root, ctx) {
     .map((code) => `result.issue.${code}`)
     .filter((key) => Object.prototype.hasOwnProperty.call(strings, key))
     .map((key) => t(key));
-  // 'fair' with no issue code is what a clean, straight-on photo scores with hand-placed door
-  // corners (the bundled demo included), so there is nothing to tell that customer to redo.
+  // 'good' or 'fair' with no issue code is what a clean, straight-on photo scores with hand-placed
+  // door corners (the bundled demo grades good), so there is nothing to tell that customer to redo.
   if (issueLines.length === 0 && (level === 'poor' || level === 'rough')) issueLines.push(t('result.issue.generic'));
   const issuesCard = issueLines.length
     ? addClass(

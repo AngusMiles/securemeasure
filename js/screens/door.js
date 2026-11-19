@@ -13,6 +13,7 @@ import {
   defaultDoorQuad,
   invalidateMeasurement,
   isQuad,
+  sameQuad,
   themeColor,
 } from './mark-common.js';
 
@@ -93,12 +94,13 @@ const HELP_DIAGRAM = `
 </svg>`.trim();
 
 /**
- * The door screen needs a photo and a marked sheet.
+ * The door screen needs a photo and a marked sheet. The stand-in rectangle the sheet screen shows
+ * after a failed detection does not count until the customer has moved a corner (`placed`).
  * @param {object} state
  * @returns {boolean}
  */
 export function canEnter(state) {
-  return Boolean(state && state.photo && state.sheet && isQuad(state.sheet.points));
+  return Boolean(state && state.photo && state.sheet && isQuad(state.sheet.points) && state.sheet.placed !== false);
 }
 
 /**
@@ -129,6 +131,9 @@ export function mount(root, ctx) {
   // Measuring the untouched starting rectangle would give a confident-looking
   // but meaningless size, so require at least one corner to have been placed.
   let touched = isQuad(state.door.points);
+  // Where the handles were last put down, starting with what the editor is given. A press on a
+  // handle that leaves it exactly there has placed nothing.
+  let committed = touched ? copyQuad(state.door.points) : defaultDoorQuad(photo.width, photo.height);
 
   const accent = themeColor('--sm-accent', config.brand?.colors?.accent || FALLBACK_ACCENT);
 
@@ -201,7 +206,7 @@ export function mount(root, ctx) {
     },
     actions: [measureBtn, backBtn],
     editor: {
-      points: touched ? state.door.points : defaultDoorQuad(photo.width, photo.height),
+      points: committed,
       color: doorColor(config, accent),
       ariaLabel: t('door.editor.aria'),
       ghost: { points: copyQuad(state.sheet.points), color: accent },
@@ -212,7 +217,8 @@ export function mount(root, ctx) {
   mark.tools.append(helpBtn);
 
   function onChange(points, meta) {
-    if (!meta.final) return;
+    if (!meta.final || sameQuad(points, committed)) return;
+    committed = points;
     touched = true;
     state.door.points = points;
     invalidateMeasurement(state);
@@ -265,14 +271,17 @@ export function mount(root, ctx) {
       source: 'photo',
     };
     // Same payload shape as the result screen sends for a size chosen there.
-    ctx.emit('measured', {
+    const measured = {
       widthMm: state.size.widthMm,
       heightMm: state.size.heightMm,
       source: 'photo',
       quality: r.quality.level,
       sigmaWidthMm: r.sigmaWidthMm,
       sigmaHeightMm: r.sigmaHeightMm,
-    });
+    };
+    // The bundled demo door, not the customer's own: said here as it is on the enquiry.
+    if (photo.isDemo === true) measured.demo = true;
+    ctx.emit('measured', measured);
     ctx.go('result');
   }
 

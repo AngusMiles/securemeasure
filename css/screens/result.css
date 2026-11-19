@@ -267,7 +267,7 @@
 
 .sm-screen--result .sm-result__art-measure {
   fill: none;
-  stroke: var(--sm-primary);
+  stroke: var(--sm-ink-primary);
   stroke-width: 3;
   stroke-linecap: round;
   stroke-linejoin: round;

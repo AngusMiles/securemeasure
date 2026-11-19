@@ -8,7 +8,9 @@ import {
   submitLead,
   leadMode,
   MAILTO_MAX_BODY_CHARS,
+  WEBHOOK_CONTENT_TYPE,
   LEAD_ERROR_STRINGS,
+  LEAD_MAIL_STRINGS,
 } from '../js/lead.js';
 
 /* ----------------------------------------------------------------- fixtures */
@@ -266,6 +268,7 @@ describe('buildLeadPayload', () => {
       'reference',
       'createdAt',
       'brand',
+      'demo',
       'customer',
       'measurement',
       'product',
@@ -276,6 +279,7 @@ describe('buildLeadPayload', () => {
     assert.match(payload.reference, /^SM-[2-9A-HJ-NP-Z]{6}$/);
     assert.equal(payload.createdAt, '2026-11-19T02:30:00.000Z');
     assert.equal(payload.brand, 'Test Doors');
+    assert.equal(payload.demo, false);
     assert.deepEqual(payload.customer, {
       name: 'Jane Citizen',
       phone: '0412 345 678',
@@ -346,6 +350,49 @@ describe('buildLeadPayload', () => {
 
   test('unknown fields do not affect the reference', () => {
     assert.equal(makePayload({ customer: makeCustomer({ extra: 'ignored' }) }).reference, makePayload().reference);
+  });
+
+  test('a retry keeps the reference and time of the first attempt at the same enquiry', () => {
+    const first = makePayload();
+    // What the details screen does when the customer taps send again after a failed send.
+    const retry = makePayload({ reference: first.reference, now: new Date(first.createdAt) });
+    assert.deepEqual(retry, first, 'an unchanged retry is the same lead, not a second one');
+
+    // Still the same enquiry when it is sent later, or after the customer corrected a detail.
+    const later = new Date(NOW.getTime() + 20000);
+    assert.notEqual(makePayload({ now: later }).reference, first.reference, 'without the kept reference it would differ');
+    assert.equal(makePayload({ reference: first.reference, now: later }).reference, first.reference);
+    const corrected = makePayload({
+      reference: first.reference,
+      now: new Date(first.createdAt),
+      customer: makeCustomer({ phone: '0499 999 999' }),
+    });
+    assert.equal(corrected.reference, first.reference);
+    assert.equal(corrected.createdAt, first.createdAt);
+    assert.equal(corrected.customer.phone, '0499 999 999');
+  });
+
+  test('only a well-formed reference is kept; anything else gets a fresh one', () => {
+    const fresh = makePayload().reference;
+    for (const reference of [undefined, null, '', 'SM-', 'SM-ABC10O', 'sm-abcdef', ' SM-ABCDEF', 'SM-ABCDEFG', 42, {}]) {
+      assert.equal(makePayload({ reference }).reference, fresh, `${String(reference)} is not kept`);
+    }
+    assert.equal(makePayload({ reference: 'SM-ABCDEF' }).reference, 'SM-ABCDEF');
+  });
+
+  test('marks a lead measured from the demo photo, and only that', () => {
+    assert.equal(makePayload().demo, false);
+    assert.equal(makePayload({ demo: false }).demo, false);
+    assert.equal(makePayload({ demo: true }).demo, true);
+    for (const demo of ['true', 1, {}, null, undefined]) {
+      assert.equal(makePayload({ demo }).demo, false, 'only exactly true counts');
+    }
+    // A size the customer typed in is their own door, whatever photo they tried first.
+    const manual = makePayload({ demo: true, measurement: { widthMm: 900, heightMm: 2100, source: 'manual' } });
+    assert.equal(manual.demo, false);
+    // The flag is the only difference: the measurement block keeps its documented shape.
+    assert.deepEqual(makePayload({ demo: true }).measurement, makePayload().measurement);
+    assert.equal(JSON.parse(JSON.stringify(makePayload({ demo: true }))).demo, true);
   });
 
   test('records consent as given rather than assuming it', () => {
@@ -598,6 +645,84 @@ describe('buildMailtoUrl', () => {
     assert.ok(!params.body.includes('Anything else'), 'empty notes are left out');
   });
 
+  test('flags a demo-photo lead at the start of the subject and in the measured line', () => {
+    const demo = makePayload({ config, demo: true });
+    const { params } = parseMailto(buildMailtoUrl(config, demo));
+    assert.equal(params.subject, `[DEMO] Door quote request ${demo.reference} - Jane Citizen (820 x 2040 mm)`);
+    assert.ok(
+      params.body.includes(
+        "Measured: from the built-in demo photo, not the customer's own door, confidence good (about +/- 4 mm wide, +/- 6 mm high)",
+      ),
+    );
+    assert.ok(!params.body.includes('Measured: from a photo'));
+
+    const real = parseMailto(buildMailtoUrl(config, makePayload({ config }))).params;
+    assert.ok(real.subject.startsWith('Door quote request '), 'no flag on a real measurement');
+    assert.ok(!/demo/i.test(real.subject + real.body));
+  });
+
+  test('the email wording can be overridden through config.text', () => {
+    const worded = makeConfig({
+      lead: { mailto: 'sales@testdoors.example' },
+      text: {
+        'lead.mail.subject': 'Solicitud de puerta {reference}',
+        'lead.mail.demoTag': '[PRUEBA]',
+        'lead.mail.heading': 'Nueva solicitud desde {brand}',
+        'lead.mail.reference': 'Referencia: {reference}',
+        'lead.mail.doorSize': 'Medida: {size}',
+        'lead.mail.size': '{width} mm de ancho x {height} mm de alto',
+        'lead.mail.measuredDemo': 'Medido: con la foto de muestra',
+        'lead.mail.confidence': 'confianza {quality}',
+        'lead.mail.accuracy': 'aprox. +/- {width} mm de ancho, +/- {height} mm de alto',
+        'lead.mail.product': 'Producto: {product}',
+        'lead.mail.options': 'Opciones:',
+        'lead.mail.installation': 'Instalación: {answer}',
+        'lead.mail.yes': 'Sí',
+        'lead.mail.totalWithTax': 'Total: {total} (incluye {tax} de {taxLabel})',
+        'lead.mail.shortened': '... [abreviado]',
+        'lead.mail.no': '', // an empty override is ignored
+      },
+    });
+    const payload = makePayload({ config: worded, demo: true, selections: { colour: 'white', petMesh: false } });
+    const { params } = parseMailto(buildMailtoUrl(worded, payload));
+
+    assert.equal(params.subject, `[PRUEBA] Solicitud de puerta ${payload.reference} - Jane Citizen (820 x 2040 mm)`);
+    assert.equal(
+      params.body,
+      [
+        'Nueva solicitud desde Test Doors',
+        '',
+        `Referencia: ${payload.reference}`,
+        '',
+        'Your name: Jane Citizen',
+        'Mobile: 0412 345 678',
+        'Email: jane@example.com',
+        'Postcode: 4000',
+        '',
+        'Medida: 820 mm de ancho x 2040 mm de alto',
+        'Medido: con la foto de muestra, confianza good (aprox. +/- 4 mm de ancho, +/- 6 mm de alto)',
+        'Producto: Classic Security Door',
+        'Opciones:',
+        '- Frame colour: Pearl white',
+        '- Pet mesh: No',
+        'Instalación: Sí',
+        'Total: $1,290 (incluye $117.27 de GST)',
+      ].join('\r\n'),
+    );
+
+    const long = makePayload({ config: worded, customer: makeCustomer({ notes: 'Ring first please. '.repeat(400) }) });
+    assert.ok(parseMailto(buildMailtoUrl(worded, long)).params.body.endsWith('... [abreviado]'));
+
+    // Customer text is never read as a placeholder, and every default is a non-empty string.
+    const braces = makePayload({ config, customer: makeCustomer({ name: '{reference} {brand}' }) });
+    assert.ok(parseMailto(buildMailtoUrl(config, braces)).params.body.includes('Your name: {reference} {brand}'));
+    assert.ok(Object.isFrozen(LEAD_MAIL_STRINGS));
+    for (const [key, value] of Object.entries(LEAD_MAIL_STRINGS)) {
+      assert.match(key, /^lead\.mail\.\w+$/);
+      assert.ok(typeof value === 'string' && value.length > 0, key);
+    }
+  });
+
   test('tidies the address and supports several recipients', () => {
     const multi = makeConfig({ lead: { mailto: ' mailto:sales@testdoors.example, quotes+web@testdoors.example ' } });
     const { to } = parseMailto(buildMailtoUrl(multi, makePayload({ config: multi })));
@@ -656,11 +781,56 @@ describe('submitLead', () => {
     const { url, init } = calls[0];
     assert.equal(url, 'https://hooks.example/lead', 'no customer data in the URL');
     assert.equal(init.method, 'POST');
-    assert.deepEqual(init.headers, { 'Content-Type': 'application/json' });
+    assert.deepEqual(init.headers, { 'Content-Type': 'text/plain;charset=UTF-8' });
     assert.equal(typeof init.body, 'string');
     assert.deepEqual(JSON.parse(init.body), payload);
     assert.ok(init.signal instanceof AbortSignal);
     assert.equal(init.signal.aborted, false);
+  });
+
+  test('webhook mode sends a CORS "simple" request, so no preflight is needed', async () => {
+    const calls = [];
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    const payload = makePayload({ config: webhookConfig });
+    assert.ok(!('contentType' in webhookConfig.lead), 'the setting is absent from this config');
+    assert.deepEqual(await submitLead(webhookConfig, payload), { ok: true, mode: 'webhook' });
+
+    const { init } = calls[0];
+    // text/plain is one of the three content types a browser will POST cross-origin without first
+    // asking the endpoint (which Zapier-style webhooks refuse); the body is still the JSON text.
+    assert.equal(WEBHOOK_CONTENT_TYPE, 'text/plain;charset=UTF-8');
+    assert.deepEqual(init.headers, { 'Content-Type': 'text/plain;charset=UTF-8' }, 'the only header');
+    assert.deepEqual(Object.keys(init).sort(), ['body', 'headers', 'method', 'signal'], 'no credentials or mode options');
+    assert.deepEqual(JSON.parse(init.body), payload);
+    // The same thing as the platform sees it.
+    const request = new Request('https://hooks.example/lead', init);
+    assert.equal(request.headers.get('content-type'), 'text/plain;charset=UTF-8');
+    assert.deepEqual([...request.headers.keys()], ['content-type']);
+  });
+
+  test('config.lead.contentType overrides the content type; blank or missing means text/plain', async () => {
+    const calls = [];
+    globalThis.fetch = async (url, init) => {
+      calls.push(init);
+      return { ok: true, status: 200 };
+    };
+    const send = async (contentType) => {
+      const config = makeConfig({ lead: { endpoint: 'https://crm.example/leads', contentType } });
+      const payload = makePayload({ config });
+      assert.deepEqual(await submitLead(config, payload), { ok: true, mode: 'webhook' });
+      const init = calls.pop();
+      assert.deepEqual(JSON.parse(init.body), payload, 'the body is the same JSON text either way');
+      return init.headers;
+    };
+
+    assert.deepEqual(await send('application/json'), { 'Content-Type': 'application/json' });
+    assert.deepEqual(await send('  application/json; charset=utf-8 '), { 'Content-Type': 'application/json; charset=utf-8' });
+    for (const unset of [undefined, null, '', '   ', 42, true, {}]) {
+      assert.deepEqual(await send(unset), { 'Content-Type': 'text/plain;charset=UTF-8' }, `${String(unset)} means the default`);
+    }
   });
 
   test('webhook mode is not ok on a 500', async () => {

@@ -16,7 +16,8 @@ export const strings = {
   'prepare.subtitle': 'Three quick steps, then one photo.',
   'prepare.steps.label': 'How to set up your photo',
   'prepare.step1.title': 'Tape the sheet to the door',
-  'prepare.step1.text': 'Stick it flat on the door itself, about halfway up, at chest height.',
+  'prepare.step1.text':
+    'Stick it flat on the door itself, about halfway up, at chest height. Tape across the corners only, never along an edge.',
   'prepare.step2.title': 'Close the door and stand back',
   'prepare.step2.text': 'Take 2 to 3 big steps back and face the door straight on.',
   'prepare.step3.title': 'Fit the whole door in',
@@ -40,7 +41,9 @@ export const strings = {
   'prepare.tips.light': 'Use good, even light.',
   'prepare.tips.flash': 'Avoid flash glare on the sheet and the door.',
   'prepare.tips.flat': 'Keep the sheet flat, with no curling corners.',
-  'prepare.tips.white': 'White or pale door? Use a coloured sheet of the same size so its edges stand out.',
+  'prepare.tips.tape':
+    'Put tape across the corners only, or Blu Tack behind the sheet. Tape along an edge hides where the paper ends.',
+  'prepare.tips.white': 'White or pale door? Use a dark coloured sheet of the same size so its edges stand out.',
   'prepare.tips.edge': 'Keep the door corners away from the very edge of the photo.',
   'prepare.take': 'Take photo',
   'prepare.choose': 'Choose a photo',
@@ -114,6 +117,21 @@ export function mount(root, ctx) {
   let alive = true;
   let loading = false;
 
+  // While the demo photo is loaded, state.referenceId / customReference describe the demo's own A4
+  // sheet and the customer's choice waits in state.ownReference (see welcome.js). The chooser
+  // always shows and edits the customer's choice, so trying the demo never changes which sheet is
+  // selected here, and the demo photo keeps its A4 if the customer goes back or forward into it.
+  const choice = () => ctx.state.ownReference || ctx.state;
+
+  /** The customer's own photo is about to replace the demo photo: measure it with their choice. */
+  function useOwnReference() {
+    const own = ctx.state.ownReference;
+    if (!own) return;
+    ctx.state.referenceId = own.referenceId;
+    ctx.state.customReference = own.customReference;
+    ctx.state.ownReference = null;
+  }
+
   // A photo measurement is only true for the sheet size it was worked out with. The customer can
   // come back here, pick a different sheet and then use the browser's Forward button, so a change
   // of sheet size has to drop that measurement (the door screen simply measures again).
@@ -178,13 +196,13 @@ export function mount(root, ctx) {
   }));
   if (allowCustom) options.push({ value: 'custom', label: t('prepare.reference.custom') });
 
-  // A stale selection (e.g. 'custom' left over from the demo, or a skin without that sheet)
-  // must not survive silently: fall back to the default reference.
-  if (options.length > 0 && !options.some((option) => option.value === ctx.state.referenceId)) {
+  // A selection that is not on offer (e.g. a skin without that sheet) must not survive silently:
+  // fall back to the default reference.
+  if (options.length > 0 && !options.some((option) => option.value === choice().referenceId)) {
     const fallback = options.find((option) => option.value === measurement.defaultReferenceId) || options[0];
-    ctx.state.referenceId = fallback.value;
+    choice().referenceId = fallback.value;
   }
-  if (!ctx.state.customReference) ctx.state.customReference = { widthMm: null, heightMm: null };
+  if (!choice().customReference) choice().customReference = { widthMm: null, heightMm: null };
   sheetSizeChanged();
 
   const rangeMessage = t('prepare.custom.error', CUSTOM_LIMITS);
@@ -194,7 +212,7 @@ export function mount(root, ctx) {
       id: `sm-prepare-custom-${key}`,
       label: t(labelKey),
       type: 'number',
-      value: formatSide(ctx.state.customReference[key]),
+      value: formatSide(choice().customReference[key]),
       required: true,
       inputmode: 'decimal',
       suffix: t('prepare.custom.unit'),
@@ -204,7 +222,7 @@ export function mount(root, ctx) {
       onInput: (value) => {
         const mm = parseMm(value);
         const ok = isValidSide(mm);
-        ctx.state.customReference[key] = ok ? mm : null;
+        choice().customReference[key] = ok ? mm : null;
         sheetSizeChanged();
         if (ok) field.setError(null);
       },
@@ -212,7 +230,7 @@ export function mount(root, ctx) {
     // Only complain once they have finished typing something that cannot be right.
     field.input.addEventListener('blur', () => {
       const typed = String(field.input.value || '').trim() !== '';
-      field.setError(typed && !isValidSide(ctx.state.customReference[key]) ? rangeMessage : null);
+      field.setError(typed && !isValidSide(choice().customReference[key]) ? rangeMessage : null);
     });
     return { key, field };
   }
@@ -220,12 +238,12 @@ export function mount(root, ctx) {
   const sideFields = [makeSideField('widthMm', 'prepare.custom.short'), makeSideField('heightMm', 'prepare.custom.long')];
 
   const customReady = () =>
-    ctx.state.referenceId !== 'custom' || sideFields.every(({ key }) => isValidSide(ctx.state.customReference[key]));
+    choice().referenceId !== 'custom' || sideFields.every(({ key }) => isValidSide(choice().customReference[key]));
 
   function showCustomErrors(focus) {
     let firstBad = null;
     for (const { key, field } of sideFields) {
-      const ok = isValidSide(ctx.state.customReference[key]);
+      const ok = isValidSide(choice().customReference[key]);
       field.setError(ok ? null : rangeMessage);
       if (!ok && !firstBad) firstBad = field;
     }
@@ -241,7 +259,7 @@ export function mount(root, ctx) {
   );
 
   function syncReference() {
-    const selected = ctx.state.referenceId;
+    const selected = choice().referenceId;
     const isCustom = selected === 'custom';
     const reference = references.find((ref) => ref.id === selected);
     if (isCustom) {
@@ -264,9 +282,9 @@ export function mount(root, ctx) {
     name: 'sm-prepare-reference',
     ariaLabel: t('prepare.reference.label'),
     options,
-    value: ctx.state.referenceId,
+    value: choice().referenceId,
     onChange: (value) => {
-      ctx.state.referenceId = value;
+      choice().referenceId = value;
       sheetSizeChanged();
       syncReference();
       if (value === 'custom' && !customReady()) sideFields[0].field.input.focus();
@@ -303,6 +321,7 @@ export function mount(root, ctx) {
     t('prepare.tips.light'),
     t('prepare.tips.flash'),
     t('prepare.tips.flat'),
+    t('prepare.tips.tape'),
     t('prepare.tips.white'),
     t('prepare.tips.edge'),
   ];
@@ -332,6 +351,7 @@ export function mount(root, ctx) {
     try {
       const photo = await ctx.busy(() => loadPhoto(file, config), t('prepare.loading'));
       if (!alive) return;
+      useOwnReference();
       setPhoto(ctx.state, photo);
       ctx.go('sheet');
     } catch {

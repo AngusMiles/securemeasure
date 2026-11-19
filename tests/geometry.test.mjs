@@ -19,6 +19,7 @@ import {
 
 const IMAGE = { width: 1920, height: 2560 };
 const A4 = { w: 210, h: 297 };
+const LETTER = { w: 215.9, h: 279.4 };
 const CARD = { w: 85.6, h: 53.98 };
 const ISSUE_CODES = [
   'sheet_small',
@@ -458,6 +459,125 @@ test('measureDoor keeps the right sheet orientation under realistic noise', () =
   assert.equal(total, 1500);
 });
 
+/** True when measureDoor could not safely tell a portrait sheet from a landscape one. */
+const orientationUndecided = (res) => res.fit.orientationMargin !== null && res.fit.orientationMargin < QUALITY_THRESHOLDS.orientationMinMargin;
+
+test('US Letter: door corners marked about 5 px out no longer flip the sheet to landscape', () => {
+  // An 820 x 2040 door with a US Letter sheet taped portrait 0.8 degrees off square, photographed 9
+  // degrees from the side. The door corners are 3 to 8 px from where they belong, about twice the
+  // configured 2.5 px. The landscape reading happens to absorb that error (chi-square 2.1 against
+  // 20.1), which used to outvote the camera: 1061 x 1583 mm, graded 'fair', no issue.
+  const marked = {
+    sheetPx: [{ x: 876.4, y: 1027.4 }, { x: 1046.9, y: 1024.6 }, { x: 1044.7, y: 1248.2 }, { x: 875.3, y: 1247.6 }],
+    doorPx: [{ x: 646.9, y: 435.8 }, { x: 1293.8, y: 418 }, { x: 1265.1, y: 2082.6 }, { x: 623.9, y: 2020.7 }],
+    sheetMm: LETTER,
+    imageSize: IMAGE,
+    sigmaSheetPx: 0.5,
+    sigmaDoorPx: 2.5,
+  };
+  const res = measureDoor(marked);
+  assert.equal(res.ok, true);
+  assert.equal(res.sheetOrientation, 'portrait');
+  assertClose(res.widthMm, 820, 4, 'width');
+  assertClose(res.heightMm, 2046, 6, 'height');
+  assert.equal(orientationUndecided(res), false, `margin ${res.fit.orientationMargin}`);
+  assert.ok(!res.quality.issues.includes('implausible_size'));
+
+  // The same photo with the door corners exactly where they belong.
+  const exact = measureDoor({ ...marked, doorPx: [{ x: 650.4, y: 443 }, { x: 1296.5, y: 410.5 }, { x: 1261.1, y: 2078.3 }, { x: 618.4, y: 2023 }] });
+  assert.equal(exact.sheetOrientation, 'portrait');
+  assertClose(exact.widthMm, 820, 0.5, 'width, true corners');
+  assertClose(exact.heightMm, 2046, 0.5, 'height, true corners');
+
+  // The configured door sigma changes how sure the answer is, not which answer it is.
+  for (const sigmaDoorPx of [2, 2.5, 4, 6]) {
+    const other = measureDoor({ ...marked, sigmaDoorPx });
+    assert.equal(other.sheetOrientation, 'portrait', `sigmaDoorPx ${sigmaDoorPx}`);
+    assertClose(other.widthMm, 820, 4, `width at sigmaDoorPx ${sigmaDoorPx}`);
+    assertClose(other.heightMm, 2046, 6, `height at sigmaDoorPx ${sigmaDoorPx}`);
+  }
+});
+
+test('when marking error makes the wrong way round fit better, the result is flagged instead of silently wrong', () => {
+  // US Letter taped portrait on an 820 x 2040 door, door corners 6 to 13 px out (about three times
+  // the configured sigma). The landscape reading fits six times better (chi-square 5 against 31) and
+  // used to win: 1060 x 1577 mm, graded 'fair', no issue. Marking error can do that, so it does not
+  // settle the choice: the camera's reading is reported and the orientation is flagged as undecided.
+  const res = measureDoor({
+    sheetPx: [{ x: 882.4, y: 1328.4 }, { x: 1042.8, y: 1319.1 }, { x: 1054.5, y: 1537 }, { x: 893.8, y: 1540.2 }],
+    doorPx: [{ x: 678.4, y: 533.2 }, { x: 1286.9, y: 463.9 }, { x: 1336.5, y: 2110.1 }, { x: 713.4, y: 2037.3 }],
+    sheetMm: LETTER,
+    imageSize: IMAGE,
+    sigmaSheetPx: 0.5,
+    sigmaDoorPx: 2.5,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(orientationUndecided(res), true, `margin ${res.fit.orientationMargin}`);
+  assert.ok(res.fit.orientationMargin >= 0);
+  assert.equal(res.sheetOrientation, 'portrait');
+  assertClose(res.widthMm, 820, 5, 'width');
+  assertClose(res.heightMm, 2040, 10, 'height');
+  // Half the gap to the other reading (1060 x 1577) is in the sigmas, and the grade says so.
+  assert.ok(res.sigmaWidthMm > 100 && res.sigmaHeightMm > 200, `sigmas ${res.sigmaWidthMm} / ${res.sigmaHeightMm}`);
+  assert.equal(res.quality.level, 'poor');
+  assert.ok(res.quality.issues.includes('high_uncertainty'));
+});
+
+test('Monte Carlo: door corners marked 2 to 3 times worse than configured never give an unflagged wrong-way-round size (US Letter)', (t) => {
+  // Configured sigmas throughout (0.5 px sheet, 2.5 px door); only the real door-corner error changes.
+  const scenarios = [
+    { name: 'as configured', doorNoisePx: 2.5, maxYawDeg: 15, seed: 501, maxWrong: 0, maxFalseAlarms: 4 },
+    { name: 'twice the configured door sigma', doorNoisePx: 5, maxYawDeg: 15, seed: 502, maxWrong: 4, maxFalseAlarms: 40 },
+    { name: 'three times, up to 25 degrees from the side', doorNoisePx: 7.5, maxYawDeg: 25, seed: 503, maxWrong: 60, maxFalseAlarms: 160 },
+  ];
+  const N = 4000;
+  for (const { name, doorNoisePx, maxYawDeg, seed, maxWrong, maxFalseAlarms } of scenarios) {
+    const rand = mulberry32(seed);
+    const gauss = gaussian(rand);
+    let wrong = 0;
+    let falseAlarms = 0;
+    for (let i = 0; i < N; i++) {
+      // Mostly portrait: that is the way round that marking error can flip.
+      const placed = i % 4 === 3 ? { w: LETTER.h, h: LETTER.w } : LETTER;
+      const scene = makeScene({
+        sheet: placed,
+        centre: { x: 220 + 380 * rand(), y: 300 + 1440 * rand() },
+        rotDeg: -3 + 6 * rand(),
+        cam: { distanceMm: 2400 + 1100 * rand(), yawDeg: maxYawDeg * (2 * rand() - 1), pitchDeg: -8 + 16 * rand(), rollDeg: -3 + 6 * rand() },
+      });
+      const res = measureDoor({
+        sheetPx: addNoise(scene.sheetPx, 0.5, gauss),
+        doorPx: addNoise(scene.doorPx, doorNoisePx, gauss),
+        sheetMm: LETTER,
+        imageSize: IMAGE,
+        sigmaSheetPx: 0.5,
+        sigmaDoorPx: 2.5,
+      });
+      const label = `${name}, trial ${i}: ${res.widthMm} x ${res.heightMm}, margin ${res.fit && res.fit.orientationMargin}`;
+      assert.equal(res.ok, true, label);
+      const undecided = orientationUndecided(res);
+      if (undecided) {
+        // Flagged: the sigmas carry half the gap between the two readings, so the true size is within
+        // reach of the reported one whichever reading was picked, and the grade cannot be good or fair.
+        assert.equal(res.quality.level, 'poor', label);
+        assert.ok(res.quality.issues.includes('high_uncertainty'), label);
+        assert.ok(Math.abs(res.widthMm - 820) <= 3 * res.sigmaWidthMm, label);
+        assert.ok(Math.abs(res.heightMm - 2040) <= 3 * res.sigmaHeightMm, label);
+      }
+      if (res.sheetOrientation !== (placed.h >= placed.w ? 'portrait' : 'landscape')) {
+        wrong++;
+        assert.ok(undecided, `wrong way round and not flagged; ${label}`);
+      } else if (undecided) {
+        falseAlarms++;
+      }
+    }
+    t.diagnostic(`${name}: ${wrong} of ${N} the wrong way round (all flagged), ${falseAlarms} flagged although right`);
+    // Wrong picks are rare as well as flagged, and right ones are seldom flagged for nothing.
+    assert.ok(wrong <= maxWrong, `${name}: ${wrong} of ${N} the wrong way round`);
+    assert.ok(falseAlarms <= maxFalseAlarms, `${name}: ${falseAlarms} of ${N} flagged although right`);
+  }
+});
+
 test('when portrait vs landscape truly cannot be decided, the sigmas say so and the grade is poor', () => {
   // The one genuinely ambiguous view: an ultra-wide lens, a strong sideways angle with the camera at
   // exactly door-centre height, a sheet taped dead level, and a door for which both readings
@@ -701,6 +821,43 @@ test('QUALITY_THRESHOLDS exposes the numbers behind the quality rules', () => {
   for (const [key, value] of Object.entries(QUALITY_THRESHOLDS)) assert.ok(Number.isFinite(value) && value > 0, key);
   assert.ok(QUALITY_THRESHOLDS.goodSigmaMm < QUALITY_THRESHOLDS.highUncertaintySigmaMm);
   assert.ok(QUALITY_THRESHOLDS.highUncertaintySigmaMm < QUALITY_THRESHOLDS.poorSigmaMm);
+});
+
+test('the sigma grades are tuned for quoting: good up to 8 mm, high_uncertainty above 12 mm, poor above 16 mm', () => {
+  assert.equal(QUALITY_THRESHOLDS.goodSigmaMm, 8);
+  assert.equal(QUALITY_THRESHOLDS.highUncertaintySigmaMm, 12);
+  assert.equal(QUALITY_THRESHOLDS.poorSigmaMm, 16);
+
+  // Without noise the reported sigma is pure propagation, so scaling both corner sigmas scales it
+  // exactly: the same clean photo can be given any sigma, with nothing else about it changing.
+  const scene = makeScene(CLEAN);
+  const base = measureDoor(input(scene, REFINED));
+  const baseSigmaMm = Math.max(base.sigmaWidthMm, base.sigmaHeightMm);
+  const gradeAt = (sigmaMm) => {
+    const k = sigmaMm / baseSigmaMm;
+    const res = measureDoor(input(scene, { sigmaSheetPx: REFINED.sigmaSheetPx * k, sigmaDoorPx: REFINED.sigmaDoorPx * k }));
+    assert.equal(res.ok, true);
+    assertClose(Math.max(res.sigmaWidthMm, res.sigmaHeightMm), sigmaMm, 1e-4, 'reported sigma');
+    return res.quality;
+  };
+  let lastScore = 1;
+  for (const [sigmaMm, level, issues] of [
+    [3, 'good', []],
+    [7.9, 'good', []],
+    [8.1, 'fair', []],
+    [11.9, 'fair', []],
+    [12.1, 'fair', ['high_uncertainty']],
+    [15.9, 'fair', ['high_uncertainty']],
+    [16.1, 'poor', ['high_uncertainty']],
+    [40, 'poor', ['high_uncertainty']],
+  ]) {
+    const quality = gradeAt(sigmaMm);
+    assert.equal(quality.level, level, `level at sigma ${sigmaMm} mm`);
+    assert.deepEqual(quality.issues, issues, `issues at sigma ${sigmaMm} mm`);
+    // The score follows the same scale: it never goes up as the measurement gets less certain.
+    assert.ok(quality.score <= lastScore, `score ${quality.score} at sigma ${sigmaMm} mm`);
+    lastScore = quality.score;
+  }
 });
 
 test("a clean, well-posed scene is graded 'good' with no issues", () => {

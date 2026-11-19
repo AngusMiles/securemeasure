@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import baseConfig from '../js/config.js';
 import acmeSkin from '../skins/acme.js';
 import { deepMerge, loadConfig } from '../js/theme.js';
+import { SHIPPED_CONFIG } from './helpers/shipped-config.mjs';
 
 // ---------------------------------------------------------------------------
 // The contract skeleton: every key the rest of the app is entitled to read,
@@ -28,6 +29,7 @@ const SKELETON = {
   brand: {
     name: 'string',
     tagline: 'string',
+    lang: 'string',
     logoUrl: 'string',
     phone: 'string',
     email: 'string',
@@ -67,6 +69,7 @@ const SKELETON = {
   },
   lead: {
     endpoint: 'string',
+    contentType: 'string',
     mailto: 'string',
     includePhoto: 'boolean',
     fields: 'array',
@@ -261,6 +264,8 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
     test('brand settings are usable', async () => {
       const { brand } = await getConfig();
       assert.ok(nonEmpty(brand.name), 'brand.name is required');
+      // '' keeps the language written in index.html; anything else must be a language tag (js/theme.js applies it).
+      if (brand.lang !== '') assert.match(brand.lang, /^[a-z]{2,3}(-[a-z0-9]{1,8})*$/i, `brand.lang = ${JSON.stringify(brand.lang)}`);
       if (brand.email !== '') assert.match(brand.email, /^[^@\s]+@[^@\s]+\.[^@\s]+$/);
       if (brand.website !== '') assert.match(brand.website, /^https?:\/\//);
       assert.match(brand.radius, /^\d*\.?\d+(px|rem|em)$/);
@@ -372,8 +377,8 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
     test("every select option's default exists among its choices", async () => {
       const { options } = (await getConfig()).pricing;
       assertUniqueIds(options, 'option');
+      // A company may delete every option of one kind (or all of them): only the ones present are checked.
       const selects = options.filter((option) => option.type === 'select');
-      assert.ok(selects.length >= 1);
       for (const option of selects) {
         assert.deepEqual(itemErrors(option, 'selectOption', `option ${option.id}`), []);
         assert.ok(option.choices.length >= 2, `${option.id} needs at least two choices`);
@@ -396,7 +401,6 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
         assert.ok(['select', 'checkbox'].includes(option.type), `option ${option.id} has unknown type "${option.type}"`);
       }
       const checkboxes = options.filter((option) => option.type === 'checkbox');
-      assert.ok(checkboxes.length >= 1);
       for (const option of checkboxes) {
         assert.deepEqual(itemErrors(option, 'checkboxOption', `option ${option.id}`), []);
         assert.ok(nonEmpty(option.label));
@@ -424,6 +428,14 @@ for (const [variantName, getConfig] of Object.entries(variants)) {
       assert.ok(nonEmpty(lead.consentText));
       assert.ok(nonEmpty(lead.successTitle));
       assert.ok(nonEmpty(lead.successMessage));
+    });
+
+    test('lead.contentType is empty (plain text, no preflight) or a media type', async () => {
+      const { lead } = await getConfig();
+      // It becomes the value of a request header, so it must be one line that looks like 'type/subtype'.
+      if (lead.contentType.trim() !== '') {
+        assert.match(lead.contentType.trim(), /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+(\s*;\s*[a-z0-9-]+=[^\s;]+)*$/i, `lead.contentType = ${JSON.stringify(lead.contentType)}`);
+      }
     });
 
     test('text overrides are strings keyed by dotted string ids', async () => {
@@ -491,6 +503,7 @@ describe('default config as shipped: contract defaults', () => {
   test('matches the contract defaults', () => {
     const { brand, measurement, pricing, lead, embed, text } = baseConfig;
     assert.equal(brand.name, 'SecureMeasure');
+    assert.equal(brand.lang, 'en-AU', 'the language index.html declares for the built-in wording');
     assert.equal(brand.logoUrl, '');
     assert.equal(brand.radius, '14px');
 
@@ -523,6 +536,7 @@ describe('default config as shipped: contract defaults', () => {
     assert.equal(pricing.quoteValidDays, 30);
 
     assert.equal(lead.endpoint, '', 'ships in demo mode');
+    assert.equal(lead.contentType, '', 'ships with the plain-text label, which needs no preflight');
     assert.equal(lead.mailto, '', 'ships in demo mode');
     assert.equal(lead.includePhoto, false);
     assert.deepEqual(
@@ -558,6 +572,17 @@ describe('default config as shipped: contract defaults', () => {
     assert.ok(820 >= limits.minWidthMm && 820 <= standardSize.maxWidthMm);
     assert.ok(2040 >= limits.minHeightMm && 2040 <= standardSize.maxHeightMm);
   });
+
+  test('is the configuration the end-to-end tests are pinned to (tests/helpers/shipped-config.mjs)', () => {
+    // The measuring, pricing and lead tests run on that fixed copy, so that an edited js/config.js cannot
+    // fail them. This check is what keeps the copy honest while js/config.js is still the shipped one.
+    assert.deepEqual(
+      baseConfig,
+      SHIPPED_CONFIG,
+      'js/config.js differs from tests/helpers/shipped-config.mjs. If you have made js/config.js your own, that is expected: ' +
+        'adjust or delete this "as shipped" group. If you changed the defaults this repo ships, make the same change in the helper.',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -585,19 +610,22 @@ describe('acme skin', () => {
   });
 
   test('changes what a skin is meant to change', async () => {
-    const merged = await loadConfig('?skin=acme');
-    assert.deepEqual(merged, deepMerge(baseConfig, acmeSkin));
+    assert.deepEqual(await loadConfig('?skin=acme'), deepMerge(baseConfig, acmeSkin));
 
+    // What the example skin changes is judged against the shipped defaults, not against js/config.js: a
+    // company that has edited js/config.js may have picked the same corner radius or a similar colour.
+    const shipped = SHIPPED_CONFIG;
+    const merged = deepMerge(shipped, acmeSkin);
     assert.equal(merged.brand.name, 'Acme Security Doors');
-    assert.notEqual(merged.brand.phone, baseConfig.brand.phone);
-    assert.notEqual(merged.brand.radius, baseConfig.brand.radius);
+    assert.notEqual(merged.brand.phone, shipped.brand.phone);
+    assert.notEqual(merged.brand.radius, shipped.brand.radius);
 
     // A visibly different palette: the two colours that carry the brand must both change.
     for (const key of ['primary', 'accent', 'background']) {
-      assert.notEqual(merged.brand.colors[key].toLowerCase(), baseConfig.brand.colors[key].toLowerCase(), `colors.${key}`);
+      assert.notEqual(merged.brand.colors[key].toLowerCase(), shipped.brand.colors[key].toLowerCase(), `colors.${key}`);
     }
 
-    const baseProducts = baseConfig.pricing.products;
+    const baseProducts = shipped.pricing.products;
     const acmeProducts = merged.pricing.products;
     const baseNames = new Set(baseProducts.map((product) => product.name));
     for (const product of acmeProducts) assert.equal(baseNames.has(product.name), false, `${product.name} should be renamed`);

@@ -4,14 +4,22 @@
 //   node tools/simulate.mjs --json           the same numbers as JSON
 //   node tools/simulate.mjs --trials 500 --seed 7
 //   node tools/simulate.mjs --sheet-band 0.3   keep the sheet centre within the middle 30% of the door height
+//   node tools/simulate.mjs --noise-scale 2    mark every corner twice as badly as js/config.js assumes
 //
 // Each trial: a random but realistic camera pose in front of an 820 x 2040 mm door, a reference sheet
 // taped somewhere on it, Gaussian pixel noise on the eight marked corners, then measureDoor().
 // The run is fully reproducible (seeded mulberry32).
+//
+// The corner sigmas come from js/config.js (measurement.sigmaSheetRefinedPx, sigmaSheetManualPx and
+// sigmaDoorPx), the same values js/screens/door.js hands to measureDoor(), so the grades and the
+// reported uncertainty in this report are the app's own. By default the injected noise is those same
+// sigmas, which is the case the app is tuned for; --noise-scale changes the noise only, never what
+// the fit is told.
 
 import { pathToFileURL } from 'node:url';
 import { cameraHomography, projectPoint } from './camera.mjs';
-import { measureDoor } from '../js/geometry.js';
+import { measureDoor, QUALITY_THRESHOLDS } from '../js/geometry.js';
+import config from '../js/config.js';
 
 const IMAGE = { width: 1920, height: 2560 };
 const FOCAL_PX = 0.72 * IMAGE.height;
@@ -20,12 +28,24 @@ const A4 = { w: 210, h: 297 };
 const CARD = { w: 85.6, h: 53.98 };
 const SHEET_MARGIN_MM = 60;
 
-/** The four scenarios of the report. Sigmas are 1-sigma corner noise in px (sheet / door). */
+const positiveOr = (value, fallback) => (Number.isFinite(value) && value > 0 ? value : fallback);
+
+/** How closely the app assumes each corner is marked, in px (1-sigma): js/config.js, else measureDoor's own defaults. */
+export const APP_SIGMAS = Object.freeze({
+  sheetRefinedPx: positiveOr(config?.measurement?.sigmaSheetRefinedPx, 1),
+  sheetManualPx: positiveOr(config?.measurement?.sigmaSheetManualPx, 1),
+  doorPx: positiveOr(config?.measurement?.sigmaDoorPx, 2.5),
+});
+
+/**
+ * The four scenarios of the report. Sigmas are the 1-sigma corner error in px (sheet / door) that the
+ * fit is told to expect; the injected noise is the same figure times the run's noise scale.
+ */
 export const SCENARIOS = [
-  { id: 'a4-refined', label: 'A4, refined corners', sheetMm: A4, sigmaSheetPx: 0.3, sigmaDoorPx: 2 },
-  { id: 'a4-manual', label: 'A4, manual corners', sheetMm: A4, sigmaSheetPx: 2, sigmaDoorPx: 2 },
-  { id: 'card-refined', label: 'Bank card, refined corners', sheetMm: CARD, sigmaSheetPx: 0.3, sigmaDoorPx: 2 },
-  { id: 'card-manual', label: 'Bank card, manual corners', sheetMm: CARD, sigmaSheetPx: 2, sigmaDoorPx: 2 },
+  { id: 'a4-refined', label: 'A4, refined corners', sheetMm: A4, sigmaSheetPx: APP_SIGMAS.sheetRefinedPx, sigmaDoorPx: APP_SIGMAS.doorPx },
+  { id: 'a4-manual', label: 'A4, manual corners', sheetMm: A4, sigmaSheetPx: APP_SIGMAS.sheetManualPx, sigmaDoorPx: APP_SIGMAS.doorPx },
+  { id: 'card-refined', label: 'Bank card, refined corners', sheetMm: CARD, sigmaSheetPx: APP_SIGMAS.sheetRefinedPx, sigmaDoorPx: APP_SIGMAS.doorPx },
+  { id: 'card-manual', label: 'Bank card, manual corners', sheetMm: CARD, sigmaSheetPx: APP_SIGMAS.sheetManualPx, sigmaDoorPx: APP_SIGMAS.doorPx },
 ];
 
 /**
@@ -114,12 +134,15 @@ function errorStats(errors) {
 /**
  * Run one scenario.
  * @param {{id:string,label:string,sheetMm:{w:number,h:number},sigmaSheetPx:number,sigmaDoorPx:number}} scenario
- * @param {{trials:number, seed:number, sheetBand?:number}} opts
+ * @param {{trials:number, seed:number, sheetBand?:number, noiseScale?:number}} opts
+ *   noiseScale multiplies the injected corner noise only; the fit is always told the scenario's sigmas.
  */
-export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
+export function runScenario(scenario, { trials, seed, sheetBand = 1, noiseScale = 1 }) {
   // Every scenario starts from the same seed, so all four see the same sequence of camera poses.
   const rand = mulberry32(seed);
   const gauss = gaussianSampler(rand);
+  const noiseSheetPx = scenario.sigmaSheetPx * noiseScale;
+  const noiseDoorPx = scenario.sigmaDoorPx * noiseScale;
   const joint = { w: [], h: [] };
   const sheetOnly = { w: [], h: [] };
   const grades = { good: 0, fair: 0, poor: 0 };
@@ -129,6 +152,7 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
   let measured = 0;
   let sheetOnlyInvalid = 0;
   let wrongWayRound = 0;
+  let wrongWayRoundUnflagged = 0;
   let within3 = 0;
   let within5 = 0;
   let sumSigmaW = 0;
@@ -146,9 +170,11 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
     }
     done++;
     const noisy = (pts, sigma) => pts.map((p) => ({ x: p.x + sigma * gauss(), y: p.y + sigma * gauss() }));
+    // The same call js/screens/door.js makes: the noise is what really happened to the corners, the
+    // sigmas are what the app assumes happened.
     const input = {
-      sheetPx: noisy(scene.sheetPx, scenario.sigmaSheetPx),
-      doorPx: noisy(scene.doorPx, scenario.sigmaDoorPx),
+      sheetPx: noisy(scene.sheetPx, noiseSheetPx),
+      doorPx: noisy(scene.doorPx, noiseDoorPx),
       sheetMm: scenario.sheetMm,
       imageSize: IMAGE,
       sigmaSheetPx: scenario.sigmaSheetPx,
@@ -176,7 +202,13 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
     for (const code of res.quality.issues) issues[code] = (issues[code] || 0) + 1;
     // The sheet is always taped the same way round in this simulation (w along the door's width).
     const expected = scenario.sheetMm.h >= scenario.sheetMm.w ? 'portrait' : 'landscape';
-    if (res.sheetOrientation !== expected) wrongWayRound++;
+    if (res.sheetOrientation !== expected) {
+      wrongWayRound++;
+      // A wrong pick the app owns up to (it widens the sigmas and grades the result poor) does little
+      // harm. One it is confident about is the case that matters.
+      const margin = res.fit.orientationMargin;
+      if (!(margin !== null && margin < QUALITY_THRESHOLDS.orientationMinMargin)) wrongWayRoundUnflagged++;
+    }
     if (Math.abs(ew) <= 3 && Math.abs(eh) <= 3) within3++;
     if (Math.abs(ew) <= 5 && Math.abs(eh) <= 5) within5++;
     sumSigmaW += res.sigmaWidthMm;
@@ -193,6 +225,8 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
     sheetMm: scenario.sheetMm,
     sigmaSheetPx: scenario.sigmaSheetPx,
     sigmaDoorPx: scenario.sigmaDoorPx,
+    noiseSheetPx,
+    noiseDoorPx,
     trials,
     measured,
     rejectedDoorOutOfFrame: rejected,
@@ -202,6 +236,7 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
     quality: { good: frac(grades.good), fair: frac(grades.fair), poor: frac(grades.poor) },
     issues: Object.fromEntries(Object.entries(issues).sort((a, b) => b[1] - a[1]).map(([code, count]) => [code, frac(count)])),
     wrongWayRound: frac(wrongWayRound),
+    wrongWayRoundUnflagged: frac(wrongWayRoundUnflagged),
     within3mm: frac(within3),
     within5mm: frac(within5),
     reportedSigma: { meanWidthMm: sumSigmaW / n, meanHeightMm: sumSigmaH / n },
@@ -212,7 +247,7 @@ export function runScenario(scenario, { trials, seed, sheetBand = 1 }) {
 }
 
 function parseArgs(argv) {
-  const opts = { json: false, trials: 5000, seed: 20240607, sheetBand: 1 };
+  const opts = { json: false, trials: 5000, seed: 20240607, sheetBand: 1, noiseScale: 1 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const [name, inline] = arg.split('=');
@@ -221,7 +256,11 @@ function parseArgs(argv) {
     else if (name === '--trials') opts.trials = Math.max(1, Math.floor(Number(value())) || 0);
     else if (name === '--seed') opts.seed = Number(value()) >>> 0;
     else if (name === '--sheet-band') opts.sheetBand = Math.min(1, Math.max(0, Number(value()) || 0));
-    else if (name === '--help' || name === '-h') opts.help = true;
+    else if (name === '--noise-scale') {
+      const scale = Number(value());
+      if (!Number.isFinite(scale) || scale < 0) throw new Error('--noise-scale needs a number of 0 or more, for example 2');
+      opts.noiseScale = scale;
+    } else if (name === '--help' || name === '-h') opts.help = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   return opts;
@@ -239,15 +278,26 @@ function printReport(results, opts) {
   );
   const where = opts.sheetBand >= 1 ? 'anywhere on the door' : `centre within the middle ${(100 * opts.sheetBand).toFixed(0)}% of the door height`;
   lines.push(`Camera 2.2-3.5 m away, yaw +-15 deg, pitch +-8 deg, roll +-3 deg; sheet ${where}, tilted +-5 deg.`);
+  lines.push(
+    `Corner sigmas from js/config.js, as the app tells the fit: sheet ${APP_SIGMAS.sheetRefinedPx} px refined / ${APP_SIGMAS.sheetManualPx} px manual, ` +
+      `door ${APP_SIGMAS.doorPx} px.`,
+  );
+  lines.push(
+    opts.noiseScale === 1
+      ? 'Injected corner noise: the same sigmas (corners marked exactly as closely as the app assumes).'
+      : `Injected corner noise: those sigmas x ${opts.noiseScale} (corners marked ${opts.noiseScale > 1 ? 'worse' : 'better'} than the app assumes).`,
+  );
   lines.push('Absolute error in mm. "joint" = all 8 corners fitted together; "sheet-only" = homography from the sheet alone.');
   lines.push('');
-  const head1 = `${'Scenario (sigma sheet / door px)'.padEnd(38)}${'Method'.padEnd(12)}${'Width error'.padStart(17)}${'Height error'.padStart(19)}`;
-  const head2 = `${''.padEnd(38)}${''.padEnd(12)}${'median'.padStart(8)}${'95th'.padStart(9)}${'median'.padStart(10)}${'95th'.padStart(9)}`;
+  // Wide enough for the longest scenario name with its sigmas: they come from js/config.js, so their length varies.
+  const nameWidth = 2 + Math.max(36, ...results.map((r) => `${r.label} (${r.sigmaSheetPx} / ${r.sigmaDoorPx})`.length));
+  const head1 = `${'Scenario (sigma sheet / door px)'.padEnd(nameWidth)}${'Method'.padEnd(12)}${'Width error'.padStart(17)}${'Height error'.padStart(19)}`;
+  const head2 = `${''.padEnd(nameWidth)}${''.padEnd(12)}${'median'.padStart(8)}${'95th'.padStart(9)}${'median'.padStart(10)}${'95th'.padStart(9)}`;
   lines.push(head1, head2, '-'.repeat(head1.length));
   for (const r of results) {
     const name = `${r.label} (${r.sigmaSheetPx} / ${r.sigmaDoorPx})`;
     const row = (label, method, s) =>
-      `${label.padEnd(38)}${method.padEnd(12)}${fmt(s.width.medianAbsMm)}${fmt(s.width.p95AbsMm, 1, 9)}${fmt(s.height.medianAbsMm, 1, 10)}${fmt(s.height.p95AbsMm, 1, 9)}`;
+      `${label.padEnd(nameWidth)}${method.padEnd(12)}${fmt(s.width.medianAbsMm)}${fmt(s.width.p95AbsMm, 1, 9)}${fmt(s.height.medianAbsMm, 1, 10)}${fmt(s.height.p95AbsMm, 1, 9)}`;
     lines.push(row(name, 'joint', r.joint));
     lines.push(row('', 'sheet-only', r.sheetOnly));
   }
@@ -269,7 +319,7 @@ function printReport(results, opts) {
     const failed = Object.entries(r.failures).map(([code, count]) => `${code} x${count}`).join(', ') || 'none';
     lines.push(`${r.label}: issues: ${issueText}.`);
     lines.push(
-      `  failed fits: ${failed}; sheet wrong way round: ${(100 * r.wrongWayRound).toFixed(2)}%; ` +
+      `  failed fits: ${failed}; sheet wrong way round: ${(100 * r.wrongWayRound).toFixed(2)}% (not flagged: ${(100 * r.wrongWayRoundUnflagged).toFixed(2)}%); ` +
         `poses redrawn (door out of frame): ${r.rejectedDoorOutOfFrame}; ${r.msPerMeasure.toFixed(3)} ms per measurement.`,
     );
   }
@@ -286,12 +336,18 @@ function main() {
     return;
   }
   if (opts.help) {
-    console.log('Usage: node tools/simulate.mjs [--json] [--trials N] [--seed N] [--sheet-band 0..1]');
+    console.log('Usage: node tools/simulate.mjs [--json] [--trials N] [--seed N] [--sheet-band 0..1] [--noise-scale N]');
     return;
   }
   const results = SCENARIOS.map((scenario) => runScenario(scenario, opts));
   if (opts.json) {
-    console.log(JSON.stringify({ trials: opts.trials, seed: opts.seed, sheetBand: opts.sheetBand, image: IMAGE, focalPx: FOCAL_PX, doorMm: DOOR, scenarios: results }, null, 2));
+    console.log(
+      JSON.stringify(
+        { trials: opts.trials, seed: opts.seed, sheetBand: opts.sheetBand, noiseScale: opts.noiseScale, appSigmasPx: APP_SIGMAS, image: IMAGE, focalPx: FOCAL_PX, doorMm: DOOR, scenarios: results },
+        null,
+        2,
+      ),
+    );
   } else {
     printReport(results, opts);
   }
