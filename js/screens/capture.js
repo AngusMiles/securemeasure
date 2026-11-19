@@ -107,6 +107,14 @@ const BUTTON_SIZES = ['sm', 'md', 'lg'];
 /** getUserMedia failures that mean "no camera at all" rather than "no camera API". */
 const NO_CAMERA_ERRORS = new Set(['NotFoundError', 'DevicesNotFoundError', 'OverconstrainedError', 'ConstraintNotSatisfiedError']);
 /**
+ * 'unavailable' reasons where Allow camera cannot help, so it is not offered: the browser has no camera
+ * API at all (and asking again fails the same way at once, with nothing to see or hear), the page is not
+ * https, or the site that embeds this page does not let it have the camera. 'inapp-unsupported' is an
+ * app's built-in browser with no camera API (an iOS WKWebView or Android WebView that exposes no
+ * getUserMedia): it gets the in-app words, as Safari or Chrome is the way on there.
+ */
+const NO_RETRY_REASONS = new Set(['insecure', 'unsupported', 'embedded', 'inapp-unsupported']);
+/**
  * The other iPhone and iPad browsers, by the token each puts in its user agent, with the name the
  * re-enable steps call it by. All are WebKit underneath, but none has Safari's aA menu or Website
  * Settings, so Safari's steps would send their customers looking for buttons that are not there.
@@ -358,10 +366,8 @@ export function mount(root, ctx) {
         break;
       case 'unavailable':
         title = t('capture.unavailable.title');
-        text = t(`capture.unavailable.${reason || 'unsupported'}`);
-        // Trying again cannot help where the browser has no camera API at all, or the site that embeds
-        // this page does not let it have the camera.
-        allow = reason !== 'insecure' && reason !== 'unsupported' && reason !== 'embedded';
+        text = t(`capture.unavailable.${reason === 'inapp-unsupported' ? 'inapp' : reason || 'unsupported'}`);
+        allow = !NO_RETRY_REASONS.has(reason);
         break;
       default:
         title = t('capture.failed.title');
@@ -507,13 +513,17 @@ export function mount(root, ctx) {
     ctx.state.liveCamera = false;
     const kind = cameraErrorKind(error);
     const name = error && typeof error.name === 'string' ? error.name : '';
+    // No camera API here (startCamera's NotSupportedError when there is no getUserMedia, or the like),
+    // rather than no camera: asking again fails the same way at once.
+    const noApi = kind === 'unavailable' && !NO_CAMERA_ERRORS.has(name);
     if (kind === 'insecure') setPhase('unavailable', 'insecure');
     // An iframe without allow="camera": neither site settings nor another browser can change that.
     else if (kind === 'blocked' && embedBlocksCamera()) setPhase('unavailable', 'embedded');
     // Site-settings help means nothing inside another app's browser: there the way on is Safari or Chrome.
-    else if (inApp && kind !== 'busy') setPhase('unavailable', 'inapp');
+    // Where that browser has no camera API at all, Allow camera goes as well (see NO_RETRY_REASONS).
+    else if (inApp && kind !== 'busy') setPhase('unavailable', noApi ? 'inapp-unsupported' : 'inapp');
     else if (kind === 'blocked') setPhase('blocked');
-    else if (kind === 'unavailable') setPhase('unavailable', NO_CAMERA_ERRORS.has(name) ? 'nocamera' : 'unsupported');
+    else if (kind === 'unavailable') setPhase('unavailable', noApi ? 'unsupported' : 'nocamera');
     else if (kind === 'busy') setPhase('busy');
     else setPhase('failed');
   }

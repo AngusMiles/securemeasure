@@ -12,6 +12,7 @@ import {
   canEnterDoor,
   clearanceFromRect,
   cornersByHand,
+  cornersByHandInOrder,
   cornersInOutlineOrder,
   doorBannerKind,
   doorCornerSigmaPx,
@@ -29,7 +30,7 @@ import {
   sheetDetectionOutcome,
 } from '../js/screens/mark-common.js';
 import { cameraHomography, projectPoint } from '../tools/camera.mjs';
-import { measureDoor } from '../js/geometry.js';
+import { measureDoor, orderDoorQuad } from '../js/geometry.js';
 import { QuadEditor, fitView, imageToScreen, viewsEqual } from '../js/editor.js';
 import { startingQuad } from '../js/door-find.js';
 import * as doorScreen from '../js/screens/door.js';
@@ -375,8 +376,19 @@ describe('doorCornersPlaced', () => {
     }
   });
 
+  test('every corner of an outline detection drew, checked where it is, counts as placed', () => {
+    // Pressed and let go of, or checked with the keyboard, each corner said to be right: an outline detection
+    // was unsure of but got right needs no corner nudged off its spot.
+    assert.equal(doorCornersPlaced({ checked: true, confident: false, outline: 0 }), true);
+    assert.equal(doorCornersPlaced({ checked: true, confident: false, outline: 1 }), true);
+    // The stand-in rectangle is nobody's door: checking its corners puts none of them on the opening.
+    assert.equal(doorCornersPlaced({ checked: true, outline: -1 }), false);
+    assert.equal(doorCornersPlaced({ checked: true }), false);
+    assert.equal(doorCornersPlaced({ checked: false, confident: false, outline: 0 }), false);
+  });
+
   test('only a real true counts', () => {
-    assert.equal(doorCornersPlaced({ moved: 1, chosen: 'yes', confident: 1, outline: 0 }), false);
+    assert.equal(doorCornersPlaced({ moved: 1, chosen: 'yes', confident: 1, checked: 1, outline: 0 }), false);
   });
 });
 
@@ -552,6 +564,28 @@ describe('where the door corners came from', () => {
     const byHand = [...NONE];
     markCornersByHand(byHand, before, after);
     assert.deepEqual(byHand, NONE, 'the input is left as it was');
+  });
+
+  test('cornersByHandInOrder follows each corner into the order measureDoor measures them in', () => {
+    // Handles that start on the bottom-right corner and go round the other way (BR, TR, TL, BL), read
+    // in the [TL, TR, BR, BL] order orderDoorQuad gives them back in.
+    const handles = [DOOR[2], DOOR[1], DOOR[0], DOOR[3]].map((p) => ({ ...p }));
+    const byHand = [true, false, false, true]; // BR and BL placed by the customer
+    assert.deepEqual(cornersByHandInOrder(byHand, handles, orderDoorQuad(handles)), [false, false, true, true]);
+    // Already in that order: unchanged, as a fresh array.
+    const same = cornersByHandInOrder(byHand, copy(DOOR), copy(DOOR));
+    assert.deepEqual(same, byHand);
+    assert.notEqual(same, byHand);
+    // Malformed byHand reads as none (cornersByHand); anything but two quads, or a corner no handle is on, as not placed.
+    assert.deepEqual(cornersByHandInOrder(null, handles, orderDoorQuad(handles)), NONE);
+    assert.deepEqual(cornersByHandInOrder(ALL, handles, null), NONE);
+    assert.deepEqual(cornersByHandInOrder(ALL, handles.slice(0, 3), copy(DOOR)), NONE);
+    const elsewhere = copy(DOOR);
+    elsewhere[1].x += 1;
+    assert.deepEqual(cornersByHandInOrder(ALL, copy(DOOR), elsewhere), [true, false, true, true]);
+    // Two handles on one spot are matched once each, never both to the same corner.
+    const doubled = [DOOR[0], DOOR[0], DOOR[2], DOOR[3]].map((p) => ({ ...p }));
+    assert.deepEqual(cornersByHandInOrder([true, false, true, true], doubled, copy(doubled)), [true, false, true, true]);
   });
 
   test("corners all placed by hand are measured with the hand's error", () => {
@@ -1231,6 +1265,29 @@ function isQuadNear(points, quad) {
 }
 const onDoor = (points) => isQuadNear(points, SCREEN_DOOR);
 
+/** The door screen's photo: the corner editor's canvas. */
+const photoOf = (screen) => screen.root.find((el) => el.classList.contains('sm-quad-editor'));
+
+/** A key pressed on the photo, with no modifiers unless `props` says. */
+const keyOnPhoto = (screen, name, props = {}) =>
+  fire(photoOf(screen), 'keydown', { key: name, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, repeat: false, ...props });
+
+/**
+ * Focus arrives on the photo from the keyboard. The stand-in knows no pseudo-classes, so the photo is told
+ * this focus is a keyboard's (:focus-visible), as a browser says after a Tab.
+ * @returns {() => void} Focus leaves the photo: it is blurred, and no longer :focus-visible.
+ */
+function focusPhotoByKeyboard(screen) {
+  const canvas = photoOf(screen);
+  const matches = canvas.matches;
+  canvas.matches = (selector) => selector === ':focus-visible' || matches.call(canvas, selector);
+  fire(canvas, 'focus');
+  return () => {
+    canvas.matches = matches;
+    fire(canvas, 'blur');
+  };
+}
+
 describe('the door screen, mounted: its background search for the door', () => {
   let saved = [];
   let realResize = null;
@@ -1419,5 +1476,265 @@ describe('the door screen, mounted: its background search for the door', () => {
     assert.deepEqual(points[0], dragged, 'where the customer put it');
     for (let i = 1; i < 4; i += 1) assert.deepEqual(points[i], FALLBACK[i], `handle ${i} untouched`);
     assert.deepEqual(state.door.byHand, [true, false, false, false]);
+  });
+
+  test('a handle checked on the stand-in rectangle, then let go of, is detection\'s again once the search puts it on the door', async () => {
+    // Pressing a handle and letting go of it where it is checks it (onHandleCheck), and a checked corner is
+    // measured with a hand's error. But that was a check of where the stand-in rectangle had it: moved onto
+    // the door by the search, it is where detection put it, and a hand's error there would make the ± too
+    // tight and tell the result screen the customer placed it.
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    // A stale measurement, so the check can be seen: a checked corner's new error drops it.
+    state.measure = { method: 'paper' };
+    const handle = onStage(FALLBACK[0]);
+    screen.down(1, handle);
+    screen.up(1, handle, { after: 80 });
+    await nextTask();
+    assert.equal(state.measure, null, 'the press checked the handle');
+    assert.equal(screen.editor.getActive(), 0, 'and selected it');
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'no handle moved');
+    // A tap away from the handles lets go of it: nothing the customer picked is selected any more.
+    screen.down(1, EMPTY_SPOT, { after: 800 });
+    screen.up(1, EMPTY_SPOT, { after: 80 });
+    await nextTask();
+    assert.equal(screen.editor.getActive(), null, 'let go of by the tap');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(onDoor(screen.editor.getPoints()), 'the handles moved onto the door');
+    screen.press(say('door.measure'));
+    assert.deepEqual(screen.toasts, []);
+    assert.deepEqual(screen.went, ['result']);
+    assert.deepEqual(state.door.byHand, [false, false, false, false], 'every corner is where detection put it');
+    assert.deepEqual(state.measure.doorCornersByHand, [false, false, false, false], 'and measured as detection\'s');
+  });
+
+  test('a pinch whose first finger lands on a handle picks nothing: the handles still go onto the door', async () => {
+    // The editor selects the handle under the first finger before the second one shows it is a pinch, and
+    // keeps it selected after. Nobody chose it, and with one outline found there would be no "Not this?
+    // Show the next outline" to bring the door back.
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    const handle = onStage(FALLBACK[0]);
+    screen.down(1, handle);
+    screen.down(2, { x: handle.x + 120, y: handle.y + 150 }, { primary: false });
+    for (const step of [30, 60, 100]) screen.move(2, { x: handle.x + 120 + step, y: handle.y + 150 + step });
+    screen.up(2, { x: handle.x + 220, y: handle.y + 250 });
+    screen.up(1, handle);
+    assert.ok(screen.editor.getView().scale > FIT.scale * 1.2, 'zoomed in');
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'no handle moved');
+    assert.equal(screen.editor.getActive(), 0, 'the editor kept the handle the pinch started on selected');
+    await nextTask();
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(onDoor(screen.editor.getPoints()), 'the handles moved onto the door');
+    assert.equal(screen.editor.getActive(), null, 'and none is left selected');
+    assert.equal(screen.banner(), say('door.banner.found'));
+    screen.press(say('door.measure'));
+    assert.deepEqual(screen.toasts, [], 'no "drag the four corners first"');
+    assert.deepEqual(screen.went, ['result']);
+    assert.ok(onDoor(state.door.points));
+  });
+
+  test('the handle the editor selects as the photo gets keyboard focus is nobody\'s pick, and stays selected for the keyboard', async () => {
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    focusPhotoByKeyboard(screen);
+    assert.equal(screen.editor.getActive(), 0, 'the editor selected the first handle by itself');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(onDoor(screen.editor.getPoints()), 'the handles moved onto the door');
+    assert.equal(screen.banner(), say('door.banner.found'));
+    // The photo still has the keyboard's focus. The editor steps on with Tab from the selected handle and
+    // confirms it with Enter: with it let go of, Tab left the photo for the buttons and Enter did nothing,
+    // though the photo's label says Tab goes from corner to corner.
+    assert.equal(screen.editor.getActive(), 0, 'still selected, on the door now');
+    assert.equal(keyOnPhoto(screen, 'Tab').defaultPrevented, true, 'Tab stays on the photo');
+    assert.equal(screen.editor.getActive(), 1, 'and goes on to the next corner');
+    assert.equal(keyOnPhoto(screen, 'Enter').defaultPrevented, true, 'Enter confirms it');
+    assert.ok(onDoor(screen.editor.getPoints()), 'where detection put it');
+    assert.deepEqual(state.door.byHand, [false, true, false, false]);
+  });
+
+  test('Tabbing past the photo while the search runs picks nothing: the handles still go onto the door', async () => {
+    // The photo comes before the buttons in tab order, so a keyboard customer Tabs through all four handles
+    // just to reach "Measure my door": focus selects the first, each Tab the next, and the editor keeps the
+    // last one selected as focus leaves. Counted as a pick, that kept the door found off the stand-in
+    // rectangle, and measuring then asked for the corners to be dragged first, with no "Not this? Show the
+    // next outline" (one outline found) to bring the door back.
+    for (const method of ['paper', 'estimate']) {
+      const state = method === 'paper' ? paperAtDoor() : { method, photo: screenPhoto(), door: { points: null, detection: null } };
+      const { screen, worker } = await mountAndSearch(state);
+      const leave = focusPhotoByKeyboard(screen);
+      assert.equal(screen.editor.getActive(), 0);
+      for (let i = 1; i < 4; i += 1) {
+        assert.equal(keyOnPhoto(screen, 'Tab').defaultPrevented, true, `Tab on to corner ${i}`);
+        assert.equal(screen.editor.getActive(), i);
+      }
+      assert.equal(keyOnPhoto(screen, 'Tab').defaultPrevented, false, 'the last Tab leaves the photo');
+      leave();
+      assert.equal(screen.editor.getActive(), 3, 'the editor keeps the last corner selected');
+      await searchAnswers(worker, foundDoor());
+
+      assert.ok(onDoor(screen.editor.getPoints()), `${method}: the handles moved onto the door`);
+      assert.equal(screen.editor.getActive(), null, 'and, the photo no longer having the focus, none is left selected');
+      assert.equal(screen.banner(), say('door.banner.found'));
+      screen.press(say(method === 'paper' ? 'door.measure' : 'door.estimate.measure'));
+      assert.deepEqual(screen.toasts, [], 'no "drag the four corners first"');
+      assert.deepEqual(screen.went, ['result']);
+      assert.deepEqual(state.door.byHand, [false, false, false, false], 'Tab confirmed no corner');
+      screen.unmount();
+    }
+  });
+
+  test('a tap on the handle already selected is a pick: the handles stay where the customer is looking', async () => {
+    // The editor only reports a selection that changes. A deliberate tap on the handle the first finger of a
+    // pinch left selected (nobody's pick) said nothing new, so the door found moved it, and the others, away.
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    const handle = onStage(FALLBACK[0]);
+    screen.down(1, handle);
+    screen.down(2, { x: handle.x + 120, y: handle.y + 150 }, { primary: false });
+    for (const step of [30, 60, 100]) screen.move(2, { x: handle.x + 120 + step, y: handle.y + 150 + step });
+    screen.up(2, { x: handle.x + 220, y: handle.y + 250 });
+    screen.up(1, handle);
+    assert.ok(screen.editor.getView().scale > FIT.scale * 1.2, 'zoomed in');
+    assert.equal(screen.editor.getActive(), 0, 'the pinch left the handle it started on selected');
+    // Now a tap on that handle, where the zoomed-in photo shows it.
+    const zoomed = imageToScreen(screen.editor.getView(), FALLBACK[0]);
+    screen.down(1, zoomed, { after: 800 });
+    screen.up(1, zoomed, { after: 80 });
+    await nextTask();
+    assert.equal(screen.editor.getActive(), 0);
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'no handle moved');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'the handle the customer picked is not moved');
+    assert.equal(screen.editor.getActive(), 0, 'and stays selected');
+    assert.equal(screen.banner(), say('door.banner'));
+  });
+
+  test('Enter on the handle keyboard focus selected is a pick: the handles stay where they are', async () => {
+    // Enter confirms the selected corner where it is, as a tap on it does; it selects nothing new.
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    focusPhotoByKeyboard(screen);
+    assert.equal(screen.editor.getActive(), 0, 'the editor selected the first handle by itself');
+    assert.equal(keyOnPhoto(screen, 'Enter').defaultPrevented, true, 'Enter confirms it');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'not moved from under the keyboard');
+    assert.equal(screen.editor.getActive(), 0, 'still selected');
+    assert.equal(screen.banner(), say('door.banner'));
+  });
+
+  test('a pinch on one handle after a tap on another: the earlier pick is over, and the handles go onto the door', async () => {
+    // The tap picks handle 1. The pinch's first finger then lands on handle 0, which the editor selects and
+    // keeps selected, though nobody chose it: what was picked is no longer what is selected.
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    const tapped = onStage(FALLBACK[1]);
+    screen.down(1, tapped);
+    screen.up(1, tapped, { after: 80 });
+    await nextTask();
+    assert.equal(screen.editor.getActive(), 1, 'the tap selected handle 1');
+    const handle = onStage(FALLBACK[0]);
+    screen.down(1, handle, { after: 800 });
+    screen.down(2, { x: handle.x + 120, y: handle.y + 150 }, { primary: false });
+    for (const step of [30, 60, 100]) screen.move(2, { x: handle.x + 120 + step, y: handle.y + 150 + step });
+    screen.up(2, { x: handle.x + 220, y: handle.y + 250 });
+    screen.up(1, handle);
+    assert.ok(screen.editor.getView().scale > FIT.scale * 1.2, 'zoomed in');
+    assert.equal(screen.editor.getActive(), 0, 'the pinch left the handle it started on selected');
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'no handle moved');
+    await nextTask();
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(onDoor(screen.editor.getPoints()), 'the handles moved onto the door');
+    assert.equal(screen.editor.getActive(), null, 'and none is left selected');
+    assert.equal(screen.banner(), say('door.banner.found'));
+    screen.press(say('door.measure'));
+    assert.deepEqual(screen.toasts, [], 'no "drag the four corners first"');
+    assert.deepEqual(screen.went, ['result']);
+  });
+
+  test('a key on the photo is over once the editor has had it: a keyboard focus after it still selects nobody\'s pick', async () => {
+    // The screen notes a key on its way down to the editor and forgets it on the way back up, so that only
+    // a handle the key itself selects is the customer's pick. Remembered past that, a key that selects
+    // nothing ('+' and '-' zoom) would make the handle the editor selects by itself when the photo gets
+    // keyboard focus again pass for one picked, and the door found would be kept off the handles. (Not
+    // Tab: a Tab never picks the handle it selects, so it would forget the key either way.)
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    const canvas = photoOf(screen);
+    // Focused by a tap (not :focus-visible): no handle is selected. Then '+' to zoom in and '-' to zoom out,
+    // and the focus goes elsewhere (a press on a button, say).
+    fire(canvas, 'focus');
+    assert.equal(keyOnPhoto(screen, '+').defaultPrevented, true, 'the editor zoomed in');
+    assert.equal(keyOnPhoto(screen, '-').defaultPrevented, true, 'and out');
+    assert.equal(screen.editor.getActive(), null, 'zooming selects nothing');
+    fire(canvas, 'blur');
+    // Back with Shift+Tab, a keyboard's focus.
+    focusPhotoByKeyboard(screen);
+    assert.equal(screen.editor.getActive(), 0, 'the editor selected the first handle by itself');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(onDoor(screen.editor.getPoints()), 'the handles moved onto the door');
+    assert.equal(screen.editor.getActive(), 0, 'the first stays selected, for the keyboard that has the photo');
+    assert.equal(screen.banner(), say('door.banner.found'));
+  });
+
+  test('a handle selected with an arrow key is the customer\'s pick: the handles stay where they are', async () => {
+    const state = paperAtDoor();
+    const { screen, worker } = await mountAndSearch(state);
+    const canvas = screen.root.find((el) => el.classList.contains('sm-quad-editor'));
+    // With nothing selected, the first arrow key selects the first handle and moves nothing.
+    fire(canvas, 'keydown', { key: 'ArrowRight', altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, repeat: false });
+    assert.equal(screen.editor.getActive(), 0);
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'no handle moved');
+    await searchAnswers(worker, foundDoor());
+
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'not moved from under the keyboard');
+    assert.equal(screen.editor.getActive(), 0, 'still selected');
+    assert.equal(screen.banner(), say('door.banner'));
+  });
+
+  test('a worker that has not started within 15 s is given up: the door is never searched for on the main thread', async () => {
+    // A budget phone can take seconds to fetch and start the worker. The customer may be dragging a corner
+    // meanwhile, so a search on the main thread would freeze the page under their finger: findDoor's
+    // `background` makes the load allowance end as a 'timeout' instead, and the screen gives it 15 s, not
+    // findDoor's own 6 s, since nothing waits on it. The allowance is the one long timer set as the search
+    // starts; it is read here as it is set, then run out at once rather than after 15 real seconds.
+    const state = paperAtDoor();
+    const realSetTimeout = globalThis.setTimeout;
+    const timers = [];
+    globalThis.setTimeout = (fn, ms, ...args) => {
+      const id = realSetTimeout(fn, ms, ...args);
+      timers.push({ fn, ms, id });
+      return id;
+    };
+    let started;
+    try {
+      started = await mountAndSearch(state);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    const { screen, worker } = started;
+    // The editor's and the scaffold's own timers are all well under a second.
+    const allowances = timers.filter(({ ms }) => ms >= 1000);
+    assert.deepEqual(allowances.map(({ ms }) => ms), [15000], 'a 15 s allowance for the worker to start, not findDoor\'s 6 s');
+
+    // The worker never says it is ready (no worker.ready()), and the allowance runs out.
+    const [allowance] = allowances;
+    clearTimeout(allowance.id);
+    allowance.fn();
+    await until(() => worker.terminated, 'the slow worker to be stopped');
+    await until(() => screen.banner() !== say('door.banner.searching'), 'the search to end');
+    for (let i = 0; i < 3; i += 1) await nextTask();
+
+    // A main-thread search would have left its answer for the photo (on this blank stand-in, a settled failure).
+    assert.equal(state.door.detection, null, 'no search ran on the main thread, and a timeout is not the photo\'s answer');
+    assert.equal(screen.banner(), say('door.banner'));
+    assert.ok(isQuadNear(screen.editor.getPoints(), FALLBACK), 'the handles stay on the fallback rectangle');
   });
 });

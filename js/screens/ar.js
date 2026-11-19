@@ -27,6 +27,7 @@ import { nearestStandard, standardSizesFrom } from '../estimate.js';
 import { add, projectSegmentToCss, projectToCss, rayFromPoseMatrix } from '../xr-measure.js';
 import { createArFlow, outlineSegments, POINT_KEYS } from '../ar-flow.js';
 import { arRefused, arSupported, isKnownInAppBrowser, noteArRefused, noteArStarted } from '../ar-support.js';
+import { dropDemoMeasure } from '../demo.js';
 
 /** Screen id. */
 export const id = 'ar';
@@ -674,8 +675,10 @@ export function mount(root, ctx) {
       return ui.button(t('ar.manual'), {
         ...look,
         icon: 'edit',
-        // As the welcome screen's "I already know my door size".
+        // As the welcome screen's "I already know my door size", a measurement of the demo photo included
+        // (dropDemoMeasure). Today no demo is offered when this is the way on, so there is none to drop.
         onClick: () => {
+          dropDemoMeasure(ctx.state);
           ctx.state.manualEntry = true;
           ctx.go('result');
         },

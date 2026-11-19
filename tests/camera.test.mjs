@@ -949,9 +949,13 @@ function framedWindow() {
   return win;
 }
 
-/** Mount the capture screen with `getUserMedia` as the camera; parts are found by their class. */
+/**
+ * Mount the capture screen with `getUserMedia` as the camera; parts are found by their class.
+ * `noCameraApi` leaves navigator.mediaDevices out altogether, as in a WebView that exposes none.
+ */
 function mountCapture({
   getUserMedia,
+  noCameraApi = false,
   window: win,
   userAgent = 'test',
   maxTouchPoints = 0,
@@ -961,7 +965,7 @@ function mountCapture({
 } = {}) {
   const dom = fakeScreenDom();
   setGlobal('document', dom.doc);
-  setGlobal('navigator', { userAgent, maxTouchPoints, mediaDevices: { getUserMedia } });
+  setGlobal('navigator', noCameraApi ? { userAgent, maxTouchPoints } : { userAgent, maxTouchPoints, mediaDevices: { getUserMedia } });
   if (win) setGlobal('window', win);
   const root = dom.h('section');
   const went = [];
@@ -1048,6 +1052,58 @@ describe('capture screen', () => {
     assert.equal(screen.part('panel-help').textContent, 'capture.blocked.help.other');
     assert.equal(screen.part('panel-help').hidden, false);
     assert.equal(screen.allow.hidden, false);
+    screen.cleanup();
+  });
+
+  test('an app\'s built-in browser with no camera API: the in-app words, and no Allow camera that fails again at once', async () => {
+    const cases = [
+      ['Facebook on an iPhone (WKWebView)', `${IPHONE} Mobile/15E148 [FBAN/FBIOS;FBAV/470.0.0.37.108;FBBV/620000000;FBDV/iPhone15,2]`],
+      ['an Android app WebView', 'Mozilla/5.0 (Linux; Android 14; Pixel 8; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.135 Mobile Safari/537.36'],
+    ];
+    for (const [label, userAgent] of cases) {
+      setGlobal('isSecureContext', true); // https: the missing API is the WebView's, not the page's
+      const screen = mountCapture({ userAgent, noCameraApi: true });
+      // The customer is on the card's button while the screen starts.
+      screen.allow.focus();
+      assert.equal(screen.doc.activeElement, screen.allow, label);
+      await settle();
+      assert.equal(screen.part('panel-title').textContent, 'capture.unavailable.title', label);
+      assert.equal(screen.part('panel-text').textContent, 'capture.unavailable.inapp', label);
+      assert.equal(screen.allow.hidden, true, `${label}: no Allow camera`);
+      assert.ok(screen.cameraApp.classes.has('sm-btn--primary'), `${label}: the camera app is the way on`);
+      assert.equal(screen.doc.activeElement, screen.cameraApp.input, `${label}: focus moved on with the hidden button`);
+      screen.cleanup();
+    }
+  });
+
+  test('an app\'s built-in browser that has the camera API but would not give the camera: Allow camera stays', async () => {
+    const userAgent = 'Mozilla/5.0 (Linux; Android 14; Pixel 8; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.135 Mobile Safari/537.36';
+    for (const error of [new DOMException('denied', 'NotAllowedError'), new DOMException('none', 'NotFoundError')]) {
+      let calls = 0;
+      const screen = mountCapture({
+        userAgent,
+        getUserMedia: () => {
+          calls += 1;
+          return Promise.reject(error);
+        },
+      });
+      await settle();
+      assert.equal(screen.part('panel-text').textContent, 'capture.unavailable.inapp', error.name);
+      assert.equal(screen.allow.hidden, false, `${error.name}: the app may yet be asked to allow it`);
+      const before = calls;
+      screen.allow.click();
+      assert.ok(calls > before, `${error.name}: Allow camera asks again`);
+      await settle();
+      screen.cleanup();
+    }
+  });
+
+  test('a browser with no camera API outside an app: the plain words, and no Allow camera', async () => {
+    setGlobal('isSecureContext', true);
+    const screen = mountCapture({ userAgent: `${IPHONE} Version/18.1 Mobile/15E148 Safari/604.1`, noCameraApi: true });
+    await settle();
+    assert.equal(screen.part('panel-text').textContent, 'capture.unavailable.unsupported');
+    assert.equal(screen.allow.hidden, true);
     screen.cleanup();
   });
 

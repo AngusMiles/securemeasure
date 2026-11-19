@@ -78,6 +78,11 @@ export const strings = {
     'The paper does not seem to be on the door. Tape it flat on the door itself, or adjust the corners if a marker has slipped.',
   'result.issue.orientation_unclear':
     'We could not tell whether the paper is upright or on its side in this photo, so the size could be a long way out. Stand square to the door and retake the photo.',
+  // Asks for a press on every corner, not only a drag: a detected corner that is already right is
+  // checked by pressing it (the magnifier shows it close up) and letting go, which the door screen
+  // counts as placed by hand. "Drag each one" left nothing to do with a corner that was already right.
+  'result.issue.corners_detected':
+    'We placed the door corners for you. To tighten this up, tap Adjust corners, zoom in and press each corner to check it sits exactly where the door meets the frame, dragging it there if not.',
   'result.issue.high_uncertainty':
     'This photo does not let us measure very precisely. Tape the paper about halfway up the door, step in until the door just fills the photo, and retake it.',
   'result.issue.generic':
@@ -257,6 +262,100 @@ export function orientationUnclear(measure, graded, issueCodes, sheetMm) {
   return !(halfGapMm <= QUALITY_THRESHOLDS.poorSigmaMm);
 }
 
+/**
+ * True when the door screen says at least one door corner of this paper measurement was left where
+ * detection put it (measure.doorCornersByHand, see measurePaper in js/screens/door.js). A measurement
+ * that does not say is taken to be the customer's own corners, as it was before that was recorded.
+ * @param {object} measure  the paper state.measure
+ * @returns {boolean}
+ */
+export function cornersLeftToDetection(measure) {
+  const byHand = measure?.doorCornersByHand;
+  return Array.isArray(byHand) && byHand.length === 4 && byHand.some((placed) => placed !== true);
+}
+
+/**
+ * True when the "plus or minus" would still be wide with every door corner placed by hand, so the photo
+ * is part of the problem: measureDoor's own 'high_uncertainty' rule (a sigma above
+ * QUALITY_THRESHOLDS.highUncertaintySigmaMm) applied to what the door screen worked out for that case
+ * (measure.sigmaIfHandPlaced). Without those figures nobody knows the corners are the whole story: true.
+ * @param {object} measure  the paper state.measure
+ * @returns {boolean}
+ */
+export function uncertainEvenByHand(measure) {
+  const sigmas = measure?.sigmaIfHandPlaced;
+  if (!isSigma(sigmas?.widthMm) || !isSigma(sigmas?.heightMm)) return true;
+  return Math.max(sigmas.widthMm, sigmas.heightMm) > QUALITY_THRESHOLDS.highUncertaintySigmaMm;
+}
+
+/** A 1-sigma figure in mm as door.js records it: a finite number, not below zero. */
+function isSigma(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * The most the "plus or minus" may be left at, as a fraction of the measured one, for placing every door
+ * corner by hand to count as tightening it when it would still be wide afterwards (handPlacingTightens):
+ * at least a fifth off. Checking four corners is real work and the corners tip promises it pays. When
+ * the sheet sets most of the uncertainty (its corners placed by hand, a bank card) or the company's
+ * config.measurement.sigmaDoorPx is no better than detection's own error, placing the last corners by
+ * hand can take only a few mm off (±47 to ±43 mm for an A4 sheet placed by hand with one door corner
+ * left where detection put it, nothing at all with sigmaDoorPx at or above detection's), and the photo's
+ * own tip is the one that helps.
+ */
+export const CORNERS_TIP_MAX_RATIO = 0.8;
+
+/**
+ * True when placing every door corner by hand would really tighten this paper measurement's wide "plus or
+ * minus", so the corners tip ('corners_detected') is worth giving. Either it would no longer be wide
+ * (uncertainEvenByHand is false: the corners are the whole story), or it would still be wide but the worse
+ * by-hand sigma (measure.sigmaIfHandPlaced) is at most CORNERS_TIP_MAX_RATIO of the worse measured one,
+ * the dimension the "±N mm" figure is read from. Without the figures to compare nobody knows the corners
+ * would not help: true, as before they were compared.
+ * @param {object} measure  the paper state.measure
+ * @returns {boolean}
+ */
+export function handPlacingTightens(measure) {
+  if (!uncertainEvenByHand(measure)) return true;
+  const byHand = measure?.sigmaIfHandPlaced;
+  if (!isSigma(byHand?.widthMm) || !isSigma(byHand?.heightMm)) return true;
+  if (!isSigma(measure.sigmaWidthMm) || !isSigma(measure.sigmaHeightMm)) return true;
+  const measured = Math.max(measure.sigmaWidthMm, measure.sigmaHeightMm);
+  return Math.max(byHand.widthMm, byHand.heightMm) <= CORNERS_TIP_MAX_RATIO * measured;
+}
+
+/**
+ * The paper result's issue codes, in the order their tips are listed: measure.quality.issues once each,
+ * with a wide "plus or minus" ('high_uncertainty') put down to its likeliest cause:
+ *  - the sheet could be either way round (orientationUnclear): 'orientation_unclear' goes first and
+ *    stands in for it;
+ *  - otherwise, with door corners left where detection put them (cornersLeftToDetection) and placing
+ *    them by hand making a real difference (handPlacingTightens), it is 'corners_detected': checking
+ *    the corners is what tightens it, not a new photo. When it would stay wide with every corner placed
+ *    by hand (uncertainEvenByHand), the photo is part of it too, and 'high_uncertainty' (retake it)
+ *    follows. When placing them by hand would take only a few mm off, 'high_uncertainty' stays alone:
+ *    the corners tip would send the customer to check four corners for nothing they would notice.
+ * Every other code is kept as it is, in its place. The grade does not change: neither
+ * 'corners_detected' nor 'high_uncertainty' is a reason not to trust the size (UNTRUSTED_ISSUES).
+ *
+ * @param {object} measure  the paper state.measure (measureDoor's result, as door.js keeps it)
+ * @param {string} graded  measure.quality.level
+ * @param {{ w: number, h: number }} sheetMm  the reference sheet it was measured with (getSheetMm)
+ * @returns {string[]}
+ */
+export function paperIssueCodes(measure, graded, sheetMm) {
+  const reported = Array.isArray(measure?.quality?.issues) ? [...new Set(measure.quality.issues)] : [];
+  if (orientationUnclear(measure, graded, reported, sheetMm)) {
+    return ['orientation_unclear', ...reported.filter((code) => code !== 'orientation_unclear' && code !== 'high_uncertainty')];
+  }
+  if (!reported.includes('high_uncertainty') || !cornersLeftToDetection(measure) || !handPlacingTightens(measure)) {
+    return reported;
+  }
+  const instead = uncertainEvenByHand(measure) ? ['corners_detected', 'high_uncertainty'] : ['corners_detected'];
+  const codes = reported.flatMap((code) => (code === 'high_uncertainty' ? instead : [code]));
+  return [...new Set(codes)];
+}
+
 /** "±N mm" figure: two sigma of the worse dimension, never claiming better than 2 mm. */
 function accuracyFromSigmas(measure) {
   const sigma = Math.max(Number(measure.sigmaWidthMm), Number(measure.sigmaHeightMm));
@@ -272,12 +371,9 @@ function mountMeasured(root, ctx) {
   const { h } = ui;
   const measure = state.measure;
   const graded = ['good', 'fair', 'poor'].includes(measure.quality?.level) ? measure.quality.level : 'fair';
-  const reportedCodes = Array.isArray(measure.quality?.issues) ? [...new Set(measure.quality.issues)] : [];
-  // An undecided sheet orientation is why the "plus or minus" is wide, so its own tip goes first
-  // and stands in for the general one.
-  const issueCodes = orientationUnclear(measure, graded, reportedCodes, getSheetMm(state, config))
-    ? ['orientation_unclear', ...reportedCodes.filter((code) => code !== 'orientation_unclear' && code !== 'high_uncertainty')]
-    : reportedCodes;
+  // A wide "plus or minus" is put down to its likeliest cause: the sheet's orientation, door corners
+  // the customer has not checked, or the photo itself.
+  const issueCodes = paperIssueCodes(measure, graded, getSheetMm(state, config));
   // What the screen shows: the grade, with 'poor' split into 'poor' (do not trust it) and 'rough'.
   const level = graded === 'poor' && !issueCodes.some((code) => UNTRUSTED_ISSUES.has(code)) ? 'rough' : graded;
 

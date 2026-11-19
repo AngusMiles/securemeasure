@@ -716,6 +716,15 @@ function rectDistance(p, x, y, w, h) {
  *   final: false one showing the handle back in place.
  * @property {(imagePoint: Point) => void} [onTap]   a tap on the image that is not on a handle
  * @property {(index: number | null) => void} [onActiveChange]   the customer (not setActive) changed the active handle
+ * @property {(index: number) => void} [onHandleCheck]
+ *   The customer looked at handle `index` and left it where it was: a press on it let go of without
+ *   the handle moving (it stayed inside the dead zone, so onChange reported nothing), or Enter / Space
+ *   pressed while it is the active handle (the keyboard's press; once per press, not for key repeats).
+ *   Fired on release for a press, never for its pointerdown, for a cancelled press, or for a press that
+ *   became a pinch. Never for a handle that is only selected: Tab / Shift+Tab moving onto it (a keyboard
+ *   customer Tabs through every handle to reach what follows the canvas), an arrow key selecting it
+ *   because no handle was active, the canvas getting keyboard focus, or setActive(). It does not change
+ *   onChange: final: true still always means the handle moved (an arrow nudge reports there).
  * @property {'corner' | 'center'} [pixelOrigin]
  *   What integer point coordinates address. 'corner' (default) is the canvas convention used by
  *   js/vision.js: pixel i covers [i, i + 1). Pass 'center' only for points produced by code in
@@ -729,7 +738,8 @@ function rectDistance(p, x, y, w, h) {
  * Gestures: drag a handle (a loupe shows what is under the finger); pinch to zoom and pan with
  * two fingers; drag empty image with one finger to pan when zoomed in; tap empty image to fire
  * onTap; mouse wheel zooms. Keyboard: Tab / Shift+Tab step through the handles, arrows nudge the
- * active handle by 1 image px (Shift: 10), + / - / 0 zoom in / out / fit.
+ * active handle by 1 image px (Shift: 10), Enter / Space confirm the active handle where it is
+ * (onHandleCheck), + / - / 0 zoom in / out / fit.
  */
 export class QuadEditor {
   /**
@@ -764,6 +774,7 @@ export class QuadEditor {
     this._onChange = typeof options.onChange === 'function' ? options.onChange : null;
     this._onTap = typeof options.onTap === 'function' ? options.onTap : null;
     this._onActiveChange = typeof options.onActiveChange === 'function' ? options.onActiveChange : null;
+    this._onHandleCheck = typeof options.onHandleCheck === 'function' ? options.onHandleCheck : null;
 
     this._points = null;
     this._active = null;
@@ -1105,6 +1116,7 @@ export class QuadEditor {
     this._onChange = null;
     this._onTap = null;
     this._onActiveChange = null;
+    this._onHandleCheck = null;
     this._ctx = null;
     this._loupeCtx = null;
   }
@@ -1544,6 +1556,8 @@ export class QuadEditor {
 
     let ended = null;
     let tapPoint = null;
+    // A press on a handle let go of with the handle where it was: the customer checked it (onHandleCheck).
+    let checked = null;
     if (this._mode === 'handle' && this._drag && this._drag.pointerId === e.pointerId) {
       const drag = this._drag;
       if (drag.moved && !cancelled && drag.pointerType === 'touch' && this._points) {
@@ -1551,6 +1565,7 @@ export class QuadEditor {
         if (settled) this._points[drag.index] = clampPoint(settled, this._iw, this._ih, this._origin);
       }
       ended = this._endDrag();
+      if (!cancelled && !ended && this._points) checked = drag.index;
     } else if (this._mode === 'pan' && this._pan && this._pan.pointerId === e.pointerId) {
       const pan = this._pan;
       this._pan = null;
@@ -1574,6 +1589,7 @@ export class QuadEditor {
     this._updateCursor(pos);
     this._requestDraw();
     if (ended) this._emitChange(ended.final, ended.index);
+    if (checked != null && this._onHandleCheck) this._onHandleCheck(checked);
     if (tapPoint && this._onTap) this._onTap(tapPoint);
   }
 
@@ -1620,9 +1636,26 @@ export class QuadEditor {
         if (next == null) return; // past the last / first handle: let focus leave the canvas
         e.preventDefault();
         this._focusVisible = true;
+        // Only a selection, never a check (onHandleCheck): a keyboard customer Tabs through all four
+        // handles just to reach the buttons after the photo, and a corner passed on the way has not been
+        // looked at. Counted as checked, an untouched detection would be measured as hand-placed.
         this._setActive(next, true);
         this._keepHandleVisible(next);
         this._requestDraw();
+        return;
+      }
+      case 'Enter':
+      case ' ': {
+        // The keyboard's way of pressing the selected handle and letting go: the customer looked at it
+        // and says it is right where it is (onHandleCheck). With nothing selected there is nothing to
+        // confirm, and the key is left alone (on a photo with no corners yet the screen reads it as a tap).
+        if (!points || this._active == null) return;
+        e.preventDefault();
+        this._focusVisible = true;
+        this._keepHandleVisible(this._active);
+        this._requestDraw();
+        // A key held down repeats: one check per press, as for a pointer.
+        if (!e.repeat && this._onHandleCheck) this._onHandleCheck(this._active);
         return;
       }
       case 'ArrowLeft':
@@ -1633,6 +1666,7 @@ export class QuadEditor {
         e.preventDefault();
         this._focusVisible = true;
         if (this._active == null) {
+          // A selection the editor made for the key, like the one keyboard focus makes: not a check.
           this._setActive(0, true);
           this._keepHandleVisible(0);
           this._requestDraw();

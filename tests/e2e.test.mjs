@@ -13,7 +13,7 @@
 // The no-paper estimate (the "no-paper photo estimate" group below):
 //   capture screen  setPhoto, method 'estimate', findDoor(photo, { prior: priorFromGuide(...) })
 //                   (the welcome demo: the bundled photo's lens from js/demo.js demoPhotoFocal35mm,
-//                   useDemoPhoto, then findDoor(photo))
+//                   hideDemoSheet, useDemoPhoto, then findDoor(photo))
 //   door screen     js/screens/door.js mounted on that state, "Find my door size" pressed untouched:
 //                   startingQuad -> doorCornersPlaced -> estimateFromCorners({ ...photoFocal(photo),
 //                   sizes: standardSizesFrom(config), cornerSigmaPx }) -> applyMeasurementRules(candidates[0])
@@ -48,7 +48,7 @@ import { detectDoor } from '../js/door-detect.js';
 import { findDoor, isConfident, startingQuad } from '../js/door-find.js';
 import { estimateFromCorners, photoFocal, planeToImageFor, standardSizesFrom } from '../js/estimate.js';
 import { guideRect, priorFromGuide } from '../js/camera.js';
-import { demoPhotoFocal35mm, demoPhotoUrl, useDemoPhoto } from '../js/demo.js';
+import { demoPhotoFocal35mm, demoPhotoUrl, hideDemoSheet, useDemoPhoto } from '../js/demo.js';
 import { createInitialState } from '../js/app.js';
 import { PREVIEW_MARGIN_MM, canPreview } from '../js/screens/result-preview.js';
 import { estimateBannerKey, estimateChoices, measuredPayload } from '../js/screens/result-standard.js';
@@ -809,9 +809,10 @@ async function runEstimate(photo, config = baseConfig) {
   const state = createInitialState(config);
   let prior = null;
   if (photo.isDemo) {
-    // js/screens/welcome.js startDemo -> js/demo.js loadDemo (which adds the bundled photo's known lens)
-    // -> useDemoPhoto, then findDoor(photo).
+    // js/screens/welcome.js startDemo -> js/demo.js loadDemo (which adds the bundled photo's known lens
+    // and, for the no-paper demo, paints the taped sheet out) -> useDemoPhoto, then findDoor(photo).
     if (photo.focal35mm == null) photo.focal35mm = demoPhotoFocal35mm(demoPhotoUrl(config));
+    hideDemoSheet(photo);
     useDemoPhoto(state, photo, 'estimate', config.measurement);
   } else {
     // js/screens/capture.js usePhoto: setPhoto, the way in, then the door with the guide as the prior

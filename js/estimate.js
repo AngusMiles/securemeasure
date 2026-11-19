@@ -90,17 +90,39 @@ export const ESTIMATE_THRESHOLDS = Object.freeze({
    * Where a picked file's camera may have been, mm above the sill, for a lens in lensRangeFile to count: a
    * phone held to photograph a door, from crouching to a tall adult's eye level. A lens that would put the
    * camera above or below this is not the lens the photo was taken with. This is what keeps the ordinary
-   * downward tilt from counting: aimed at the door's middle from 2.6 m at 1.4 m, the same photo on twice
-   * the focal would have been taken from 5 m with the camera about 2.5 m up.
+   * downward tilt from counting on the long side: aimed at the door's middle from 2.6 m at 1.4 m, the same
+   * photo on twice the focal would have been taken from 5 m with the camera about 2.5 m up. On the short side
+   * it cannot: a shorter focal reads the tilt as a phone held nearer and lower, which still fits (see
+   * fileSideOnDeg).
    */
   fileCameraHeightMm: Object.freeze([400, 1800]),
   /**
-   * A lens in lensRangeFile that turns the view at least this far sideways (door normal against the optical
-   * axis, left-right, deg) also takes away a sure answer when the best size stops being a sure match (p <
-   * confidentP) there, not only when the size changes. Turned sideways, nothing in the photo limits where
-   * the camera stood, as the camera's height does for the downward tilt (see estimateFromCorners).
+   * How far a lens in lensRangeFile must turn the view sideways (door normal against the optical axis,
+   * left-right, deg) to count at all, while the assumed focal itself puts the camera at a
+   * fileCameraHeightMm height, unless it is the ultra-wide lens (fileUltraWideMax). Square on, a lens moves
+   * the ratio only through the downward tilt, which a shorter focal reads as a phone held nearer and lower
+   * and a longer one as a phone held further back and higher. The assumed focal explains that photo as
+   * well, so the tilt alone does not take the sure answer away for a focal between the ultra-wide and the
+   * main lens (no phone lens is there: only a cropped ultra-wide photo gets there) or longer than the
+   * assumed one (a crop, or the 2x lens, used from further back where the tilt is shallower). Where the
+   * assumed focal does not fit (an ultra-wide photo read as 1x can put the camera 1.9 m up), the photo was
+   * not taken with it, and every lens that fits counts. A lens turned this far also takes away a sure
+   * answer when the best size stops being a sure match (p < confidentP) there, not only when the size
+   * changes: turned sideways, nothing in the photo limits where the camera stood, as the camera's height
+   * does for the downward tilt (see estimateFromCorners).
    */
   fileSideOnDeg: 10,
+  /**
+   * A focal in lensRangeFile at most this fraction of the assumed one is the phone's ultra-wide lens (13-16
+   * mm against the 26 mm prior, 0.5-0.62), which a picked photo is often taken with, so it counts whenever
+   * it puts the camera at a fileCameraHeightMm height, square on or not. Square on, the photo cannot tell it
+   * from the main lens: on the 0.5x lens an 820 x 2100 door from 1.2 m with the camera 1.25 m up reads as a
+   * sure 770 x 2040 (p 0.95) with the 26 mm prior, which puts the camera 1.7 m up, where a phone is held
+   * too. Likewise an 870 x 2040 door from 2.2 m on the 1x lens, camera 1.5 m up, is what a 0.5x photo of a
+   * 920 x 2100 door from 1.1 m, camera 1.2 m up, looks like. Either way the lens decides the size, so the
+   * answer is not sure.
+   */
+  fileUltraWideMax: 0.65,
   /** 'non_standard': the best catalogue size is more than this many sigmas away in ln(aspect). */
   nonStandardZ: 3,
   /** 'door_near_edge': a corner closer to the image border than this fraction of the image size. */
@@ -607,35 +629,51 @@ function sideTiltDeg(rect) {
  * never decides.
  *
  * `file` is for a picked file's wider range (ESTIMATE_THRESHOLDS.lensRangeFile), where a focal only counts
- * when it puts the camera `heightMm` above the sill (with the size found there), and where it also decides
- * when `best`, a sure match at K.f (p >= minP), is no longer one at a focal that sees the door at least
- * `sideOnDeg` from the side. `longerOnly`: only focal lengths above K.f (a crop of a photo whose EXIF names
- * the lens).
+ * when it puts the camera `heightMm` above the sill (with the size found there) and, while K.f does too (with
+ * `best`), is the ultra-wide lens (at most `ultraWideMax` K.f) or sees the door at least `sideOnDeg` from
+ * the side; and where it also decides when `best`, a sure match at K.f (p >= minP), is no longer one at a
+ * focal that sees the door at least `sideOnDeg` from the side. `longerOnly`: only focal lengths above K.f (a
+ * crop of a photo whose EXIF names the lens).
  *
  * @param {Point[]} quad   [TL, TR, BR, BL]
  * @param {Intrinsics} K   with the assumed focal
- * @param {number} aspectHW  the ratio at K.f
+ * @param {{ aspectHW: number, t: number[], r2: number[] }} atK  the rectification at K.f (rectifyRectangle)
  * @param {StandardSize[]} sizes
  * @param {number} sigmaLnAspect  the estimate's sigma, kept for every focal tried
  * @param {Candidate} best  the best size at K.f
  * @param {number} range   > 1
- * @param {{ longerOnly: boolean, heightMm: readonly number[], sideOnDeg: number, minP: number } | null} [file]
+ * @param {{ longerOnly: boolean, heightMm: readonly number[], sideOnDeg: number, ultraWideMax: number,
+ *           minP: number } | null} [file]
  * @returns {{ decides: boolean, shiftLn: number }}
  */
-function lensEffect(quad, K, aspectHW, sizes, sigmaLnAspect, best, range, file = null) {
+function lensEffect(quad, K, atK, sizes, sigmaLnAspect, best, range, file = null) {
   const sure = file !== null && best.p >= file.minP;
+  // Square on, a lens only moves the ratio through the downward tilt, and a shorter focal reads that tilt as
+  // a phone held nearer and lower, which the height check lets through. Where the assumed focal already puts
+  // the camera where a phone is held, it explains the photo as well as a focal between the ultra-wide and the
+  // main lens (where no phone lens is) or a longer one (a crop, or the 2x lens from further back), so those
+  // then count only seen from the side (ESTIMATE_THRESHOLDS.fileSideOnDeg). The ultra-wide lens always
+  // counts (fileUltraWideMax): a 0.5x photo is as ordinary as a 1x one, and square on the photo cannot tell
+  // them apart (an 820 x 2100 door on the 0.5x lens from 1.2 m, camera 1.25 m up, reads as a sure 770 x 2040
+  // with the 26 mm prior, which puts the camera 1.7 m up, where a phone is held too). Where the assumed
+  // focal does not fit (the same door from 1.6 m, camera 1.3 m up, read with the prior puts the camera 1.9 m
+  // up), the photo was not taken with it, and every focal that fits counts.
+  const heightAtKMm = file ? cameraHeightAboveSill(atK) * best.heightMm : NaN;
+  const assumedFits = file !== null && heightAtKMm >= file.heightMm[0] && heightAtKMm <= file.heightMm[1];
   let decides = false;
   let shiftLn = 0;
   for (let i = file && file.longerOnly ? 1 : -LENS_STEPS; i <= LENS_STEPS; i++) {
     if (i === 0) continue;
-    const rect = rectifyRectangle(quad, { ...K, f: K.f * range ** (i / LENS_STEPS) });
+    const factor = range ** (i / LENS_STEPS);
+    const rect = rectifyRectangle(quad, { ...K, f: K.f * factor });
     const top = classifyStandard({ aspectHW: rect.aspectHW, sigmaLnAspect, sizes })[0];
     if (!top) return { decides: true, shiftLn: Infinity };
     if (file) {
       const heightMm = cameraHeightAboveSill(rect) * top.heightMm;
       if (!(heightMm >= file.heightMm[0] && heightMm <= file.heightMm[1])) continue;
+      if (assumedFits && factor > file.ultraWideMax && sideTiltDeg(rect) < file.sideOnDeg) continue;
     }
-    shiftLn = Math.max(shiftLn, Math.abs(Math.log(rect.aspectHW / aspectHW)));
+    shiftLn = Math.max(shiftLn, Math.abs(Math.log(rect.aspectHW / atK.aspectHW)));
     if (top.widthMm !== best.widthMm || top.heightMm !== best.heightMm) decides = true;
     else if (sure && top.p < file.minP && sideTiltDeg(rect) >= file.sideOnDeg) decides = true;
   }
@@ -679,7 +717,12 @@ function lensEffect(quad, K, aspectHW, sizes, sigmaLnAspect, best, range, file =
  *     A picked file is asked about more lenses (half to twice), but only those that put the camera where a
  *     customer holds a phone: the phone tilted down at the door's middle, as nearly every photo is, moves
  *     the ratio a little with the lens too, and on twice the focal the same photo would have been taken
- *     from a camera 2.5 m up. So the ordinary downward tilt alone never makes a square-on picked photo unsure.
+ *     from a camera 2.5 m up. On a shorter focal it would have been taken from nearer and lower, which also
+ *     fits, so while the assumed focal puts the camera where a phone is held too, a focal no phone lens has
+ *     counts only seen from the side (ESTIMATE_THRESHOLDS.fileSideOnDeg). The ultra-wide lens always counts
+ *     (fileUltraWideMax): square on, a 0.5x photo from nearer and lower looks just like a 1x one, and where
+ *     the two lenses pick different sizes the photo cannot say which is right, so a picked photo without
+ *     EXIF is then unsure.
  *
  * @param {object} input
  * @param {Point[]} input.corners      the opening's four corners, image px (canvas convention), any order
@@ -760,23 +803,29 @@ function estimate(input) {
   if (focalSource !== 'exif') {
     // The 1x main lens's own spread, for every source: the live camera's lens is within the prior's own
     // sigma, which p already allows for, so there only the size must stay the same.
-    const near = lensEffect(quad, K, rect.aspectHW, sizes, sigmaLnAspect, best, T.lensRangePrior);
+    const near = lensEffect(quad, K, rect, sizes, sigmaLnAspect, best, T.lensRangePrior);
     // A picked file's lens and crop may be far out, past anything sigma allows, so it is also asked about
     // the lenses and crops it may have been taken with, but only those that put the camera at a height a
     // customer holds a phone at. Aimed at the door's middle from 1.3-1.5 m, as nearly every photo is, the
     // phone is tilted down 5-12 deg, and a longer focal reads that as a steeper tilt, which moves the ratio
     // up: an 870 x 2040 door from 2.6 m becomes 870 x 2100 on twice the focal, the same photo taken from 5 m
-    // with the camera 2.5 m up. Seen from the side nothing limits where the camera stood, so there the size
-    // must also stay a sure match: far outside two close sizes the nearer one looks sure. 720 x 2040 and
-    // 820 x 2340 are 0.7 % apart; a 720 x 2040 door 20 deg off on the 2x lens reads as 820 x 2340 at p 0.83
-    // with the prior, and at its real focal neither is sure (p 0.52). With a corner a few px out, 820 x 2340
-    // can stay the nearer all the way to the real focal. EXIF names the lens ('exif_file': a 2x photo reads
-    // 52 mm), so there only a crop is unknown, and a crop only lengthens the focal.
+    // with the camera 2.5 m up. A shorter focal reads it as a shallower tilt from nearer and lower, which
+    // still fits (870 x 2040 from 2.2 m at 1.5 m reads 920 x 2100 on half the focal, with the camera 1.2 m
+    // up), so while the assumed focal fits too, a focal counts only seen from the side (fileSideOnDeg), or
+    // when it is the ultra-wide lens (fileUltraWideMax), a lens the photo may well have been taken with: those
+    // corners are also a 0.5x photo of a 920 x 2100 door from 1.1 m with the camera 1.2 m up. Seen
+    // from the side nothing limits where the camera stood, so there the size must also stay a sure match:
+    // far outside two close sizes the nearer one looks sure. 720 x 2040 and 820 x 2340 are 0.7 % apart; a
+    // 720 x 2040 door 20 deg off on the 2x lens reads as 820 x 2340 at p 0.83 with the prior, and at its
+    // real focal neither is sure (p 0.52). With a corner a few px out, 820 x 2340 can stay the nearer all
+    // the way to the real focal. EXIF names the lens ('exif_file': a 2x photo reads 52 mm), so there only a
+    // crop is unknown, and a crop only lengthens the focal.
     const far = file
-      ? lensEffect(quad, K, rect.aspectHW, sizes, sigmaLnAspect, best, T.lensRangeFile, {
+      ? lensEffect(quad, K, rect, sizes, sigmaLnAspect, best, T.lensRangeFile, {
           longerOnly: focalSource === 'exif_file',
           heightMm: T.fileCameraHeightMm,
           sideOnDeg: T.fileSideOnDeg,
+          ultraWideMax: T.fileUltraWideMax,
           minP: T.confidentP,
         })
       : { decides: false, shiftLn: 0 };

@@ -67,11 +67,28 @@ export const LEAD_MAIL_STRINGS = Object.freeze({
   // The no-paper estimate run on the bundled demo photo: the demo flag matters more than the method.
   'lead.mail.measuredDemoEstimate':
     "Measured: estimated from the built-in demo photo, not the customer's own door, matched to the nearest standard size",
+  // In place of the two above when the customer picked a size other than the app's most likely one:
+  // the size sent is then the customer's choice, not the app's match, and the next line names the match.
+  'lead.mail.measuredEstimateChosen':
+    'Measured: estimated from one photo, a standard size the customer chose — needs a check measure',
+  'lead.mail.measuredDemoEstimateChosen':
+    "Measured: estimated from the built-in demo photo, not the customer's own door, a standard size the customer chose",
+  'lead.mail.estimateOverride': "The customer chose this over the app's most likely size, {size}",
+  'lead.mail.estimateOverrideUnadjusted':
+    "The customer chose this over the app's most likely size, before your fitting allowance: {size}",
+  // In place of the two above when the app was not sure of its most likely size either: the result
+  // screen asked the customer to pick, so their pick is an answer to the app, not an overruling of it.
+  'lead.mail.estimateAnswered': 'The app asked the customer to pick, and they chose this over its most likely size, {size}',
+  'lead.mail.estimateAnsweredUnadjusted':
+    'The app asked the customer to pick, and they chose this over its most likely size, before your fitting allowance: {size}',
   'lead.mail.measuredAr': "Measured: with the phone's AR camera — needs a check measure",
   'lead.mail.alternatives': 'Other standard sizes it could be: {sizes}',
   // When the door size has the company's adjustments in it, the matched catalogue size is named and
   // the second line replaces the one above, so catalogue sizes are not read as quoted sizes.
   'lead.mail.standardSize': 'Matched standard size, before your fitting allowance: {size}',
+  // In place of the one above when the customer picked a size other than the app's most likely one,
+  // which the app did not match (the "Measured:" line says the customer chose it).
+  'lead.mail.chosenStandardSize': 'Standard size the customer chose, before your fitting allowance: {size}',
   'lead.mail.alternativesUnadjusted': 'Other standard sizes it could be, before your fitting allowance: {sizes}',
   // What the result screen warned the customer about (it showed them a banner for each).
   'lead.mail.estimateNonStandard': 'The app flagged: the door may not be a standard size, so this size could be some way out',
@@ -239,9 +256,12 @@ function cleanCodes(codes) {
  *
  * - 'photo' (paper): the fit quality, its issue codes and the two sigmas, as before.
  * - 'estimate': `standardSize`, the standard size accepted, as listed in the catalogue (before the
- *   company's rules); `alternatives`, the other standard sizes the photo could also be; `aspectHW`,
- *   the height-to-width ratio read from the photo; and what the customer was warned about:
- *   `nonStandard`, `confident` and the `issues` codes. No quality or sigmas: the estimate has no
+ *   company's rules); `alternatives`, the other standard sizes the photo could also be; `appBest`,
+ *   the app's most likely size, only when the customer accepted another one; `aspectHW`, the
+ *   height-to-width ratio read from the photo; and what the customer was warned about:
+ *   `nonStandard`, `confident` (about the size accepted), `appConfident` (about the app's own most
+ *   likely size, so it says whether the result screen warned the customer even when they accepted
+ *   another size) and the `issues` codes. No quality or sigmas: the estimate has no
  *   millimetre scale of its own, and the company must not be told a "plus or minus" nobody measured.
  * - 'ar': `measured`, the AR reading of the opening before the company's rules; `warnings`, the AR
  *   self-check codes; and `standardOffered`, whether a standard size was close enough to offer.
@@ -280,9 +300,12 @@ function cleanMeasurement(measurement) {
     // Always present (possibly empty) for an estimate, so a CRM can map the field once.
     const given = Array.isArray(measurement?.alternatives) ? measurement.alternatives : [];
     out.alternatives = given.map(cleanSize).filter(Boolean).slice(0, MAX_ALTERNATIVES);
+    // Only when it is not the size accepted: its presence is what says the customer overrode the app.
+    const appBest = cleanSize(measurement?.appBest);
+    if (appBest && !(standardSize && sameWholeMm(appBest, standardSize))) out.appBest = appBest;
     const aspect = finiteOrNull(measurement?.aspectHW);
     if (aspect !== null && aspect > 0) out.aspectHW = Math.round(aspect * 10000) / 10000;
-    for (const key of ['nonStandard', 'confident']) {
+    for (const key of ['nonStandard', 'confident', 'appConfident']) {
       if (typeof measurement?.[key] === 'boolean') out[key] = measurement[key];
     }
     if (Array.isArray(measurement?.issues)) out.issues = cleanCodes(measurement.issues);
@@ -404,8 +427,10 @@ export function validateCustomer(config, customer) {
  * @param {object} input.measurement the size and how it was got:
  *   `{ widthMm, heightMm, source, standard? }` plus, by source, 'photo' (paper):
  *   `quality?` (a level string or the whole { level, issues } object), `sigmaWidthMm?`, `sigmaHeightMm?`;
- *   'estimate': `standardSize?: { widthMm, heightMm }`, `alternatives?: { widthMm, heightMm }[]`, `aspectHW?`,
- *   `nonStandard?: boolean`, `confident?: boolean`, `issues?: string[]`; 'ar': `measured?: { widthMm, heightMm }`,
+ *   'estimate': `standardSize?: { widthMm, heightMm }`, `alternatives?: { widthMm, heightMm }[]`,
+ *   `appBest?: { widthMm, heightMm }` (the app's most likely size, when the customer chose another), `aspectHW?`,
+ *   `nonStandard?: boolean`, `confident?: boolean` (about the size sent), `appConfident?: boolean` (about
+ *   the app's most likely size), `issues?: string[]`; 'ar': `measured?: { widthMm, heightMm }`,
  *   `warnings?: string[]`, `standardOffered?: boolean`; 'manual': nothing more. An unknown source is recorded as 'photo'.
  * @param {object | null} [input.quote] a calculateQuote result
  * @param {Record<string, string | boolean>} [input.selections] chosen options keyed by option id
@@ -554,7 +579,11 @@ function measuredLine(config, payload) {
   // Neither of these has a "plus or minus" the customer was shown, so none is given to the company:
   // the wording itself says the size is an estimate that a check measure confirms.
   if (source === 'estimate') {
-    return mailText(config, payload?.demo === true ? 'lead.mail.measuredDemoEstimate' : 'lead.mail.measuredEstimate');
+    // A size the customer picked over the app's most likely one was not "matched" by the app.
+    const chosen = cleanSize(measurement.appBest) !== null;
+    const demo = payload?.demo === true;
+    if (chosen) return mailText(config, demo ? 'lead.mail.measuredDemoEstimateChosen' : 'lead.mail.measuredEstimateChosen');
+    return mailText(config, demo ? 'lead.mail.measuredDemoEstimate' : 'lead.mail.measuredEstimate');
   }
   if (source === 'ar') return mailText(config, 'lead.mail.measuredAr');
   let text = mailText(config, payload?.demo === true ? 'lead.mail.measuredDemo' : 'lead.mail.measuredPhoto');
@@ -598,8 +627,9 @@ function sameWholeMm(a, b) {
 
 /**
  * The lines under "Measured:" that only an estimate or an AR reading has. For an estimate: the
- * other standard sizes it could be, so whoever books the check measure knows what to expect, and
- * anything the customer was warned about. For AR: the reading itself, whether a standard size was
+ * app's most likely size when the customer chose another (and whether the app had asked them to
+ * pick, being unsure of it), the other standard sizes it could be, so whoever books the check
+ * measure knows what to expect, and anything the customer was warned about. For AR: the reading itself, whether a standard size was
  * chosen, turned down or never on offer, and any self-check it failed, so a priced standard size
  * can be told from what was measured.
  */
@@ -607,20 +637,44 @@ function sourceDetailLines(config, measurement) {
   const lines = [];
   if (measurement?.source === 'estimate') {
     // The door size has the company's adjustments in it; the standard sizes are as its catalogue lists
-    // them. When the two differ, the matched catalogue size is named and the list says which it is.
+    // them. When the two differ, the catalogue size sent is named and the list says which it is.
     const matched = sizeText(config, measurement.standardSize, 'lead.mail.sizeShort');
     const adjusted =
       matched !== '' && sizeText(config, measurement) !== '' && !sameWholeMm(measurement.standardSize, measurement);
-    if (adjusted) lines.push(mailText(config, 'lead.mail.standardSize', { size: matched }));
+    // The customer picked another size than the app put first (appBest names that one): the app did
+    // not match the size sent, so it is never called "matched", here or on the "Measured:" line.
+    const appBest = sizeText(config, measurement.appBest, 'lead.mail.sizeShort');
+    if (adjusted) {
+      const key = appBest !== '' ? 'lead.mail.chosenStandardSize' : 'lead.mail.standardSize';
+      lines.push(mailText(config, key, { size: matched }));
+    }
+    // Was the app unsure of its own most likely size, so the customer was shown a warning banner? Said
+    // by `appConfident`; a lead without it (built by older code) has only `confident`, which says so
+    // when the customer kept the app's size. Only when the caller said so: an estimate with no flags
+    // given is not reported as unsure.
+    const unsure = measurement.appConfident === false || (measurement.confident === false && appBest === '');
+    // Say which size the app put first, so the company does not quote believing the app matched the
+    // size it was sent; and whether the customer overruled a size the app was sure of, or answered the
+    // result screen asking them to pick because it was not.
+    if (appBest !== '') {
+      const keys = unsure
+        ? ['lead.mail.estimateAnsweredUnadjusted', 'lead.mail.estimateAnswered']
+        : ['lead.mail.estimateOverrideUnadjusted', 'lead.mail.estimateOverride'];
+      lines.push(mailText(config, adjusted ? keys[0] : keys[1], { size: appBest }));
+    }
+    // The line above has already named the app's most likely size, so it is not listed again here.
     const alternatives = Array.isArray(measurement.alternatives) ? measurement.alternatives : [];
-    const sizes = alternatives.map((size) => sizeText(config, size, 'lead.mail.sizeShort')).filter(Boolean);
+    const sizes = alternatives
+      .map((size) => sizeText(config, size, 'lead.mail.sizeShort'))
+      .filter((text) => text !== '' && text !== appBest);
     if (sizes.length > 0) {
       const key = adjusted ? 'lead.mail.alternativesUnadjusted' : 'lead.mail.alternatives';
       lines.push(mailText(config, key, { sizes: sizes.join(', ') }));
     }
-    // Only when the caller said so: an estimate with no flags given is not reported as unsure.
+    // The banner the customer saw: a door that may not be standard wins over plain uncertainty, as it
+    // does on the result screen (estimateBannerKey). Reported whichever size the customer then picked.
     if (measurement.nonStandard === true) lines.push(mailText(config, 'lead.mail.estimateNonStandard'));
-    else if (measurement.confident === false) lines.push(mailText(config, 'lead.mail.estimateUnsure'));
+    else if (unsure) lines.push(mailText(config, 'lead.mail.estimateUnsure'));
     const issues = (Array.isArray(measurement.issues) ? measurement.issues : []).map(oneLine).filter(Boolean);
     if (issues.length > 0) lines.push(mailText(config, 'lead.mail.estimateIssues', { issues: issues.join(', ') }));
   } else if (measurement?.source === 'ar') {

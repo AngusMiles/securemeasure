@@ -68,6 +68,22 @@ export const strings = {
     'Is your door a standard height, tall or extra tall? Pick the one that matches. We confirm the exact size with a check measure.',
   'result.estimate.unsureOne':
     "We can't match your door to a standard size with confidence from this photo. Check the corners, or retake the photo standing square to the door.",
+  // The same three for the bundled demo photo (welcome's "Try it with a demo photo"). Its visitor has never
+  // seen the demo door, so cannot say which height it is or which size looks like it; and the demo photo
+  // cannot be retaken (resultTools offers Measure my own door instead). Each says what is unsure, what a
+  // customer does about it with their own door, and that there is nothing to answer here.
+  'result.estimate.demo.unsureHeight':
+    "We can't be sure of the height from one photo. With a photo of your own door, you would pick the height that matches what you see. This is our demo door, so you don't need to pick. We confirm the exact size with a check measure.",
+  'result.estimate.demo.unsure':
+    "We can't be sure between these sizes from one photo. With a photo of your own door, you would pick the one that looks most like it. This is our demo door, so you don't need to pick. We confirm the exact size with a check measure.",
+  'result.estimate.demo.unsureOne':
+    "We can't match our demo door to a standard size with confidence from this photo. Tap Adjust corners to check them, or tap Measure my own door to try it with yours.",
+  // The demo photo's list of sizes, which sits right under those banners. They say there is nothing to
+  // pick, so it is not headed "Which is your door?": it shows what a customer's own photo would offer,
+  // and the visitor can still try picking one.
+  'result.estimate.demo.choices.title': 'Sizes our demo door could be',
+  'result.estimate.demo.choices.hint':
+    'These standard sizes fit our demo photo best. With a photo of your own door, you would pick the one that looks right; here you can try any of them.',
   'result.estimate.nonStandard':
     'Your door may not be a standard size, so this estimate could be some way out. We measure it exactly at the check measure, before anything is made.',
   'result.estimate.issues.title': 'How to get a better estimate',
@@ -579,16 +595,27 @@ export function heightQuestionKey(families) {
  * differ in height: that is a question the customer can answer by looking at the door, so it is asked
  * plainly (heightFamilies explains why this is the usual case).
  *
+ * The bundled demo photo (`isDemo`) gets the 'result.estimate.demo.' form of each unsure banner: its
+ * visitor has never seen the demo door, so a question about "your door" is one only we could answer. It
+ * is the usual demo outcome, not a rare one: corners left where detection put them are measured with
+ * detection's error, and on the demo photo that leaves 820 x 2040 short of the estimate's confidence. The
+ * demo copy still says the estimate is unsure, and what a customer would do about it with their own door.
+ * 'nonStandard' is left as it is: it is about the size the demo is priced at, not a question.
+ *
  * @param {object} measure  the estimate measure
  * @param {number} choiceCount  estimateChoices(measure).length
  * @param {Array<string | null>} [choiceFamilies]  the height family of each choice (choiceHeightFamilies)
+ * @param {{ isDemo?: boolean }} [options]  isDemo: the estimate came from the bundled demo photo
  * @returns {string | null} a string key
  */
-export function estimateBannerKey(measure, choiceCount, choiceFamilies = []) {
+export function estimateBannerKey(measure, choiceCount, choiceFamilies = [], { isDemo = false } = {}) {
   if (measure?.nonStandard === true) return 'result.estimate.nonStandard';
   if (measure?.confident === true) return null;
-  if (!(choiceCount > 1)) return 'result.estimate.unsureOne';
-  return heightQuestionKey(choiceFamilies) ?? 'result.estimate.unsure';
+  const demo = isDemo === true;
+  if (!(choiceCount > 1)) return demo ? 'result.estimate.demo.unsureOne' : 'result.estimate.unsureOne';
+  const question = heightQuestionKey(choiceFamilies);
+  if (demo) return question ? 'result.estimate.demo.unsureHeight' : 'result.estimate.demo.unsure';
+  return question ?? 'result.estimate.unsure';
 }
 
 /**
@@ -927,15 +954,22 @@ export function mountEstimate(root, ctx) {
   // sizes differ in height asks the customer which height their door is (heightFamilies explains why).
   // Neither when the sizes on offer all look the same height (choiceHeightFamilies).
   const choiceFamilies = choiceHeightFamilies(choices, heightFamilies(standardSizesFrom(config)));
+  const isDemo = isDemoPhoto(state.photo);
 
-  const bannerKey = estimateBannerKey(measure, choices.length, choiceFamilies);
+  // The demo photo's banner asks nothing about "your door" (estimateBannerKey), and nor does the list of
+  // sizes under it: that banner says there is nothing to pick, so a list headed "Which is your door?"
+  // would ask the very question it has just said needs no answer. Its sizes keep their height labels,
+  // which show what a customer's own photo would offer.
+  const bannerKey = estimateBannerKey(measure, choices.length, choiceFamilies, { isDemo });
   const banner = bannerKey ? addClass(ui.banner(t(bannerKey), { tone: 'warning' }), 'sm-result__banner') : null;
+  const choicesTitle = isDemo ? t('result.estimate.demo.choices.title') : t('result.estimate.choices.title');
+  const choicesHint = isDemo ? t('result.estimate.demo.choices.hint') : t('result.estimate.choices.hint');
 
   /* "Which is your door?": only worth asking when the photo fits more than one size */
   const picker =
     choices.length > 1
       ? ui.radioCards({
-          ariaLabel: t('result.estimate.choices.title'),
+          ariaLabel: choicesTitle,
           options: choices.map((choice, index) => ({
             value: choice.key,
             title: t('result.size', vars(choice)),
@@ -956,8 +990,8 @@ export function mountEstimate(root, ctx) {
     ? addClass(
         ui.card(
           null,
-          h('h2', { class: 'sm-result__section-title', text: t('result.estimate.choices.title') }),
-          h('p', { class: 'sm-result__section-hint sm-small sm-muted', text: t('result.estimate.choices.hint') }),
+          h('h2', { class: 'sm-result__section-title', text: choicesTitle }),
+          h('p', { class: 'sm-result__section-hint sm-small sm-muted', text: choicesHint }),
           picker.el,
         ),
         'sm-result__choices',
@@ -971,7 +1005,7 @@ export function mountEstimate(root, ctx) {
 
   const preview = createPreview(ui, { caption: t('result.estimate.preview.caption') });
 
-  const tools = createTools(ctx, resultTools('estimate', { isDemo: isDemoPhoto(state.photo), methods: config.measurement?.methods }));
+  const tools = createTools(ctx, resultTools('estimate', { isDemo, methods: config.measurement?.methods }));
   const paperLink = offersPaper(config)
     ? addClass(
         ui.button(t('result.estimate.paper'), { variant: 'ghost', size: 'sm', icon: 'paper', onClick: () => ctx.go('prepare') }),

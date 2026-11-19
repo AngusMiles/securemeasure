@@ -390,9 +390,13 @@ export function photoBacksSize(state) {
  *
  * - 'photo' (paper): the fit quality and the two sigmas.
  * - 'estimate': `standard: true`, `standardSize` (the standard size the customer is going ahead
- *   with) and `alternatives` (the other ones they were offered), both as listed in
+ *   with), `alternatives` (the other ones they were offered) and, only when the customer picked a
+ *   size other than the app's most likely one, `appBest` (that most likely size), all as listed in
  *   config.measurement.standardSizes; `aspectHW`; and what the result screen warned the customer
- *   about: `nonStandard`, `confident` and the `issues` codes.
+ *   about: `nonStandard`, `confident` (false too when `appBest` is set: the app was never sure of
+ *   the size the customer picked), `appConfident` (whether the app was sure of its own most likely
+ *   size, whichever size was picked: false means the result screen showed the customer a warning
+ *   banner, the unsure one unless the nonStandard one took its place) and the `issues` codes.
  * - 'ar': `standard` (whether the customer took the nearest standard size), `standardOffered`
  *   (whether one was close enough to offer them), `measured` (the AR reading of the opening, before
  *   the company's rules) and `warnings` (the AR self-check codes).
@@ -420,12 +424,24 @@ export function leadMeasurement(state, config) {
         measurement.standardSize = { widthMm: candidates[chosen].widthMm, heightMm: candidates[chosen].heightMm };
       }
       measurement.alternatives = offeredAlternatives(candidates, chosen);
+      // The customer picked a size under "Which is your door?" other than the one the app thought most
+      // likely: the company is told which size the app put first, so it does not read the chosen one
+      // as the app's own match.
+      const overridden = chosen > 0;
+      if (overridden) measurement.appBest = { widthMm: candidates[0].widthMm, heightMm: candidates[0].heightMm };
       measurement.aspectHW = measure.aspectHW;
       // The customer was shown a warning banner for these (estimateBannerKey: not confident, or not a
       // standard size at all), so the company hears it too: a priced standard size may really be a
       // door wider than any it sells. Read the way the banner reads them.
       measurement.nonStandard = measure.nonStandard === true;
-      measurement.confident = measure.confident === true;
+      // measure.confident is about the app's most likely size (candidates[0]) alone. The lead's
+      // `confident` is about the size it carries, so a size the customer picked over that one is never
+      // sent as confident (its chance is at most even, and the 0.8 bar is about the first size only).
+      measurement.confident = measure.confident === true && !overridden;
+      // The app's own confidence is sent as well, because `confident: false` alone cannot say why: with
+      // appBest set, it covers both a customer answering the unsure banner's "pick the one that matches"
+      // and one overruling a size the app was sure of (no banner). This one tells the two apart.
+      measurement.appConfident = measure.confident === true;
       const issues = Array.isArray(measure.issues) ? measure.issues : [];
       measurement.issues = issues.filter((code) => typeof code === 'string');
     }
@@ -508,7 +524,8 @@ function effectiveInstallation(config, chosen) {
  * The photo to send with the enquiry (buildLeadPayload's `photoDataUrl`), as a JPEG data URL, or
  * undefined when none may go: the company has not asked for photos, the photo is not the one the
  * size came from (photoBacksSize), or it is the bundled demo image behind a size that is not the
- * demo door's. Exported so the submit path's photo choice is tested, not only its parts.
+ * demo door's. Exported so it can be called on its own; tests/lead.test.mjs checks submit's use of it
+ * by mounting this screen and sending, since only that catches a submit that stops calling it.
  * The photo is a nice-to-have for the company: never let it block the enquiry.
  *
  * @param {object} config merged app config

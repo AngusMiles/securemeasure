@@ -14,9 +14,18 @@ import {
   resolveScreenId,
   SCREEN_ORDER,
 } from '../js/app.js';
-import { BUNDLED_DEMO_PHOTO, demoPhotoFocal35mm, demoPhotoUrl, loadDemo, selectDemoReference, useDemoPhoto } from '../js/demo.js';
+import {
+  BUNDLED_DEMO_PHOTO,
+  demoPhotoFocal35mm,
+  demoPhotoUrl,
+  hideDemoSheet,
+  loadDemo,
+  selectDemoReference,
+  useDemoPhoto,
+} from '../js/demo.js';
+import { isConfident } from '../js/door-find.js';
 import { estimateFromCorners, FULL_FRAME_DIAGONAL_MM, photoFocal, standardSizesFrom } from '../js/estimate.js';
-import { DEMO_SCENE } from '../tools/scene.mjs';
+import { DEMO_SCENE, decodePng, renderScene } from '../tools/scene.mjs';
 import { COMMON, buildStrings, createTranslator } from '../js/strings.js';
 import { deepMerge } from '../js/theme.js';
 import { noteArRefused, resetArSupport } from '../js/ar-support.js';
@@ -839,6 +848,109 @@ function fakeBrowser({ xr = null } = {}) {
   };
 }
 
+/** assets/demo-door.png as the browser would decode it (RGBA). */
+function bundledDemoPixels() {
+  return decodePng(readFileSync(new URL('../assets/demo-door.png', import.meta.url)));
+}
+
+let sheetFreeDemo = null;
+
+/**
+ * The bundled demo photo rendered again with no sheet on the door (tools/scene.mjs, DEMO_SCENE with
+ * sheet: null): pixel for pixel what assets/demo-door.png would be had nothing been taped up. Rendered
+ * once, on first use.
+ */
+function demoWithoutSheet() {
+  if (!sheetFreeDemo) sheetFreeDemo = renderScene({ ...DEMO_SCENE, sheet: null }).image;
+  return sheetFreeDemo;
+}
+
+/** The largest difference, in levels of any colour channel, between two images of the same size. */
+function maxPixelDifference(a, b) {
+  assert.equal(a.width, b.width);
+  assert.equal(a.height, b.height);
+  let worst = 0;
+  for (let i = 0; i < a.data.length; i += 4) {
+    for (let c = 0; c < 3; c += 1) worst = Math.max(worst, Math.abs(a.data[i + c] - b.data[i + c]));
+  }
+  return worst;
+}
+
+/**
+ * Just enough of the browser's image decoding and 2-D canvas for js/photo.js loadPhoto to load a photo
+ * by its address, with real pixels: `new Image()` decodes whichever of `photos` (address -> RGBA image)
+ * its src names, and a canvas keeps its pixels, so what the app paints onto a photo's canvas (what the
+ * door screen and the enquiry's photo draw from) can be read back. Works under fakeBrowser (it adds the
+ * canvas to the page's document) or on its own.
+ *
+ * @param {Record<string, {data: Uint8ClampedArray, width: number, height: number}>} photos
+ * @returns {{ canvases: object[], uninstall: () => void }}
+ */
+function installPhotoDecoding(photos) {
+  const savedImage = Object.getOwnPropertyDescriptor(globalThis, 'Image');
+  const savedDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const set = (name, value) => Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  const canvases = [];
+
+  class FakeImage {
+    set src(url) {
+      this.currentSrc = url;
+      setTimeout(() => {
+        const pixels = photos[url];
+        if (!pixels) return this.onerror && this.onerror(new Error(`no photo at ${url}`));
+        this.pixels = pixels;
+        this.naturalWidth = pixels.width;
+        this.naturalHeight = pixels.height;
+        return this.onload && this.onload();
+      }, 0);
+    }
+  }
+
+  function createCanvas() {
+    const canvas = { width: 0, height: 0, pixels: null };
+    const context = {
+      fillRect() {},
+      drawImage(source, x, y, width, height) {
+        // loadPhoto never crops, and at the shipped working size never scales the bundled photo either.
+        assert.deepEqual([x, y, width, height], [0, 0, source.naturalWidth, source.naturalHeight], 'drawn at its own size');
+        canvas.pixels = new Uint8ClampedArray(source.pixels.data);
+      },
+      getImageData: (x, y, width, height) => {
+        assert.deepEqual([x, y, width, height], [0, 0, canvas.width, canvas.height], 'the whole canvas');
+        return { data: new Uint8ClampedArray(canvas.pixels), width, height };
+      },
+      putImageData(image, dx, dy, x = 0, y = 0, width = image.width, height = image.height) {
+        for (let row = y; row < y + height; row += 1) {
+          const from = (row * image.width + x) * 4;
+          canvas.pixels.set(image.data.subarray(from, from + width * 4), ((row + dy) * canvas.width + x + dx) * 4);
+        }
+      },
+    };
+    canvas.getContext = () => context;
+    canvases.push(canvas);
+    return canvas;
+  }
+
+  set('Image', FakeImage);
+  const page = globalThis.document;
+  if (page) {
+    const createElement = page.createElement.bind(page);
+    page.createElement = (tag) => (tag === 'canvas' ? createCanvas() : createElement(tag));
+  } else {
+    set('document', { createElement: (tag) => (tag === 'canvas' ? createCanvas() : null) });
+  }
+  return {
+    canvases,
+    uninstall() {
+      if (page) delete page.createElement;
+      for (const [name, descriptor] of [['Image', savedImage], ['document', savedDocument]]) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete globalThis[name];
+      }
+    },
+  };
+}
+
 /** The kit button (js/ui.js button or fileButton) on `page` whose label reads `label`. */
 function buttonLabelled(page, label) {
   const found = page.doc.documentElement
@@ -1086,23 +1198,50 @@ describe('the router around a typed size (js/app.js in a fake browser)', () => {
 describe('the welcome screen for each mix of ways in (js/screens/welcome.js in a fake browser)', () => {
   const strings = buildStrings([welcome]);
 
-  /** Mount the welcome screen on a new page of `browser`, with `methods` and the rest as shipped. */
-  function mountWelcome(browser, methods, { allowManualOverride = true } = {}) {
+  /**
+   * Mount the welcome screen on a new page of `browser`, with `methods` and the rest as shipped.
+   * `state` holds what an earlier part of the session left in the shared state.
+   */
+  function mountWelcome(browser, methods, { allowManualOverride = true, state: earlier = {} } = {}) {
     // No tagline: the shipped one is the company's own words, and mentions a photo.
     const config = deepMerge(SHIPPED_CONFIG, { brand: { tagline: '' }, measurement: { methods, allowManualOverride } });
     const page = browser.newPage();
     const root = page.doc.createElement('section');
     page.doc.body.append(root);
     const went = [];
-    const state = createInitialState(config);
-    const ctx = { config, ui, state, t: createTranslator(config, strings), go: (id) => went.push(id), busy: (fn) => fn(), toast() {}, emit() {} };
+    const toasts = [];
+    const state = { ...createInitialState(config), ...earlier };
+    const ctx = {
+      config,
+      ui,
+      state,
+      t: createTranslator(config, strings),
+      go: (id) => went.push(id),
+      busy: (fn) => fn(),
+      toast: (message) => toasts.push(message),
+      emit() {},
+    };
     const cleanup = welcome.mount(root, ctx);
     const style = (button, pattern) => [...button.classList].find((name) => pattern.test(name)).slice('sm-btn--'.length);
     return {
       root,
       went,
+      toasts,
       state,
       cleanup,
+      /** Tap the button labelled `label`. */
+      press(label) {
+        const button = root.querySelectorAll('.sm-btn').find((candidate) => candidate.querySelector('.sm-btn__label').textContent === label);
+        assert.ok(button, `no "${label}" button on the welcome screen`);
+        button.click();
+      },
+      /** Mount the screen `module` next, on the same page and with the same state, as the router would. */
+      mountNext(module) {
+        const next = page.doc.createElement('section');
+        page.doc.body.append(next);
+        const cleanupNext = module.mount(next, { ...ctx, t: createTranslator(config, buildStrings([welcome, module])) });
+        return { root: next, doc: page.doc, cleanup: () => cleanupNext && cleanupNext() };
+      },
       buttons: () =>
         root
           .querySelectorAll('.sm-btn')
@@ -1127,6 +1266,143 @@ describe('the welcome screen for each mix of ways in (js/screens/welcome.js in a
         screen.root.querySelector('.sm-btn').click();
         assert.equal(screen.state.manualEntry, true);
         assert.deepEqual(screen.went, ['result']);
+        screen.cleanup();
+      } finally {
+        browser.uninstall();
+      }
+    }
+  });
+
+  /**
+   * What the no-paper demo leaves in the state once its result has been shown (js/screens/door.js
+   * measureEstimate): the bundled photo, the estimate from its door's corners, and the matched size.
+   */
+  function afterTheDemo() {
+    const truth = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+    const photo = fakePhoto({
+      width: truth.imageWidth,
+      height: truth.imageHeight,
+      isDemo: true,
+      capture: 'demo',
+      focal35mm: BUNDLED_DEMO_PHOTO.focal35mm,
+    });
+    const focal = photoFocal(photo);
+    const measure = estimateFromCorners({
+      corners: truth.doorPx,
+      imageWidth: photo.width,
+      imageHeight: photo.height,
+      focalPx: focal.focalPx,
+      focalSource: focal.source,
+      sizes: standardSizesFrom(SHIPPED_CONFIG),
+    });
+    const best = measure.candidates[0];
+    return {
+      method: 'estimate',
+      photo,
+      door: { points: truth.doorPx, detection: null },
+      measure,
+      size: { widthMm: best.widthMm, heightMm: best.heightMm, source: 'estimate', standard: true },
+    };
+  }
+
+  test('"I already know my door size" after the demo opens the size form, not the demo door\'s result', () => {
+    const resultStrings = buildStrings([result]);
+    const browser = fakeBrowser();
+    try {
+      // Welcome -> "Try it with a demo photo" -> "Find my door size" -> "Measure my own door" -> back here.
+      const screen = mountWelcome(browser, { ar: true, camera: true, paper: true }, { state: afterTheDemo() });
+      assert.equal(result.resultMode(screen.state), 'estimate', "the demo's result, as it was just shown");
+      screen.press(strings['welcome.manual']);
+      assert.deepEqual(screen.went, ['result']);
+      assert.equal(screen.state.manualEntry, true);
+      assert.equal(screen.state.measure, null, "the demo door's estimate is not the customer's");
+      assert.equal(screen.state.size, null, 'nothing of the demo door is left for "Get my price" to price');
+      assert.equal(result.resultMode(screen.state), 'manual');
+      screen.cleanup();
+
+      // The result screen the router mounts next is the empty size form, with nothing to price yet.
+      const next = screen.mountNext(result);
+      assert.ok(next.root.textContent.includes(resultStrings['result.manual.title']), 'the manual-entry screen');
+      const width = next.doc.getElementById('sm-result-manual-width');
+      assert.ok(width, 'the size form');
+      assert.notEqual(width.value, String(afterTheDemo().size.widthMm), "not filled in with the demo door's width");
+      const getPrice = next.root
+        .querySelectorAll('.sm-btn')
+        .find((button) => button.querySelector('.sm-btn__label').textContent === resultStrings['result.continue']);
+      assert.equal(getPrice.disabled, true, 'no size to price until one is typed in');
+      next.cleanup();
+    } finally {
+      browser.uninstall();
+    }
+  });
+
+  test('after the paper demo too, and a size already typed in over the demo is kept for the form', () => {
+    const cases = [
+      {
+        label: 'the paper demo',
+        state: {
+          method: 'paper',
+          photo: fakePhoto({ isDemo: true, capture: 'demo' }),
+          sheet: { points: QUAD, refined: true, detected: true },
+          measure: { widthMm: 812, heightMm: 2032, sigmaWidthMm: 4, sigmaHeightMm: 6, quality: { level: 'good' } },
+          size: { widthMm: 812, heightMm: 2032, source: 'photo' },
+        },
+        before: 'paper',
+        size: null,
+      },
+      {
+        label: 'a size typed in over the demo',
+        state: { ...afterTheDemo(), size: { widthMm: 900, heightMm: 2100, source: 'manual' } },
+        before: 'estimate',
+        size: { widthMm: 900, heightMm: 2100, source: 'manual' },
+      },
+    ];
+    for (const { label, state, before, size } of cases) {
+      const browser = fakeBrowser();
+      try {
+        const screen = mountWelcome(browser, { ar: true, camera: true, paper: true }, { state });
+        assert.equal(result.resultMode(screen.state), before, label);
+        screen.press(strings['welcome.manual']);
+        assert.equal(screen.state.measure, null, label);
+        assert.deepEqual(screen.state.size, size, label);
+        assert.equal(result.resultMode(screen.state), 'manual', label);
+        screen.cleanup();
+      } finally {
+        browser.uninstall();
+      }
+    }
+  });
+
+  test('"I already know my door size" leaves the customer\'s own measurement alone', () => {
+    const cases = [
+      {
+        label: 'an estimate from their own photo',
+        state: { ...afterTheDemo(), photo: fakePhoto({ isDemo: false, capture: 'live' }) },
+        mode: 'estimate',
+      },
+      {
+        // AR measures the door in front of the phone, whatever photo an earlier try left loaded.
+        label: 'an AR reading with the demo photo still loaded',
+        state: {
+          method: 'ar',
+          photo: fakePhoto({ isDemo: true, capture: 'demo' }),
+          measure: { method: 'ar', ok: true, widthMm: 823, heightMm: 2046 },
+          size: { widthMm: 826, heightMm: 2040, source: 'ar', standard: true },
+        },
+        mode: 'ar',
+      },
+    ];
+    for (const { label, state, mode } of cases) {
+      const browser = fakeBrowser();
+      try {
+        const screen = mountWelcome(browser, { ar: true, camera: true, paper: true }, { state });
+        const { measure, size } = screen.state;
+        screen.press(strings['welcome.manual']);
+        assert.equal(screen.state.manualEntry, true, label);
+        assert.equal(screen.state.measure, measure, label);
+        assert.equal(screen.state.size, size, label);
+        // Shown with the typed-size form open (manualEntry), as it always has been.
+        assert.equal(result.resultMode(screen.state), mode, label);
         screen.cleanup();
       } finally {
         browser.uninstall();
@@ -1162,6 +1438,35 @@ describe('the welcome screen for each mix of ways in (js/screens/welcome.js in a
       ]);
       screen.root.querySelectorAll('.sm-btn')[1].click();
       assert.deepEqual(screen.went, ['ar']);
+      screen.cleanup();
+    } finally {
+      browser.uninstall();
+      resetArSupport();
+    }
+  });
+
+  test('the standard-size note promises the match for the camera way only, not for AR or the paper method', async () => {
+    // Android Chrome with ARCore and every way in on: AR goes on top, the camera under it and the exact
+    // paper method lower down, all under the one note. AR keeps its own reading (standard: false) and the
+    // paper method measures exactly, so a note that says every door is matched to a standard size is
+    // wrong for two of the three.
+    resetArSupport();
+    const browser = fakeBrowser({ xr: { isSessionSupported: async (mode) => mode === 'immersive-ar' } });
+    try {
+      const screen = mountWelcome(browser, { ar: true, camera: true, paper: true });
+      await browser.settle();
+      const buttons = screen.buttons();
+      assert.deepEqual(buttons.slice(0, 2), [`${strings['welcome.ar']} [primary lg]`, `${strings['welcome.camera']} [secondary md]`]);
+      assert.ok(buttons.includes(`${strings['welcome.paper']} [ghost sm]`), buttons.join(', '));
+
+      const note = screen.root.querySelector('.sm-welcome__note--standard');
+      assert.ok(note, 'the camera customer is still told up front what they get');
+      const sentences = note.textContent.split(/(?<=\.)\s+/);
+      const promises = sentences.filter((sentence) => /standard size/i.test(sentence));
+      assert.ok(promises.length > 0, note.textContent);
+      for (const sentence of promises) assert.match(sentence, /camera/i, `"${sentence}" is not true of AR or the paper method`);
+      // The check measure is what every way in gets, so that part stays for all of them.
+      assert.match(note.textContent, /check measure/i);
       screen.cleanup();
     } finally {
       browser.uninstall();
@@ -1216,10 +1521,107 @@ describe('the welcome screen for each mix of ways in (js/screens/welcome.js in a
       }
     }
   });
+
+  test('"Try it with a demo photo", under "no paper", shows the door with no sheet taped to it', async () => {
+    // The welcome screen promises "No tape measure, no paper", and its demo is the no-paper estimate. The
+    // bundled photo is the paper method's, with an A4 sheet on the door; shown as it is, on the door
+    // screen and flattened on the result screen, it tells a first-time visitor to tape paper up.
+    // startDemo -> loadDemo -> findDoor all run for real here (findDoor without a Worker, as in Node).
+    const browser = fakeBrowser();
+    let decoding = null;
+    try {
+      const screen = mountWelcome(browser, { ar: true, camera: true, paper: true });
+      decoding = installPhotoDecoding({ [BUNDLED_DEMO_PHOTO.path]: bundledDemoPixels() });
+      assert.ok(screen.text().includes(strings['welcome.subtitle']), 'the promise the demo sits under');
+      screen.press(strings['welcome.demo']);
+      for (const deadline = Date.now() + 60000; !screen.went.length && !screen.toasts.length && Date.now() < deadline; ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.deepEqual(screen.toasts, [], 'the demo loaded');
+      assert.deepEqual(screen.went, ['door']);
+      assert.equal(screen.state.method, 'estimate', 'the no-paper demo');
+
+      // Within a level or two of the very photo rendered with nothing on the door: the sheet and its
+      // shadow are gone, and nothing else in the photo moved.
+      const { photo } = screen.state;
+      const worst = maxPixelDifference(photo.image, demoWithoutSheet());
+      assert.ok(worst <= 2, `photo.image (the estimate, the result's preview): up to ${worst} levels off the door with no sheet`);
+      // The door screen and the enquiry's photo draw the canvas, which must match.
+      assert.equal(maxPixelDifference({ data: photo.canvas.pixels, width: photo.width, height: photo.height }, photo.image), 0, 'photo.canvas');
+
+      // The door is still found where it is, so the door screen starts from it as before.
+      const truth = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+      const { detection } = screen.state.door;
+      assert.ok(isConfident(detection), `findDoor is sure of the door (${detection && detection.reason})`);
+      const cornerError = Math.max(...detection.quad.map((p, i) => Math.hypot(p.x - truth.doorPx[i].x, p.y - truth.doorPx[i].y)));
+      assert.ok(cornerError < 8, `worst corner ${cornerError.toFixed(2)} px`);
+      screen.cleanup();
+    } finally {
+      if (decoding) decoding.uninstall();
+      browser.uninstall();
+    }
+  });
 });
 
 describe('demo photo (js/demo.js)', () => {
   const measurement = SHIPPED_CONFIG.measurement;
+
+  test('knows where the sheet is in the bundled demo photo', () => {
+    const truth = JSON.parse(readFileSync(new URL('../assets/demo-door.truth.json', import.meta.url), 'utf8'));
+    assert.deepEqual([BUNDLED_DEMO_PHOTO.width, BUNDLED_DEMO_PHOTO.height], [truth.imageWidth, truth.imageHeight]);
+    assert.deepEqual(BUNDLED_DEMO_PHOTO.sheetPx, truth.sheetPx);
+  });
+
+  test('the paper demo keeps the sheet it measures from, and a company\'s own demo photo is left as it is', async () => {
+    const pixels = bundledDemoPixels();
+    const decoding = installPhotoDecoding({ [BUNDLED_DEMO_PHOTO.path]: pixels, 'img/our-door.png': pixels });
+    try {
+      const cases = [
+        { method: 'paper', url: BUNDLED_DEMO_PHOTO.path },
+        // The app knows where the sheet is in its own photo only.
+        { method: 'estimate', url: 'img/our-door.png' },
+      ];
+      for (const { method, url } of cases) {
+        const label = `${method} demo from ${url}`;
+        const config = deepMerge(SHIPPED_CONFIG, { measurement: { demoPhotoUrl: url } });
+        const state = createInitialState(config);
+        const photo = await loadDemo({ config, state }, { method });
+        assert.equal(state.method, method, label);
+        assert.equal(maxPixelDifference(photo.image, pixels), 0, `${label}: not a pixel changed`);
+        assert.equal(maxPixelDifference({ data: photo.canvas.pixels, width: photo.width, height: photo.height }, pixels), 0, label);
+        assert.ok(maxPixelDifference(photo.image, demoWithoutSheet()) > 100, `${label}: the sheet is there`);
+      }
+    } finally {
+      decoding.uninstall();
+    }
+  });
+
+  test('a scaled-down working copy of the demo photo has its sheet painted out in the same place', () => {
+    // A company's lower measurement.maxWorkingSizePx scales the photo down (js/photo.js; never cropped).
+    const halve = ({ data, width, height }) => {
+      const out = { data: new Uint8ClampedArray((width / 2) * (height / 2) * 4), width: width / 2, height: height / 2 };
+      for (let y = 0; y < out.height; y += 1) {
+        for (let x = 0; x < out.width; x += 1) {
+          for (let c = 0; c < 4; c += 1) {
+            const at = (dx, dy) => data[((2 * y + dy) * width + 2 * x + dx) * 4 + c];
+            out.data[(y * out.width + x) * 4 + c] = Math.round((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4);
+          }
+        }
+      }
+      return out;
+    };
+    const image = halve(bundledDemoPixels());
+    const photo = { image, width: image.width, height: image.height, _luma: { data: 'made before' } };
+    assert.equal(hideDemoSheet(photo), true);
+    const worst = maxPixelDifference(photo.image, halve(demoWithoutSheet()));
+    assert.ok(worst <= 2, `up to ${worst} levels off the door with no sheet`);
+    assert.equal(photo._luma, null, 'no greyscale copy with the sheet still in it');
+
+    // Another shape is not the bundled photo, whatever its address said.
+    const square = { data: new Uint8ClampedArray(400 * 400 * 4).fill(200), width: 400, height: 400 };
+    assert.equal(hideDemoSheet({ image: square }), false);
+    assert.ok(square.data.every((value) => value === 200));
+  });
 
   test('reads the demo address from the config', () => {
     assert.equal(demoPhotoUrl(SHIPPED_CONFIG), 'assets/demo-door.png');
@@ -1325,7 +1727,7 @@ describe('shell copy', () => {
     assert.equal(welcome.strings['welcome.subtitle'], 'Point your phone at your door for an instant price. No tape measure, no paper.');
     assert.equal(
       welcome.strings['welcome.standardNote'],
-      'We match your door to the nearest standard size. We confirm the exact size with a check measure before your door is made.',
+      'Measure with your camera and we match your door to the nearest standard size. We confirm the exact size with a check measure before your door is made.',
     );
     assert.deepEqual(
       ['welcome.ar', 'welcome.camera', 'welcome.demo', 'welcome.paper', 'welcome.manual'].map((key) => welcome.strings[key]),

@@ -333,13 +333,21 @@ export function nextOutlineIndex(index, count) {
  *  - moved a corner (`moved`), or
  *  - picked an outline with "Not this? Show the next outline" (`chosen`): looking at a few and
  *    settling on one is a decision about where the door is;
+ *  - checked every corner of an outline detection drew (`checked`, with the handles still on it:
+ *    `outline` 0 or more): pressed each handle and let go of it where it was, or checked it there with
+ *    the keyboard (the editor's onHandleCheck). That is saying each corner is right, one by one; an
+ *    outline detection was unsure of but got right needs no corner moved, and without this the only way
+ *    on would be to nudge a correct corner off its spot. Not the stand-in rectangle (`outline` -1): it
+ *    is nobody's door, so checking its corners puts none of them on the opening;
  * or when the handles are still on the outline detection was confident of (`confident` and
- * `outline` 0). A detection it was not sure of is only a starting position.
- * @param {{ moved?: boolean, chosen?: boolean, confident?: boolean, outline?: number }} status
+ * `outline` 0). A detection it was not sure of is otherwise only a starting position.
+ * @param {{ moved?: boolean, chosen?: boolean, confident?: boolean, checked?: boolean, outline?: number }} status
+ *   `checked`: every one of the four handles is where the customer put or checked it (cornersByHand all true).
  * @returns {boolean}
  */
-export function doorCornersPlaced({ moved = false, chosen = false, confident = false, outline = -1 } = {}) {
-  return moved === true || chosen === true || (confident === true && outline === 0);
+export function doorCornersPlaced({ moved = false, chosen = false, confident = false, checked = false, outline = -1 } = {}) {
+  const onOutline = Number.isInteger(outline) && outline >= 0;
+  return moved === true || chosen === true || (confident === true && outline === 0) || (checked === true && onOutline);
 }
 
 /**
@@ -361,8 +369,10 @@ export function isSettledDetection(detection) {
 }
 
 /**
- * Which of the four door handles the customer put where they are themselves (dragged or nudged), by
- * handle index, read from what state.door.byHand holds: anything but four entries is none of them.
+ * Which of the four door handles the customer put where they are themselves (dragged or nudged), or
+ * checked there (pressed and let go of without moving it, or Enter / Space on it while it is selected:
+ * the editor's onHandleCheck), by handle index, read from what state.door.byHand holds: anything but four
+ * entries is none of them.
  * @param {unknown} saved
  * @returns {boolean[]} Four booleans (a fresh array).
  */
@@ -383,6 +393,28 @@ export function markCornersByHand(byHand, before, after) {
   const known = cornersByHand(byHand);
   if (!isQuad(before) || !isQuad(after)) return known;
   return known.map((mine, i) => mine || before[i].x !== after[i].x || before[i].y !== after[i].y);
+}
+
+/**
+ * cornersByHand for the same four corners put in another order: `ordered` holds the points of `handles`
+ * rearranged (the door screen passes orderDoorQuad(handles) from js/geometry.js, the [TL, TR, BR, BL]
+ * order measureDoor measures them in), and each is matched back to its handle by position. A corner that
+ * matches no handle, and anything but two quads, counts as not placed by hand: never surer than known.
+ * @param {unknown} byHand cornersByHand, by handle index.
+ * @param {unknown} handles The four handles, in handle order.
+ * @param {unknown} ordered The same four points in the new order.
+ * @returns {boolean[]} Four booleans, in `ordered`'s order (a fresh array).
+ */
+export function cornersByHandInOrder(byHand, handles, ordered) {
+  if (!isQuad(handles) || !isQuad(ordered)) return [false, false, false, false];
+  const mine = cornersByHand(byHand);
+  const matched = new Set();
+  return ordered.map((corner) => {
+    const i = handles.findIndex((p, j) => !matched.has(j) && p.x === corner.x && p.y === corner.y);
+    if (i < 0) return false;
+    matched.add(i);
+    return mine[i];
+  });
 }
 
 /**
@@ -792,6 +824,8 @@ export function holdToRepeat(button, action, options = {}) {
  * @property {{ points: Point[], color: string } | null} [editor.ghost]
  * @property {(points: Point[], meta: { final: boolean, index: number | null }) => void} [editor.onChange] Receives a detached copy of the points.
  * @property {(point: Point) => void} [editor.onTap] A tap on the photo away from the handles. While there is no quad, Enter or Space on the photo counts as a tap in the middle of the view, so the step can be done from a keyboard.
+ * @property {(index: number | null) => void} [editor.onActiveChange] The editor selected another handle (or none) because of the customer: a press on a handle (also the first finger of a pinch), Tab or an arrow key, or the photo getting keyboard focus. Never for setActive().
+ * @property {(index: number) => void} [editor.onHandleCheck] The customer looked at a handle and left it where it was (the editor's onHandleCheck): a press on it let go of without moving it, or Enter / Space on it while it is selected. Never for Tab, an arrow key selecting a handle, a pinch, the photo getting keyboard focus, or setActive().
  * @property {(editor: QuadEditor) => void} [onReady] Called once, right after the editor is created.
  */
 
@@ -1056,7 +1090,7 @@ export function createMarkScreen(root, ctx, opts) {
   // The editor only reports taps made with a pointer. So that marking the sheet
   // does not need one, Enter or Space on the photo stands in for a tap in the
   // middle of the view while there are no corners yet. Once there are, the
-  // editor's own keys (Tab, arrows) take over and this does nothing.
+  // editor's own keys (Tab, arrows, Enter / Space) take over and this does nothing.
   const onPhotoKey = (event) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
     // defaultPrevented: an editor that handles the key itself has already made the tap.
@@ -1110,9 +1144,13 @@ export function createMarkScreen(root, ctx, opts) {
         }
       },
       onTap: (point) => (config.onTap && point ? config.onTap({ x: point.x, y: point.y }) : undefined),
+      onHandleCheck: (index) => (config.onHandleCheck ? config.onHandleCheck(index) : undefined),
       // Not part of the editor contract: used when the editor offers it, and the
       // stage listeners above cover editors that do not.
-      onActiveChange: scheduleSync,
+      onActiveChange: (index) => {
+        scheduleSync();
+        if (config.onActiveChange) config.onActiveChange(Number.isInteger(index) ? index : null);
+      },
     });
     if (opts.onReady) opts.onReady(editor);
     syncWhenSettled();

@@ -9,7 +9,7 @@
  * camera nor the paper method on, typing in a size is the main way in, and the copy promises no photo.
  */
 import { arRefused, arSupported } from '../ar-support.js';
-import { demoPhotoUrl, loadDemo } from '../demo.js';
+import { demoPhotoUrl, dropDemoMeasure, loadDemo } from '../demo.js';
 import { findDoor } from '../door-find.js';
 import { measurementMethods } from '../theme.js';
 
@@ -34,8 +34,11 @@ export const strings = {
   'welcome.how.camera': 'Allow camera',
   'welcome.how.snap': 'Snap your door',
   'welcome.how.price': 'See your price',
+  // Only the camera way is matched to a standard size: AR keeps its own reading unless the customer
+  // picks the standard one, and the paper method measures exactly. So the match is promised for the
+  // camera alone, and the check measure, which every way in gets, for all of them.
   'welcome.standardNote':
-    'We match your door to the nearest standard size. We confirm the exact size with a check measure before your door is made.',
+    'Measure with your camera and we match your door to the nearest standard size. We confirm the exact size with a check measure before your door is made.',
   'welcome.privacy': 'Your photo stays on your phone unless you send us an enquiry.',
   'welcome.ar': 'Measure with AR',
   'welcome.camera': 'Measure with my camera',
@@ -229,9 +232,11 @@ export function mount(root, ctx) {
 
   // ---- The small print -----------------------------------------------------------------------
 
-  // A photo with no scale in it cannot give raw millimetres, and AR is an estimate too: say up front
-  // what the customer gets, so the result screen holds no surprise. A typed-in size is matched to
-  // nothing and there is no photo to keep private, so neither note belongs on the manual-entry copy.
+  // A photo with no scale in it cannot give raw millimetres: say up front what the camera customer
+  // gets, so the result screen holds no surprise. The note sits above every way in on offer (AR goes on
+  // top of it on some Android phones, the exact paper method under it), so its wording promises the
+  // standard size for the camera way only. A typed-in size is matched to nothing and there is no photo
+  // to keep private, so neither note belongs on the manual-entry copy.
   const standardNote =
     paperCopy || manualCopy
       ? null
@@ -267,6 +272,9 @@ export function mount(root, ctx) {
   }
 
   function startManual() {
+    // A size left over from the demo is the demo door's, and the result screen would show it ahead of
+    // the size form: a customer who has said they know their own size gets the form (dropDemoMeasure).
+    dropDemoMeasure(ctx.state);
     ctx.state.manualEntry = true;
     ctx.go('result');
   }

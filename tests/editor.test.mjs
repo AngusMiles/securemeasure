@@ -1032,6 +1032,7 @@ function setup(envOptions = {}, editorOptions = {}) {
   const changes = [];
   const taps = [];
   const actives = [];
+  const checks = [];
   const editor = new QuadEditor(env.container, {
     image: env.image,
     imageWidth: IMG_W,
@@ -1042,11 +1043,12 @@ function setup(envOptions = {}, editorOptions = {}) {
     onChange: (points, meta) => changes.push({ points, meta }),
     onTap: (point) => taps.push(point),
     onActiveChange: (index) => actives.push(index),
+    onHandleCheck: (index) => checks.push(index),
     ...editorOptions,
   });
   /** Screen position of handle i (`offset` is 0.5 for an editor built with pixelOrigin 'center'). */
   const handleAt = (i, offset = 0) => imageToScreen(shiftView(editor.getView(), offset), editor.getPoints()[i]);
-  return { env, editor, changes, taps, actives, handleAt };
+  return { env, editor, changes, taps, actives, checks, handleAt };
 }
 
 test('QuadEditor: builds an accessible canvas that fills the container', () => {
@@ -1900,6 +1902,116 @@ test('QuadEditor: keyboard focus selects the first handle; mouse focus does not'
     assert.equal(editor.getActive(), null);
     assert.deepEqual(actives, []);
     editor.destroy();
+  }
+});
+
+test('QuadEditor: onHandleCheck fires when the customer looks at a handle and leaves it where it was', () => {
+  // A press let go of inside the dead zone: on the release, not the press, and with no onChange.
+  {
+    const { env, editor, changes, checks, handleAt } = setup();
+    const s = handleAt(2);
+    env.down(1, s.x, s.y);
+    assert.deepEqual(checks, [], 'not on pointerdown');
+    env.move(1, s.x + 2, s.y + 1);
+    env.advance(80);
+    env.up(1, s.x + 2, s.y + 1);
+    assert.deepEqual(checks, [2]);
+    assert.equal(changes.length, 0, 'onChange is not told: final: true still means the handle moved');
+    assert.deepEqual(editor.getPoints(), QUAD());
+    editor.destroy();
+  }
+  // A tap that wobbled out of the dead zone but never moved the handle is a check too; a drag is not.
+  {
+    const { env, editor, changes, checks, handleAt } = setup();
+    const s = handleAt(1);
+    env.down(1, s.x, s.y);
+    env.advance(30);
+    env.move(1, s.x + 6, s.y);
+    env.advance(30);
+    env.up(1, s.x + 6, s.y);
+    assert.deepEqual(checks, [1], 'wobble');
+    assert.equal(changes.length, 0);
+
+    const t = handleAt(0);
+    env.down(1, t.x, t.y);
+    env.move(1, t.x + 6, t.y);
+    env.move(1, t.x + 40, t.y + 20);
+    env.advance(400);
+    env.up(1, t.x + 40, t.y + 20);
+    assert.equal(changes.at(-1).meta.final, true);
+    assert.deepEqual(checks, [1], 'a drag that moved the handle is not a check');
+    editor.destroy();
+  }
+  // Not for a cancelled press, nor for a pinch whose first finger landed on a handle.
+  {
+    const { env, editor, checks, handleAt } = setup();
+    const s = handleAt(3);
+    env.down(1, s.x, s.y);
+    env.cancel(1);
+    assert.deepEqual(checks, [], 'cancelled');
+
+    env.down(1, s.x, s.y);
+    env.advance(40);
+    env.down(2, s.x - 120, s.y - 180);
+    env.move(2, s.x - 160, s.y - 220);
+    env.up(1, s.x, s.y);
+    env.up(2, s.x - 160, s.y - 220);
+    assert.deepEqual(checks, [], 'pinch');
+    assert.equal(editor.getActive(), 3);
+    editor.destroy();
+  }
+  // Keyboard: Enter or Space on the active handle is the keyboard's press, so a check. Only selecting a handle
+  // is not: the handle selected as the canvas gets keyboard focus, the arrow that selects the first handle,
+  // Tab / Shift+Tab onto one (a keyboard customer Tabs through all four to reach the buttons after the
+  // photo), setActive(); nor a nudge, which reports through onChange.
+  {
+    const { env, editor, checks, changes } = setup({ focusVisible: true });
+    env.fire('focus');
+    assert.equal(editor.getActive(), 0);
+    assert.deepEqual(checks, [], 'keyboard focus');
+    // Tabbing past the photo: through handles 1, 2 and 3, then out.
+    for (const expected of [1, 2, 3]) {
+      env.key('Tab');
+      assert.equal(editor.getActive(), expected);
+    }
+    assert.equal(env.key('Tab').defaultPrevented, false, 'focus leaves after the last handle');
+    env.key('Tab', { shiftKey: true });
+    assert.deepEqual(checks, [], 'Tab and Shift+Tab only select');
+    editor.setActive(null);
+    editor.setActive(2);
+    assert.deepEqual(checks, [], 'setActive');
+    editor.setActive(null);
+    env.key('ArrowRight');
+    assert.equal(editor.getActive(), 0);
+    assert.deepEqual(checks, [], 'the arrow that selects the first handle');
+    env.key('ArrowRight');
+    assert.deepEqual(checks, [], 'a nudge reports through onChange');
+    assert.equal(changes.length, 1);
+
+    // Confirming the selected handle where it is.
+    const enter = env.key('Enter');
+    assert.equal(enter.defaultPrevented, true);
+    assert.deepEqual(checks, [0], 'Enter');
+    env.key('Tab');
+    const space = env.key(' ');
+    assert.equal(space.defaultPrevented, true, 'Space does not scroll the page');
+    assert.deepEqual(checks, [0, 1], 'Space');
+    env.key(' ', { repeat: true });
+    env.key('Enter', { repeat: true });
+    assert.deepEqual(checks, [0, 1], 'a held key is one press');
+    assert.equal(env.key('Enter', { ctrlKey: true }).defaultPrevented, false, 'modified keys belong to the browser');
+    assert.deepEqual(checks, [0, 1]);
+    assert.equal(changes.length, 1, 'a check moves nothing');
+
+    // Nothing selected: nothing to confirm, and the key is left alone.
+    editor.setActive(null);
+    assert.equal(env.key('Enter').defaultPrevented, false);
+    assert.equal(env.key(' ').defaultPrevented, false);
+    assert.deepEqual(checks, [0, 1]);
+    editor.destroy();
+    // After destroy, nothing is reported.
+    env.key('Enter');
+    assert.deepEqual(checks, [0, 1]);
   }
 });
 

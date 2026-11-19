@@ -16,14 +16,18 @@
  * (or a sensible fallback rectangle). The live-camera path runs findDoor()
  * before coming here; on the paper path, and whenever an earlier search ran out
  * of time, this screen runs it after the first paint, and moves the handles onto
- * what it found unless the customer has moved or selected one by then (and never
+ * what it found unless the customer has moved or picked one by then (and never
  * while a finger is on the photo). Detection is a starting position, never a
  * measurement: the customer always confirms the corners, "Not this? Show the next
  * outline" steps through the other outlines it considered, and corners left where
- * detection put them are measured with detection's error, not a hand's.
+ * detection put them are measured with detection's error, not a hand's (a corner the
+ * customer presses and lets go of where it is, or confirms with Enter or Space, is theirs). The paper
+ * measurement says which corners those were, so that when they are what makes the
+ * "plus or minus" wide the result screen asks for the corners to be checked rather
+ * than for a new photo (see measurePaper).
  */
 
-import { measureDoor } from '../geometry.js';
+import { measureDoor, orderDoorQuad } from '../geometry.js';
 import { applyMeasurementRules } from '../quote.js';
 import { getSheetMm } from '../photo.js';
 import { ESTIMATE_THRESHOLDS, estimateFromCorners, photoFocal, standardSizesFrom } from '../estimate.js';
@@ -32,6 +36,7 @@ import {
   canEnterDoor,
   copyQuad,
   cornersByHand,
+  cornersByHandInOrder,
   cornersInOutlineOrder,
   createMarkScreen,
   defaultDoorQuad,
@@ -93,7 +98,7 @@ export const strings = {
   'door.error.no_convergence':
     "We couldn't get a steady measurement. Check each handle sits right on a corner of the door opening, then try again.",
   'door.editor.aria':
-    'Your door photo. Drag the four corner handles onto the corners of the door opening.',
+    'Your door photo. Drag the four corner handles onto the corners of the door opening. With a keyboard, use Tab to go from corner to corner, Enter to confirm a corner where it is, and the arrow keys to move it.',
   'door.nudge.label': 'Fine-tune the selected corner',
   'door.nudge.up': 'Move the corner up',
   'door.nudge.down': 'Move the corner down',
@@ -135,6 +140,8 @@ const ERROR_TOAST_MS = 6000;
 const BACKGROUND_SEARCH_TIMEOUT_MS = 15000;
 // Stage events that end a press on the photo (see pressGate).
 const RELEASE_EVENTS = ['pointerup', 'pointercancel', 'lostpointercapture'];
+// The stage's listener for a key on the photo once the editor has had it: the bubbling phase.
+const KEY_END_OPTIONS = { passive: true };
 
 // Static illustration, styled by classes in mark.css so it follows the skin.
 // It carries no text: the wording lives in `strings`. Built from parts so the
@@ -280,7 +287,8 @@ export function mount(root, ctx) {
 
   // Corners kept from an earlier visit (moved, a chosen outline, or measured), or none.
   const saved = isQuad(state.door.points) ? copyQuad(state.door.points) : null;
-  // Which handles the customer put where they are themselves, by handle index. Kept with the corners
+  // Which handles the customer put where they are themselves (moved, or checked where they were: see
+  // onHandleCheck), by handle index. Kept with the corners
   // (state.door.byHand), so a detected outline measured untouched is still the detector's when the
   // customer comes back to adjust it: it is measured with detection's error, not a hand's (doorCornerSigmaPx).
   let byHand = cornersByHand(saved ? state.door.byHand : null);
@@ -291,8 +299,24 @@ export function mount(root, ctx) {
   // never moves the handles once the customer has moved one, nor replaces an earlier visit's. A tap, a
   // pan or a pinch that moved no handle does not count: the fallback rectangle is nobody's, and a detection
   // dropped for it could not be got back with a single outline (there is no "next outline" to show). A
-  // handle held under a finger, or a selected one, is not moved either (pressGate, showSearchResult).
+  // handle held under a finger, or one the customer picked, is not moved either (pressGate, `picked`).
   let handled = saved !== null;
+  // Whether the selected handle (editor.getActive()) is one the customer picked: let go of after a press
+  // on it that stayed one finger (a tap or a hold), selected with an arrow key, or checked where it is
+  // (onHandleCheck: a press let go of, Enter or Space), even one that was selected already. Not the handle
+  // the first finger of a pinch happened to land on (the editor selects it before the second finger
+  // shows it was a pinch, and keeps it selected after), nor the first handle the editor selects by itself
+  // when the photo gets keyboard focus, nor one Tab steps onto: a keyboard customer Tabs through all four
+  // handles just to reach the buttons after the photo, and the editor counts that as a selection only
+  // (never a check) for the same reason. Nobody chose those, so like the rest of the fallback rectangle
+  // they do not keep a late detection off the handles (showSearchResult).
+  let picked = false;
+  // A handle the press now on the photo selected: picked once the press ends, unless it became a pinch.
+  let pressPicked = false;
+  // A key that picks the handle it selects (an arrow key, never Tab: see `picked`) is being handled.
+  let keying = false;
+  // The photo while it has the focus, for photoHasKeyboardFocus; null when something else has it.
+  let focusedPhoto = null;
   // An outline picked with "Not this? Show the next outline", on this visit or an earlier one.
   let chosen = saved !== null && state.door.chosen === true;
   // Where the handles were last put down, starting with what the editor is given. A press on a
@@ -405,6 +429,8 @@ export function mount(root, ctx) {
       ghost: estimate ? null : { points: copyQuad(state.sheet.points), color: accent },
       onChange,
       onTap,
+      onActiveChange,
+      onHandleCheck,
     },
     onReady: () => {
       if (searching) cancelSearch = afterPaint(lookForDoor);
@@ -423,18 +449,82 @@ export function mount(root, ctx) {
   const stageListenerOptions = { capture: true, passive: true };
   const onPress = (event) => {
     if (!isPhotoTarget(event.target)) return;
+    if (event.isPrimary === true) {
+      // A new gesture: one whose release was lost has ended.
+      settlePress();
+    } else if (gate.pressed) {
+      // A second finger: the press is a pinch, which picks no handle (see `picked`).
+      pressPicked = false;
+    }
     gate.press(event.pointerId, event.isPrimary === true);
   };
   const onRelease = (event) => {
     const run = gate.release(event.pointerId);
+    if (!gate.pressed) settlePress();
     if (!run) return;
     clearTimeout(releaseTimer);
     // This listener runs before the editor's own pointerup: let it put the handle down first. Pressed
     // again by then, the change waits for that press too.
     releaseTimer = setTimeout(() => gate.whenReleased(run), 0);
   };
+  // A key on the photo: seen on the way down to the editor and again on the way back up, so a handle the
+  // editor selects in between is known to be one the customer asked for, not one it selected by itself
+  // as the photo got focus (see `picked`). Tab is not asking for one: it only steps through the handles.
+  const onKeyStart = (event) => {
+    keying = isPhotoTarget(event.target) && event.key !== 'Tab';
+  };
+  const onKeyEnd = () => {
+    keying = false;
+  };
+  // Focus does not bubble, but it does pass the stage on its way down to the photo (capture phase).
+  const onFocus = (event) => {
+    focusedPhoto = isPhotoTarget(event.target) ? event.target : null;
+  };
+  const onBlur = (event) => {
+    if (event.target === focusedPhoto) focusedPhoto = null;
+  };
   mark.stage.addEventListener('pointerdown', onPress, stageListenerOptions);
   for (const type of RELEASE_EVENTS) mark.stage.addEventListener(type, onRelease, stageListenerOptions);
+  mark.stage.addEventListener('keydown', onKeyStart, stageListenerOptions);
+  mark.stage.addEventListener('keydown', onKeyEnd, KEY_END_OPTIONS);
+  mark.stage.addEventListener('focus', onFocus, stageListenerOptions);
+  mark.stage.addEventListener('blur', onBlur, stageListenerOptions);
+
+  /** The press on the photo has ended: a handle it selected without turning into a pinch was picked. */
+  function settlePress() {
+    if (pressPicked) picked = true;
+    pressPicked = false;
+  }
+
+  /**
+   * The editor selected another handle, or none, because of the customer (see `picked`): a press, which is
+   * only known to be a pick once it has ended as one finger; a key, which is one unless it is Tab; or the
+   * photo getting keyboard focus, which never is.
+   * @param {number | null} index
+   */
+  function onActiveChange(index) {
+    const selected = index !== null;
+    if (gate.pressed) {
+      pressPicked = selected;
+      picked = false;
+    } else {
+      picked = selected && keying;
+    }
+  }
+
+  /**
+   * Whether the photo has the focus from the keyboard (:focus-visible, which the editor also goes by when
+   * it selects the first handle on focus). Not after a finger or the mouse focused it.
+   * @returns {boolean}
+   */
+  function photoHasKeyboardFocus() {
+    if (!focusedPhoto || typeof focusedPhoto.matches !== 'function') return false;
+    try {
+      return focusedPhoto.matches(':focus-visible') === true;
+    } catch {
+      return false;
+    }
+  }
 
   /** The banner for where things stand now (see doorBannerKind). */
   function bannerNow() {
@@ -459,9 +549,18 @@ export function mount(root, ctx) {
     outlineBtn.hidden = searching || outlines.length < 2;
   }
 
-  /** The guard in front of measuring: see doorCornersPlaced. */
+  /**
+   * The guard in front of measuring: see doorCornersPlaced. `checked`: every handle is the customer's
+   * (moved or checked, see onHandleCheck), which on an outline detection drew accepts it corner by corner.
+   */
   function placed() {
-    return doorCornersPlaced({ moved: touched, chosen, confident: confidentOf(detection), outline });
+    return doorCornersPlaced({
+      moved: touched,
+      chosen,
+      confident: confidentOf(detection),
+      checked: byHand.every(Boolean),
+      outline,
+    });
   }
 
   /**
@@ -516,13 +615,21 @@ export function mount(root, ctx) {
     outlines = doorOutlines(detection, bounds);
     const editor = mark.editor;
     let placedNow = false;
-    // A selected handle is the customer's too, whatever `handled` says: it is never moved or let go of.
-    if (!handled && !chosen && editor && editor.getActive() === null) {
+    // A handle the customer picked is theirs too, whatever `handled` says: it is never moved or let go of.
+    // One selected that nobody picked (see `picked`) is put on the door with the rest, and let go of, unless
+    // the photo has the keyboard's focus. There it stays selected, on the door: the editor's Tab steps on
+    // from the selected handle and its Enter confirms it, so with none selected the next Tab would leave the
+    // photo and Enter do nothing, though the photo's label says Tab goes from corner to corner.
+    if (!handled && !chosen && editor && !(picked && editor.getActive() !== null)) {
       const start = startPoints(photo, detection);
       editor.setPoints(copyQuad(start));
+      editor.setActive(photoHasKeyboardFocus() ? editor.getActive() : null);
       // The editor keeps every handle inside the photo; remember where it actually put them.
       committed = editor.getPoints() ?? start;
       outline = outlineIndexOf(outlines, start);
+      // Every handle is now where detection put it, including one the customer checked where it was before
+      // (onHandleCheck): that was a check of the old position.
+      byHand = cornersByHand(null);
       placedNow = true;
     } else {
       outline = outlineIndexOf(outlines, editor ? editor.getPoints() : committed);
@@ -567,6 +674,39 @@ export function mount(root, ctx) {
     committed = points;
     touched = true;
     keepCorners(points);
+    invalidateMeasurement(state);
+  }
+
+  /**
+   * The customer looked at a handle and left it where it was (the editor's onHandleCheck): a press on it let
+   * go of without moving it, or Enter / Space pressed on it while it is selected (Tab and the arrow that
+   * selects the first handle only select). Checked, it is where the customer
+   * says the corner is, so from now on it is measured with a hand's error, not detection's: this is how a
+   * detected corner that is already right gets the tighter "plus or minus" the result screen's
+   * 'corners_detected' tip promises ("press each corner to check it"). The corners have not moved, but their
+   * error has, so any measurement of them is dropped.
+   *
+   * A check is not a move: it does not set `touched` (or `handled`). Pressing a handle of the stand-in
+   * rectangle and letting go does not put it on the door, so it still cannot be measured until a corner is
+   * moved or an outline is accepted (placed()). For the same reason the check is kept with the corners
+   * (state.door) only once they count as placed: kept on the stand-in rectangle, the next visit would read
+   * it as corners the customer had placed and moved (touched, handled), measure the rectangle and keep a
+   * late detection off it. Until then it lives on this visit, and goes with the next move or measurement.
+   *
+   * On an outline detection drew, though, checking all four corners is accepting it corner by corner, and
+   * placed() counts it (doorCornersPlaced's `checked`): an outline detection was unsure of but got right can
+   * then be measured without nudging a correct corner off its spot, and the last check keeps the corners.
+   * @param {number} index Handle index.
+   */
+  function onHandleCheck(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= 4) return;
+    // Looked at on purpose, so the selected handle (the one checked) is the customer's pick (see `picked`).
+    // Here and not only in onActiveChange: the editor reports no new selection for a handle that was
+    // selected already, such as the one a pinch's first finger landed on or keyboard focus selected.
+    picked = true;
+    if (byHand[index]) return;
+    byHand = byHand.map((mine, i) => mine || i === index);
+    if (placed()) keepCorners(committed);
     invalidateMeasurement(state);
   }
 
@@ -619,22 +759,39 @@ export function mount(root, ctx) {
     else measurePaper(points);
   }
 
-  /** Paper: fit the marked sheet and the door together (unchanged from before the no-paper path). */
+  /**
+   * Paper: fit the marked sheet and the door together. state.measure is measureDoor's result with
+   * `method: 'paper'` and two more fields, which the result screen reads to say what would tighten a wide
+   * "plus or minus" (paperIssueCodes in js/screens/result.js); nothing else reads them, and the enquiry
+   * carries neither:
+   *  - `doorCornersByHand`: boolean[4], which door corners the customer placed, in the [TL, TR, BR, BL]
+   *    order of the measured opening (orderDoorQuad, as doorFitPx);
+   *  - `sigmaIfHandPlaced`: `{ widthMm, heightMm }`, the 1-sigma measureDoor gives the same sheet had every
+   *    door corner been placed by hand (m.sigmaDoorPx) where this fit puts the opening (r.doorFitPx): what
+   *    is left of the uncertainty once the customer has checked the corners, so the part the photo itself
+   *    sets. The measured sigmas when all four are by hand; null if that measurement fails.
+   *    Not the marked corners themselves: one left to detection is typically about 8 px out and one in ten
+   *    more than 19 px (on a 2048 px photo), far more than a hand's 2.5 px, and measured as a hand's that
+   *    misfit would be read as the photo's (measureDoor widens its sigmas by how badly the corners fit,
+   *    fit.sigmaScale). The retake tip would then show for many photos that are fine by hand, just from
+   *    which way detection happened to be off. The fitted opening agrees with the sheet and its plane, so
+   *    what is left is the photo's own geometry: how big the sheet is in it, how far and how steep.
+   */
   function measurePaper(points) {
     if (!isQuad(state.sheet?.points)) return;
     const m = config.measurement;
+    const input = {
+      sheetPx: state.sheet.points,
+      doorPx: points,
+      sheetMm: getSheetMm(state, config),
+      imageSize: { width: photo.width, height: photo.height },
+      sigmaSheetPx: state.sheet.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
+      plausible: m.plausible,
+    };
     let r;
     try {
-      r = measureDoor({
-        sheetPx: state.sheet.points,
-        doorPx: points,
-        sheetMm: getSheetMm(state, config),
-        imageSize: { width: photo.width, height: photo.height },
-        sigmaSheetPx: state.sheet.refined ? m.sigmaSheetRefinedPx : m.sigmaSheetManualPx,
-        // m.sigmaDoorPx is for corners dragged into place; a detected one left as it was is as good as detection.
-        sigmaDoorPx: cornerSigmaPx(m.sigmaDoorPx),
-        plausible: m.plausible,
-      });
+      // m.sigmaDoorPx is for corners dragged into place; a detected one left as it was is as good as detection.
+      r = measureDoor({ ...input, sigmaDoorPx: cornerSigmaPx(m.sigmaDoorPx) });
     } catch {
       r = { ok: false, error: 'degenerate' };
     }
@@ -643,9 +800,23 @@ export function mount(root, ctx) {
       ctx.toast(t(key), { type: 'error', duration: ERROR_TOAST_MS });
       return;
     }
+    let handPlaced = r;
+    if (!byHand.every(Boolean)) {
+      try {
+        // On the fitted opening, not `points`: see sigmaIfHandPlaced above.
+        handPlaced = measureDoor({ ...input, doorPx: r.doorFitPx, sigmaDoorPx: m.sigmaDoorPx });
+      } catch {
+        handPlaced = null;
+      }
+    }
 
     keepCorners(points);
-    state.measure = { ...r, method: 'paper' };
+    state.measure = {
+      ...r,
+      method: 'paper',
+      doorCornersByHand: cornersByHandInOrder(byHand, points, orderDoorQuad(points)),
+      sigmaIfHandPlaced: handPlaced?.ok ? { widthMm: handPlaced.sigmaWidthMm, heightMm: handPlaced.sigmaHeightMm } : null,
+    };
     state.size = {
       ...applyMeasurementRules(m, { widthMm: r.widthMm, heightMm: r.heightMm }),
       source: 'photo',
@@ -726,6 +897,10 @@ export function mount(root, ctx) {
     gate.clear();
     mark.stage.removeEventListener('pointerdown', onPress, stageListenerOptions);
     for (const type of RELEASE_EVENTS) mark.stage.removeEventListener(type, onRelease, stageListenerOptions);
+    mark.stage.removeEventListener('keydown', onKeyStart, stageListenerOptions);
+    mark.stage.removeEventListener('keydown', onKeyEnd, KEY_END_OPTIONS);
+    mark.stage.removeEventListener('focus', onFocus, stageListenerOptions);
+    mark.stage.removeEventListener('blur', onBlur, stageListenerOptions);
     mark.destroy();
     // Close the help sheet if it is still open, so nothing is left on <body>.
     try {
