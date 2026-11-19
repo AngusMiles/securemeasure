@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: mediastream:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="color-scheme" content="only light">
+  <meta name="format-detection" content="telephone=no">
+  <title>TEST PAGE: door scale by sliding the phone</title>
+  <style>
+    :root {
+      --ink: #111;
+      --muted: #555;
+      --line: #d6d6d6;
+      --card: #fff;
+      --bg: #f2f3f5;
+      --accent: #0a58ca;
+      --ok: #137333;
+      --bad: #b3261e;
+      --warn: #8a5a00;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 17px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    body.capturing { overflow: hidden; }
+    .banner {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      margin: 0;
+      padding: 8px 16px;
+      padding-top: calc(8px + env(safe-area-inset-top));
+      background: #ffd400;
+      color: #000;
+      font-weight: 700;
+      text-align: center;
+      letter-spacing: 0.02em;
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 12px 16px 32px; }
+    h1 { font-size: 1.5rem; line-height: 1.25; margin: 12px 0 6px; }
+    h2 { font-size: 1.2rem; margin: 0 0 10px; display: flex; gap: 10px; align-items: center; }
+    h3 { font-size: 1.05rem; margin: 18px 0 6px; }
+    .lead { color: var(--muted); margin: 0 0 12px; }
+    .num {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px; border-radius: 50%;
+      background: var(--accent); color: #fff; font-size: 1rem; flex: none;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      margin: 14px 0;
+    }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input[type="text"], input[type="number"], input:not([type]) {
+      width: 100%;
+      font-size: 18px; /* 16 px or more: iOS does not zoom into the field */
+      padding: 10px 12px;
+      border: 1px solid #b9b9b9;
+      border-radius: 10px;
+      background: #fff;
+    }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+    .check, .radio { display: flex; gap: 12px; align-items: flex-start; font-weight: 400; margin: 12px 0; }
+    .check input, .radio input { width: 24px; height: 24px; margin: 2px 0 0; flex: none; }
+    .radio b { display: block; }
+    .note { color: var(--muted); font-size: 0.92rem; }
+    button {
+      font: inherit;
+      font-weight: 600;
+      min-height: 52px;
+      padding: 10px 18px;
+      border-radius: 12px;
+      border: 0;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.45; }
+    button.quiet { background: #e7e9ee; color: var(--ink); }
+    button.big { width: 100%; min-height: 64px; font-size: 1.25rem; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 4px; }
+    ol.how { padding-left: 1.3em; margin: 6px 0 14px; }
+    ol.how li { margin: 6px 0; }
+    #start-msg { color: var(--bad); font-weight: 600; }
+    details summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+    table.kv th { text-align: left; vertical-align: top; width: 42%; padding: 6px 8px 6px 0; color: var(--muted); font-weight: 600; }
+    table.kv td { padding: 6px 0; word-break: break-word; }
+    table.kv tr + tr th, table.kv tr + tr td { border-top: 1px solid #eee; }
+    table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px; text-align: left; white-space: nowrap; }
+    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+    td, th, pre, .big-num { -webkit-user-select: text; user-select: text; }
+    .headline { border-radius: 12px; padding: 12px 14px; margin-bottom: 6px; }
+    .headline p { margin: 4px 0; }
+    .headline.pass { background: #e6f4ea; }
+    .headline.fail { background: #fff4e5; }
+    .headline.none { background: #fde7e7; }
+    .big-num { font-size: 2rem; font-weight: 800; line-height: 1.1; }
+    .gate { font-weight: 700; }
+    .warn { color: var(--warn); font-weight: 600; }
+    pre.json { white-space: pre-wrap; word-break: break-all; font-size: 0.8rem; background: #f6f6f6; padding: 8px; border-radius: 8px; }
+    .offscreen { position: fixed; left: -9999px; top: 0; }
+    footer { text-align: center; padding: 8px 16px 40px; }
+    footer a { color: var(--accent); font-weight: 600; }
+
+    /* Capture view: full screen, fixed boxes only (no layout changes while recording). */
+    .cap { position: fixed; inset: 0; z-index: 20; background: #000; overflow: hidden; touch-action: none; }
+    .cap[hidden] { display: none; }
+    .cap video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .cap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .hud {
+      position: absolute; left: 0; right: 0; top: 0;
+      padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
+      background: rgba(0, 0, 0, 0.55); color: #fff;
+      contain: layout paint;
+    }
+    .hud-step { margin: 0; font-size: 1.2rem; font-weight: 700; line-height: 1.3; height: 4em; overflow: hidden; }
+    .hud-stat { margin: 4px 0 0; font: 12px/1.3 ui-monospace, Menlo, monospace; color: #cfcfcf; height: 1.3em; overflow: hidden; white-space: nowrap; }
+    .hud-hint {
+      position: absolute; left: 12px; right: 12px; bottom: calc(150px + env(safe-area-inset-bottom));
+      margin: 0; padding: 10px 12px; border-radius: 12px;
+      background: rgba(0, 0, 0, 0.6); color: #ffe45c;
+      font-size: 1.1rem; font-weight: 700; line-height: 1.3; height: 4.2em; overflow: hidden; text-align: center;
+      contain: strict;
+    }
+    .hud-hint:empty { visibility: hidden; }
+    .cap-buttons {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+      background: rgba(0, 0, 0, 0.55);
+    }
+    .cap-buttons button { min-height: 56px; }
+    .cap-buttons #b-cancel { background: #5f6368; }
+    .cap-buttons #b-yes { background: var(--ok); }
+  </style>
+</head>
+<body>
+  <p class="banner" role="note">TEST PAGE &middot; internal R&amp;D &middot; nothing is uploaded</p>
+  <main>
+    <h1>Measure a door by sliding the phone</h1>
+    <p class="lead">This test page tries to measure a door in millimetres with only the camera and the phone's motion sensors: you film the door while sliding the phone left and right, and it works out the size. You then compare its answer with a tape measure.</p>
+
+    <section class="card" id="setup">
+      <h2><span class="num">1</span> About this door (once per door)</h2>
+      <label for="f-door">Door name or number</label>
+      <input id="f-door" type="text" autocomplete="off" placeholder="e.g. D1 front door">
+      <div class="row2">
+        <div>
+          <label for="f-tapew">Tape width (mm)</label>
+          <input id="f-tapew" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 820">
+        </div>
+        <div>
+          <label for="f-tapeh">Tape height (mm)</label>
+          <input id="f-tapeh" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 2040">
+        </div>
+      </div>
+      <p class="note">Measure the opening (inside the frame), floor or sill to the top.</p>
+      <div class="row2">
+        <div>
+          <label for="f-phone">Phone model</label>
+          <input id="f-phone" type="text" autocomplete="off" placeholder="e.g. iPhone 17 Pro">
+        </div>
+        <div>
+          <label for="f-ios">iOS version</label>
+          <input id="f-ios" type="text" autocomplete="off" placeholder="e.g. 26.1">
+        </div>
+      </div>
+      <details>
+        <summary>Optional: camera-height test</summary>
+        <label for="f-lens">Lens height above the ground you stand on (mm; a helper tapes it)</label>
+        <input id="f-lens" type="text" inputmode="decimal" autocomplete="off">
+        <label for="f-sill">Sill offset (mm; + when the sill is higher than where you stand)</label>
+        <input id="f-sill" type="text" inputmode="decimal" autocomplete="off" placeholder="0">
+        <label for="f-stature">Your height (mm)</label>
+        <input id="f-stature" type="text" inputmode="decimal" autocomplete="off">
+        <p class="note">Heights are personal: they stay on this phone. Unless you tick this box, Download and Share leave out the heights and the camera-height sizes worked out from them, and Copy keeps only those sizes' errors against the tape.</p>
+        <label class="check"><input id="f-heights" type="checkbox"> <span>Include my heights in Copy, Download and Share</span></label>
+      </details>
+    </section>
+
+    <section class="card" id="mode">
+      <h2><span class="num">2</span> Choose the test</h2>
+      <label class="radio"><input type="radio" name="mode" value="sweep" checked> <span><b>Sweep (the normal test)</b>Hold still, slide the phone left and right for about 7 seconds, hold still.</span></label>
+      <label class="radio"><input type="radio" name="mode" value="rotate"> <span><b>Rotate-only</b>Stand still and only turn the phone a little (about 10 degrees) for 6 seconds. The answer should be "no movement".</span></label>
+      <label class="radio"><input type="radio" name="mode" value="still"> <span><b>Still 10 s</b>Hold the phone still, or brace it against a post, for 10 seconds. Measures the sensor noise.</span></label>
+      <label class="radio"><input type="radio" name="mode" value="tapsync"> <span><b>Tap-sync</b>A normal sweep, with one sharp tap on the side of the phone before and after it. Checks the camera-motion timing; listed apart from the Sweep runs.</span></label>
+      <label class="check"><input id="f-pacing" type="checkbox" checked> <span>Pacing click: move to the other side on each click (turn the ringer on to hear it)</span></label>
+      <label class="check"><input id="f-video" type="checkbox"> <span>Record video too (for offline re-tracking; large file)</span></label>
+    </section>
+
+    <section class="card" id="lens">
+      <h2><span class="num">3</span> Lens check (optional)</h2>
+      <p>Takes one photo to read the lens's focal length from it (iPhone with iOS 18.4 or newer). Do it once per phone, before measuring.</p>
+      <button id="b-lens" type="button" class="quiet">Lens check</button>
+      <p id="lens-out" class="note" role="status"></p>
+    </section>
+
+    <section class="card" id="measure">
+      <h2><span class="num">4</span> Measure</h2>
+      <ol class="how">
+        <li>Tap <b>Start</b>. Allow <b>motion</b> and <b>camera</b> when asked.</li>
+        <li>Stand <b>2 to 2.5 m</b> back. Hold the phone <b>upright</b> with both hands and fit the whole door inside the white frame.</li>
+        <li>When the green outline sits on the door opening, tap <b>Yes</b>. If it is wrong, tap <b>Not right</b> (or tap the 4 corners yourself).</li>
+        <li><b>Hold still</b> for 1 second.</li>
+        <li><b>Slide</b> the phone left and right about a hand-width (15 to 30 cm), about once a second, keeping it pointing straight at the door, until the ring is full (about 7 s).</li>
+        <li><b>Hold still</b> again. The result appears below.</li>
+      </ol>
+      <button id="b-start" type="button" class="big">Start</button>
+      <p id="start-msg" role="status" hidden></p>
+    </section>
+
+    <section class="card" id="result" hidden>
+      <h2>Result</h2>
+      <div id="result-body"></div>
+    </section>
+
+    <section class="card" id="session">
+      <h2>This session</h2>
+      <div id="session-body"></div>
+    </section>
+
+    <section class="card">
+      <h2>This phone</h2>
+      <div id="support"></div>
+      <p class="note">Safari remembers a refused motion or camera permission until Safari is fully closed (swipe it away in the app switcher). Motion data stops while the page is hidden, so do not switch apps during a run. Low Power Mode can slow the camera.</p>
+      <div class="buttons"><button id="b-example" type="button" class="quiet">Show a synthetic example result</button></div>
+      <p class="note">The example is simulated data (not a measurement) and is not added to the session.</p>
+    </section>
+  </main>
+  <footer>
+    <p class="note">Internal R&amp;D test page, not for customers: any customer use of this method first needs a freedom-to-operate opinion on US11372017B2.</p>
+    <a href="../../">Back to SecureMeasure</a>
+  </footer>
+
+  <div id="cap" class="cap" hidden>
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div class="hud">
+      <p id="hud-step" class="hud-step"></p>
+      <p id="hud-stat" class="hud-stat"></p>
+    </div>
+    <p id="hud-hint" class="hud-hint"></p>
+    <div class="cap-buttons">
+      <button id="b-yes" type="button" hidden>Yes, that's the door</button>
+      <button id="b-next" type="button" hidden>Not right</button>
+      <button id="b-taps" type="button" hidden>Tap the corners</button>
+      <button id="b-play" type="button" hidden>Start the camera</button>
+      <button id="b-cancel" type="button">Cancel</button>
+    </div>
+  </div>
+  <script type="module" src="vio.js"></script>
+</body>
+</html>

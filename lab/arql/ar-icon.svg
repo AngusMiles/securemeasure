@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="150" viewBox="0 0 600 150" role="img" aria-label="Open in AR">
+  <rect x="0" y="0" width="600" height="150" rx="30" fill="#0b5cd5"/>
+  <g fill="none" stroke="#ffffff" stroke-width="9" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M75 38 L120 62 L120 112 L75 136 L30 112 L30 62 Z"/>
+    <path d="M30 62 L75 86 L120 62"/>
+    <path d="M75 86 L75 136"/>
+  </g>
+  <text x="160" y="96" fill="#ffffff" font-family="-apple-system, system-ui, Helvetica, Arial, sans-serif" font-size="54" font-weight="700">Open in AR</text>
+</svg>

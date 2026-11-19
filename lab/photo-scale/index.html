@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="only light">
+  <meta name="format-detection" content="telephone=no">
+  <title>Photo scale lab (TEST PAGE)</title>
+  <link rel="icon" type="image/svg+xml" href="../../assets/favicon.svg">
+  <style>
+    :root {
+      --ink: #14181d; --muted: #56606b; --line: #d5dae0; --bg: #f3f5f7; --card: #ffffff;
+      --brand: #0b5cad; --brand-ink: #ffffff; --ok: #137a3a; --warn: #9a5b00; --bad: #b3261e;
+      --ok-bg: #e7f4ec; --warn-bg: #fff4e0; --bad-bg: #fde9e7; --info-bg: #e8f1fb;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .test-banner { position: sticky; top: 0; z-index: 10; background: #ffd400; color: #000; text-align: center; font-weight: 800; letter-spacing: .04em; padding: 6px 12px calc(6px); padding-top: max(6px, env(safe-area-inset-top)); border-bottom: 2px solid #000; }
+    main { max-width: 760px; margin: 0 auto; padding: 12px max(12px, env(safe-area-inset-right)) 40px max(12px, env(safe-area-inset-left)); }
+    h1 { font-size: 1.6rem; margin: 12px 0 4px; }
+    h2 { font-size: 1.25rem; margin: 0 0 8px; }
+    h3 { font-size: 1.05rem; margin: 16px 0 6px; }
+    p { margin: 6px 0; }
+    .lead { color: var(--muted); }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin: 14px 0; }
+    .step-num { display: inline-flex; align-items: center; justify-content: center; width: 1.8em; height: 1.8em; border-radius: 50%; background: var(--brand); color: var(--brand-ink); font-weight: 700; margin-right: 8px; font-size: .9em; }
+    ol.big { padding-left: 1.4em; margin: 8px 0; }
+    ol.big li { margin: 6px 0; }
+    label.field { display: block; margin: 10px 0 4px; font-weight: 600; }
+    select, input[type=number], input[type=text] { font: inherit; width: 100%; padding: 10px 12px; border: 1px solid #9aa5b1; border-radius: 10px; background: #fff; color: var(--ink); }
+    input[type=range] { width: 100%; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .row > * { flex: 1 1 auto; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+    @media (max-width: 420px) { .grid2 { grid-template-columns: 1fr; } }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 52px; padding: 12px 18px; border-radius: 12px; border: 2px solid var(--brand); background: var(--brand); color: var(--brand-ink); font: inherit; font-weight: 700; cursor: pointer; text-align: center; -webkit-tap-highlight-color: transparent; }
+    .btn.secondary { background: #fff; color: var(--brand); }
+    .btn.small { min-height: 40px; padding: 6px 12px; font-size: .92rem; }
+    .btn[disabled], .btn.disabled { opacity: .45; pointer-events: none; }
+    .btn.wide { width: 100%; margin-top: 10px; }
+    .file-btn { position: relative; overflow: hidden; }
+    .file-btn input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; font-size: 200px; }
+    .route-help { background: var(--info-bg); border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
+    .route-help ol { margin: 4px 0; padding-left: 1.3em; }
+    .notice { border-radius: 10px; padding: 10px 14px; margin: 8px 0; }
+    .notice.ok { background: var(--ok-bg); color: #0c4d25; }
+    .notice.warn { background: var(--warn-bg); color: #5e3800; }
+    .notice.bad { background: var(--bad-bg); color: #7a1912; }
+    .notice.info { background: var(--info-bg); color: #08396b; }
+    video { width: 100%; max-height: 60vh; background: #000; border-radius: 10px; display: block; margin-top: 10px; object-fit: contain; }
+    .editor-wrap { position: relative; width: 100%; margin-top: 10px; background: #15181c; border-radius: 10px; overflow: hidden; }
+    canvas#editor { display: block; width: 100%; touch-action: none; -webkit-user-select: none; user-select: none; }
+    .headline { display: grid; gap: 10px; margin: 8px 0; }
+    .hl { border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; }
+    .hl .k { font-size: .9rem; color: var(--muted); font-weight: 600; }
+    .hl .v { font-size: 1.45rem; font-weight: 800; }
+    .hl .s { font-size: .92rem; color: var(--muted); }
+    .hl.ok { border-color: #7cc196; background: var(--ok-bg); }
+    .hl.bad { border-color: #e3a29c; background: var(--bad-bg); }
+    details { border-top: 1px solid var(--line); padding: 8px 0; }
+    details > summary { font-weight: 700; cursor: pointer; padding: 6px 0; }
+    table { border-collapse: collapse; width: 100%; font-size: .86rem; font-variant-numeric: tabular-nums; }
+    th, td { border-bottom: 1px solid #e6e9ed; padding: 4px 6px; text-align: left; vertical-align: top; }
+    th { background: #f6f7f9; font-weight: 700; }
+    td.num, th.num { text-align: right; white-space: nowrap; }
+    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .kv td:first-child { color: var(--muted); width: 42%; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .8rem; word-break: break-all; }
+    .tag-ok { color: var(--ok); font-weight: 700; }
+    .tag-bad { color: var(--bad); font-weight: 700; }
+    .tag-warn { color: var(--warn); font-weight: 700; }
+    .progress { height: 10px; background: #e6e9ed; border-radius: 5px; overflow: hidden; margin: 8px 0; }
+    .progress > span { display: block; height: 100%; width: 0; background: var(--brand); transition: width .15s; }
+    textarea { width: 100%; min-height: 160px; font: 12px ui-monospace, Menlo, monospace; }
+    canvas#preview { width: 100%; max-width: 600px; display: block; margin: 8px auto; background: #222; border-radius: 8px; }
+    .radio-list label { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin: 6px 0; font-weight: 500; }
+    .radio-list input { width: 22px; height: 22px; flex: none; }
+    .check { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+    .check input { width: 22px; height: 22px; }
+    footer { text-align: center; margin: 30px 0 10px; }
+    footer a { color: var(--brand); font-weight: 700; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="test-banner" role="note">TEST PAGE &middot; not for customers &middot; photos stay on this phone</div>
+  <main>
+    <h1>Photo scale lab</h1>
+    <p class="lead">Checks two ways to get a door's real size from one photo, with no app and no paper:
+      the iPhone's own focus distance (stored inside Pro iPhone photos), and the brick courses beside the door.
+      Nothing is uploaded: everything happens on this phone.</p>
+
+    <section class="card" id="quick">
+      <h2>Do this first: the 10-minute check</h2>
+      <p>You need a <strong>Pro iPhone</strong> (12 Pro or later: it has a small black dot, the LiDAR sensor, next to the cameras).</p>
+      <ol class="big">
+        <li>Open the iPhone <strong>Camera</strong> app. Photo mode, <strong>1x</strong>, phone held <strong>upright</strong>.</li>
+        <li>Stand <strong>2 to 3 metres</strong> from a front door with the door in the middle of the screen. <strong>Do not tap</strong> the screen. Take one photo.</li>
+        <li>In the <strong>Photos</strong> app, open that photo, tap Share, then <strong>Save to Files</strong>.</li>
+        <li>Back here, type a door name in step 1 (for example <em>front-door</em>), then give the photo each way in the list, one after the other:
+          the three Photo Library choices (they differ only in which file types the page says it accepts), Files, In-page camera, and Take Photo.</li>
+        <li>After each one, read the green or red box that says whether the <strong>MakerNote</strong> and the <strong>AF depth</strong> came through. The table at the bottom fills in by itself.</li>
+        <li>For the error table, check the 4 dots in step 2 on each photo: move a dot, or tick "the 4 dots are on the corners". Photos with unchecked dots are left out.</li>
+        <li>At the next door, type its name <em>before</em> giving its first photo: the photo on screen keeps the door it was given with.</li>
+      </ol>
+    </section>
+
+    <section class="card" id="step-photo">
+      <h2><span class="step-num">1</span>Give the photo</h2>
+      <label class="field" for="door-id">Which door is it? (any short name, the same for every photo of this door)</label>
+      <input type="text" id="door-id" list="door-ids" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="for example front-door">
+      <datalist id="door-ids"></datalist>
+      <div id="door-bind" aria-live="polite"></div>
+      <label class="field" for="route">How are you giving the photo?</label>
+      <select id="route">
+        <option value="library">Photo Library (pick it from Photos; page accepts image/*)</option>
+        <option value="library_heic">Photo Library, page accepts HEIC (image/heic, image/heif, image/*)</option>
+        <option value="library_any">Photo Library, page sets no accept filter</option>
+        <option value="files">Files (after "Save to Files" in Photos)</option>
+        <option value="inpage">In-page camera (this page takes the photo)</option>
+        <option value="takephoto">"Take Photo" from the picker (the control)</option>
+      </select>
+      <div class="route-help" id="route-help"></div>
+
+      <div id="pick-box">
+        <label class="btn wide file-btn" id="pick-label">
+          <span id="pick-text">Choose photo</span>
+          <input type="file" id="file" accept="image/*">
+        </label>
+      </div>
+
+      <div id="cam-box" hidden>
+        <button type="button" class="btn wide" id="cam-start">Start camera</button>
+        <video id="cam-video" muted playsinline hidden></video>
+        <div class="row" id="cam-controls" hidden>
+          <button type="button" class="btn" id="cam-shoot">Take photo</button>
+          <button type="button" class="btn secondary" id="cam-stop">Stop camera</button>
+        </div>
+      </div>
+
+      <div class="progress" id="load-progress" hidden><span></span></div>
+      <div id="load-status" aria-live="polite"></div>
+      <div id="q1-box" aria-live="polite"></div>
+    </section>
+
+    <section class="card" id="step-corners" hidden>
+      <h2><span class="step-num">2</span>Put the 4 dots on the door opening</h2>
+      <p>Drag each dot to an <strong>inside corner of the opening</strong>: where the frame meets the opening at the top, and where the frame meets the sill at the bottom.
+        A magnifier appears while you drag. The cross marks where the iPhone measured its focus distance.</p>
+      <div class="editor-wrap"><canvas id="editor" aria-label="Photo with four corner dots"></canvas></div>
+      <div class="row" style="margin-top:10px">
+        <button type="button" class="btn secondary small" id="corners-detected">Back to the found corners</button>
+        <button type="button" class="btn secondary small" id="corners-default">Back to a middle box</button>
+      </div>
+      <label class="check"><input type="checkbox" id="corners-ok" disabled> The 4 dots are on the opening's corners (count this photo in the error table)</label>
+      <p class="lead" id="corners-ok-note"></p>
+      <div id="corner-status"></div>
+    </section>
+
+    <section class="card" id="step-settings" hidden>
+      <h2><span class="step-num">3</span>About the wall and door</h2>
+      <p><strong>How far does the brick face stand in front of the door frame?</strong> (Look at the side of the opening: the "reveal".)</p>
+      <div class="radio-list" id="reveal-list">
+        <label><input type="radio" name="reveal" value="none"> None: the frame is flush with the wall (0 mm)</label>
+        <label><input type="radio" name="reveal" value="half"> About half a brick (55 mm)</label>
+        <label><input type="radio" name="reveal" value="one"> About one brick (110 mm)</label>
+        <label><input type="radio" name="reveal" value="typed" checked> Typed: <strong><span id="reveal-typed-out">125</span> mm</strong> (use the slider)</label>
+      </div>
+      <input type="range" id="reveal-slider" min="0" max="300" step="5" value="125" aria-label="Reveal in mm">
+
+      <div class="grid2">
+        <div>
+          <label class="field" for="setback">Door leaf set back behind the frame face, mm (for the focus distance)</label>
+          <input type="number" id="setback" inputmode="decimal" value="20" min="0" max="200" step="1">
+        </div>
+        <div>
+          <label class="field" for="region">Brick course size for this area</label>
+          <select id="region"></select>
+        </div>
+      </div>
+      <button type="button" class="btn wide" id="measure">Measure</button>
+      <div class="progress" id="measure-progress" hidden><span></span></div>
+      <div id="measure-status" aria-live="polite"></div>
+    </section>
+
+    <section class="card" id="step-result" hidden>
+      <h2>Result for this photo</h2>
+      <div id="result"></div>
+    </section>
+
+    <section class="card" id="step-truth">
+      <h2><span class="step-num">4</span>Tape-measure truth</h2>
+      <p>Measure the opening with a tape (inside the frame, head to sill). Every photo with the same door name (step 1) shares these numbers.</p>
+      <p><strong>Door: <span id="truth-door">(type a door name in step 1)</span></strong></p>
+      <div class="grid2">
+        <div><label class="field" for="t-w">Width, mm</label><input type="number" id="t-w" inputmode="decimal" step="1"></div>
+        <div><label class="field" for="t-h">Height, mm</label><input type="number" id="t-h" inputmode="decimal" step="1"></div>
+        <div><label class="field" for="t-reveal">Reveal (brick face to frame face), mm</label><input type="number" id="t-reveal" inputmode="decimal" step="1"></div>
+        <div><label class="field" for="t-courses">Height of 10 brick courses, mm</label><input type="number" id="t-courses" inputmode="decimal" step="1"></div>
+        <div><label class="field" for="t-setback">Leaf set back from the frame face, mm</label><input type="number" id="t-setback" inputmode="decimal" step="1"></div>
+        <div><label class="field" for="t-wall">Wall beside the door</label>
+          <select id="t-wall">
+            <option value="">(not said)</option>
+            <option value="brick">Brick</option>
+            <option value="other">Not brick (render, weatherboard, stone...)</option>
+          </select>
+        </div>
+      </div>
+      <div id="truth-errors"></div>
+    </section>
+
+    <section class="card" id="step-export">
+      <h2><span class="step-num">5</span>Save and send the numbers</h2>
+      <label class="check"><input type="checkbox" id="include-photo"> Include the photo (it shows the house: only tick this if that is fine)</label>
+      <div class="row">
+        <button type="button" class="btn small" id="copy-result">Copy results</button>
+        <button type="button" class="btn small secondary" id="copy-session">Copy session</button>
+        <button type="button" class="btn small secondary" id="download">Download JSON</button>
+        <button type="button" class="btn small secondary" id="share">Share</button>
+      </div>
+      <div id="export-status" aria-live="polite"></div>
+      <textarea id="copy-fallback" hidden readonly aria-label="Copy this text"></textarea>
+    </section>
+
+    <section class="card" id="step-session">
+      <h2>Session so far</h2>
+      <div id="session"></div>
+      <button type="button" class="btn small secondary" id="clear-session" style="margin-top:12px">Clear the session</button>
+    </section>
+
+    <footer><a href="../../">Back to SecureMeasure</a></footer>
+  </main>
+  <noscript><p style="padding:16px">This test page needs JavaScript.</p></noscript>
+  <script type="module" src="photo-scale.js"></script>
+</body>
+</html>

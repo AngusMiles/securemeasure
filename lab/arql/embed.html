@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'self'">
+  <meta name="robots" content="noindex">
+  <meta name="color-scheme" content="only light">
+  <title>Lab: AR link inside an iframe</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f4f6f8; color: #15181c; font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    body { display: flex; flex-direction: column; }
+    .test-banner { background: #b00020; color: #fff; text-align: center; font-weight: 800; padding: 8px 12px; padding-top: calc(8px + env(safe-area-inset-top)); }
+    p { margin: 8px 14px; }
+    iframe { flex: 1; width: 100%; border: 0; border-top: 4px dashed #0b5cd5; background: #fff; min-height: 70vh; }
+    a { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="test-banner" role="note">TEST PAGE - not for customers</div>
+  <p>The lab page below is inside an iframe from the same site, as it would be on a door company's website.
+    Do one run of step 2 in it and note whether "Open in AR" still opens the AR view, and whether the
+    "This size fits" banner (gauge D) still reaches the page. Step 1 below should say "inside an iframe".</p>
+  <p><a href="./">Open the lab page on its own</a> &middot; <a href="../../">Back to SecureMeasure</a></p>
+  <iframe src="index.html" title="AR Quick Look lab page" allow="camera; clipboard-write; web-share"></iframe>
+</body>
+</html>

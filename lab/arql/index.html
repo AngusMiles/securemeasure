@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'">
+  <meta name="robots" content="noindex">
+  <meta name="color-scheme" content="only light">
+  <meta name="format-detection" content="telephone=no">
+  <title>Lab: door gauge in Apple AR</title>
+  <link rel="icon" type="image/svg+xml" href="../../assets/favicon.svg">
+  <link rel="stylesheet" href="arql.css">
+</head>
+<body>
+  <div class="test-banner" role="note">TEST PAGE - not for customers</div>
+
+  <header>
+    <h1>Door gauge in Apple AR</h1>
+    <p class="lead">This page makes a life-size measuring gauge and opens it in the iPhone's built-in AR viewer
+      (AR Quick Look, part of iOS). Nothing to install, no app. You hold the gauge against a real door and read
+      it, then compare with a tape measure. Nothing leaves this phone unless you copy or share it in step 5.</p>
+    <nav class="jump" aria-label="Steps">
+      <a href="#p1">1 Phone</a>
+      <a href="#p2">2 Make and open</a>
+      <a href="#p3">3 After AR</a>
+      <a href="#p4">4 Product flow</a>
+      <a href="#p5">5 Send results</a>
+    </nav>
+    <div id="storage-warning" class="warn hidden" role="alert"></div>
+    <div id="restore-note" class="note hidden" role="status"></div>
+  </header>
+
+  <main>
+    <!-- 1 ------------------------------------------------------------------------------------- -->
+    <section class="panel" id="p1" aria-labelledby="p1h">
+      <h2 id="p1h">1. About this phone</h2>
+      <ol class="steps">
+        <li>Fill in the three boxes below once. They are remembered on this phone.</li>
+        <li>For the iOS version open <strong>Settings &gt; General &gt; About</strong> (the browser may report an older one).</li>
+      </ol>
+      <div class="grid2">
+        <label class="field"><span>Phone model</span><input type="text" data-bind="env.model" placeholder="e.g. iPhone 13" autocomplete="off"></label>
+        <label class="field"><span>iOS version</span><input type="text" data-bind="env.ios" placeholder="e.g. 18.3.1" inputmode="decimal" autocomplete="off"></label>
+        <label class="field"><span>Pro model with LiDAR?</span>
+          <select data-bind="env.lidar">
+            <option value="">Choose…</option>
+            <option value="yes">Yes (Pro / Pro Max, 12 or later)</option>
+            <option value="no">No</option>
+            <option value="unsure">Not sure</option>
+          </select>
+        </label>
+      </div>
+      <div id="ar-support" class="note" role="status">Checking AR support…</div>
+      <h3>What the browser reports</h3>
+      <table class="kv" id="env-table"></table>
+    </section>
+
+    <!-- 2 ------------------------------------------------------------------------------------- -->
+    <section class="panel" id="p2" aria-labelledby="p2h">
+      <h2 id="p2h">2. Make the gauge and open it in AR</h2>
+      <ol class="steps">
+        <li><strong>Choose a gauge</strong> (start with A, the tape L).</li>
+        <li>Leave the other choices as they are for your first run.</li>
+        <li>Tap <strong>Make the AR link</strong>, then tap the blue <strong>Open in AR</strong> button.</li>
+        <li>If the viewer opens on <strong>Object</strong>, tap <strong>AR</strong> at the top. Point the phone at the wall beside the door
+          and move it slowly side to side until the gauge appears on the wall.</li>
+        <li>Drag the gauge so its red zero (the outline's corner on C and D) sits on the <strong>bottom-left inside corner</strong>
+          of the door opening.</li>
+        <li><strong>Read the gauge first</strong> (see step 3 for how) and remember or jot down the readings.</li>
+        <li>Only then try a pinch, and note whether the size changes. Readings taken after a pinch resized it do not count
+          (if you need to read again, pinch back until it shows 100 %).</li>
+        <li>Close the AR view and fill in step 3.</li>
+      </ol>
+
+      <fieldset>
+        <legend>Gauge</legend>
+        <div class="choices" role="radiogroup">
+          <label><input type="radio" name="design" value="A" data-bind="form.design"> A. Tape L</label>
+          <label><input type="radio" name="design" value="B" data-bind="form.design"> B. Grid</label>
+          <label><input type="radio" name="design" value="C" data-bind="form.design"> C. All standard sizes</label>
+          <label><input type="radio" name="design" value="D" data-bind="form.design"> D. One outline</label>
+          <label><input type="radio" name="design" value="E" data-bind="form.design"> E. Floor ruler</label>
+        </div>
+        <p class="muted" id="design-help"></p>
+        <div class="grid2" id="params-A">
+          <label class="field"><span>Upright strip length, mm</span><input type="number" inputmode="numeric" data-bind="form.tapeH" min="500" max="4000"></label>
+          <label class="field"><span>Sill strip length, mm</span><input type="number" inputmode="numeric" data-bind="form.tapeW" min="300" max="4000"></label>
+        </div>
+        <div class="grid2" id="params-B">
+          <label class="field"><span>Grid width, mm</span><input type="number" inputmode="numeric" data-bind="form.gridW" min="300" max="4000"></label>
+          <label class="field"><span>Grid height, mm</span><input type="number" inputmode="numeric" data-bind="form.gridH" min="300" max="4000"></label>
+        </div>
+        <div id="params-C"><p class="muted" id="catalogue-list"></p></div>
+        <div class="grid2" id="params-D">
+          <label class="field"><span>Outline width, mm</span><input type="number" inputmode="numeric" data-bind="form.outlineW" min="300" max="3000"></label>
+          <label class="field"><span>Outline height, mm</span><input type="number" inputmode="numeric" data-bind="form.outlineH" min="1000" max="4000"></label>
+        </div>
+        <div class="grid2" id="params-E">
+          <label class="field"><span>Ruler length, mm</span><input type="number" inputmode="numeric" data-bind="form.floorL" min="500" max="5000"></label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Sticks to</legend>
+        <div class="choices" role="radiogroup">
+          <label><input type="radio" name="anchoring" value="vertical" data-bind="form.anchoring"> Wall (vertical)</label>
+          <label><input type="radio" name="anchoring" value="none" data-bind="form.anchoring"> Not set (none)</label>
+          <label><input type="radio" name="anchoring" value="horizontal" data-bind="form.anchoring"> Floor (horizontal)</label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Which way the gauge is built</legend>
+        <div class="choices" role="radiogroup">
+          <label><input type="radio" name="orientation" value="xy" data-bind="form.orientation"> Standing up (xy)</label>
+          <label><input type="radio" name="orientation" value="xz" data-bind="form.orientation"> Lying flat (xz)</label>
+        </div>
+        <p class="muted">Changing the gauge resets these two to that gauge's normal choice. Change them only when testing them.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Scale lock (stops pinch from resizing)</legend>
+        <div class="choices" role="radiogroup">
+          <label><input type="radio" name="lock" value="on" data-bind="form.lock"> On</label>
+          <label><input type="radio" name="lock" value="off" data-bind="form.lock"> Off</label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>How the file reaches the viewer</legend>
+        <div class="choices" role="radiogroup">
+          <label><input type="radio" name="delivery" value="blob" data-bind="form.delivery"> Made on this phone</label>
+          <label><input type="radio" name="delivery" value="static" data-bind="form.delivery"> Ready-made file</label>
+        </div>
+        <p class="muted">Try "Made on this phone" first. If the AR button does nothing, try "Ready-made file" with the same choices.</p>
+        <details>
+          <summary>Advanced</summary>
+          <div class="choices">
+            <label><input type="checkbox" data-bind="form.downloadAttr"> Add download="model.usdz" to the link (Google model-viewer does this)</label>
+            <label><input type="checkbox" data-bind="form.forcePngJs"> Make the pictures without the canvas (fallback encoder)</label>
+          </div>
+        </details>
+      </fieldset>
+
+      <div class="row-buttons">
+        <button type="button" id="make-link">Make the AR link</button>
+      </div>
+      <div id="build-status" role="status" aria-live="polite"></div>
+
+      <div id="ar-area" class="hidden">
+        <div class="ar-box">
+          <a id="ar-link" class="ar-link" rel="ar" href="#"><img src="ar-icon.svg" alt="Open in AR" width="300" height="75"></a>
+          <span class="caption" id="ar-caption"></span>
+        </div>
+        <div class="note">If the viewer opens on <strong>Object</strong>, tap <strong>AR</strong> at the top.
+          Move the phone slowly until the gauge appears. A plain painted door may never "catch": aim at brick or a
+          textured wall beside it, and write that down in step 3.</div>
+        <div class="row-buttons">
+          <a id="dl-link" class="button secondary" href="#" download="gauge.usdz">Save the .usdz file</a>
+          <a id="plain-link" class="button secondary" href="#">Open as a plain link</a>
+        </div>
+        <p class="muted">Use these two only if the blue button does nothing (other browsers, or an app's built-in browser).</p>
+        <h3>The file</h3>
+        <table class="kv" id="build-table"></table>
+        <div class="table-wrap"><table class="data" id="entry-table"></table></div>
+      </div>
+
+      <h3>Page events (shows how long you were in AR)</h3>
+      <div class="log" id="event-log" aria-live="off"></div>
+    </section>
+
+    <!-- 3 ------------------------------------------------------------------------------------- -->
+    <section class="panel" id="p3" aria-labelledby="p3h">
+      <h2 id="p3h">3. After AR: write down what happened</h2>
+      <div class="note">
+        <strong>How to read the gauge</strong>
+        <ul>
+          <li>Stand square-on to each edge and hold the phone level with it. For the head (top) reading, raise the phone to the head.
+            The gauge sits on whatever surface the phone found, and the wall face can be 50-150 mm in front of the door frame, so reading at an angle shifts the number.</li>
+          <li>On gauges A, B and E the numbers are <strong>centimetres</strong>, one every 10 cm (label 200 = 2000 mm).
+            On A and E each small tick is <strong>10 mm</strong>: label 200 + 4 ticks = 2040 mm, and an edge a little past
+            that 4th tick is about 2043. On B estimate the mm between the 100 mm bars. On C and D the numbers are sizes in mm.</li>
+          <li>Write every reading in <strong>millimetres</strong>.</li>
+          <li>Note whether it stuck to the <strong>wall</strong> or the <strong>door</strong> itself.</li>
+        </ul>
+      </div>
+      <div id="pending-run" class="note" role="status">No AR run yet. Make and open a gauge in step 2 first.</div>
+
+      <fieldset>
+        <legend>This run</legend>
+        <div class="grid2">
+          <label class="field"><span>Gauge</span>
+            <select data-bind="draft.design">
+              <option value="A">A. Tape L</option><option value="B">B. Grid</option><option value="C">C. All standard sizes</option>
+              <option value="D">D. One outline</option><option value="E">E. Floor ruler</option>
+            </select>
+          </label>
+          <label class="field"><span>Did AR open?</span>
+            <select data-bind="draft.opened">
+              <option value="">Choose…</option><option value="yes">Yes</option><option value="no">No, nothing happened</option><option value="error">Error message</option>
+            </select>
+          </label>
+          <label class="field"><span>Error text (if any)</span><input type="text" data-bind="draft.openedNote" autocomplete="off"></label>
+          <label class="field"><span>Stuck to</span>
+            <select data-bind="draft.stuck">
+              <option value="">Choose…</option><option value="wall">Wall</option><option value="door">Door</option><option value="floor">Floor</option><option value="floated">Floated / never stuck</option>
+            </select>
+          </label>
+          <label class="field"><span>Seconds to stick</span><input type="number" inputmode="decimal" data-bind="draft.stickSec" min="0"></label>
+          <label class="field"><span>Right way up?</span>
+            <select data-bind="draft.upright"><option value="">Choose…</option><option value="yes">Yes</option><option value="no">No</option></select>
+          </label>
+          <label class="field"><span>Could you drag it?</span>
+            <select data-bind="draft.drag"><option value="">Choose…</option><option value="yes">Yes</option><option value="no">No</option></select>
+          </label>
+          <label class="field"><span>Did a pinch change its size?</span>
+            <select data-bind="draft.pinch"><option value="">Choose…</option><option value="yes">Yes, it resized</option><option value="no">No, it stayed</option></select>
+          </label>
+          <label class="field"><span>If it resized: were the readings taken before the pinch (or back at 100 %)?</span>
+            <select data-bind="draft.readBeforePinch"><option value="">Choose…</option><option value="yes">Yes, before it resized (or at 100 %)</option><option value="no">No, after it resized</option></select>
+          </label>
+          <label class="field"><span>Light</span>
+            <select data-bind="draft.light">
+              <option value="">Choose…</option><option value="sun">Bright sun</option><option value="day">Daylight / overcast</option><option value="indoor">Indoor lights</option><option value="dim">Dim</option>
+            </select>
+          </label>
+          <label class="field"><span>Distance from the door, m</span><input type="number" inputmode="decimal" data-bind="draft.distM" min="0" step="0.1"></label>
+        </div>
+      </fieldset>
+
+      <fieldset id="readings-A">
+        <legend>Tape L readings (mm)</legend>
+        <div class="grid2">
+          <label class="field"><span>Head on the upright strip</span><input type="number" inputmode="numeric" data-bind="draft.readings.head"></label>
+          <label class="field"><span>Right jamb on the sill strip</span><input type="number" inputmode="numeric" data-bind="draft.readings.right"></label>
+        </div>
+      </fieldset>
+      <fieldset id="readings-B">
+        <legend>Grid readings (mm): read both edges</legend>
+        <div class="grid2">
+          <label class="field"><span>Left jamb</span><input type="number" inputmode="numeric" data-bind="draft.readings.left"></label>
+          <label class="field"><span>Right jamb</span><input type="number" inputmode="numeric" data-bind="draft.readings.right"></label>
+          <label class="field"><span>Sill (bottom)</span><input type="number" inputmode="numeric" data-bind="draft.readings.sill"></label>
+          <label class="field"><span>Head (top)</span><input type="number" inputmode="numeric" data-bind="draft.readings.head"></label>
+        </div>
+      </fieldset>
+      <fieldset id="readings-C">
+        <legend id="readings-C-legend">Which lines matched</legend>
+        <div class="grid2">
+          <label class="field"><span>Width line that meets the right jamb (mm)</span><select data-bind="draft.readings.wLine" id="wline-select"></select></label>
+          <label class="field"><span>The right jamb is</span>
+            <select data-bind="draft.readings.wFit">
+              <option value="">Choose…</option><option value="match">On the line</option><option value="bigger">Outside it (opening wider)</option><option value="smaller">Inside it (opening narrower)</option>
+            </select>
+          </label>
+          <label class="field"><span>By how many mm (wider or narrower)</span><input type="number" inputmode="numeric" min="0" data-bind="draft.readings.wOff"></label>
+          <label class="field"><span>Height line that meets the head (mm)</span><select data-bind="draft.readings.hLine" id="hline-select"></select></label>
+          <label class="field"><span>The head is</span>
+            <select data-bind="draft.readings.hFit">
+              <option value="">Choose…</option><option value="match">On the line</option><option value="bigger">Above it (opening taller)</option><option value="smaller">Below it (opening shorter)</option>
+            </select>
+          </label>
+          <label class="field"><span>By how many mm (taller or shorter)</span><input type="number" inputmode="numeric" min="0" data-bind="draft.readings.hOff"></label>
+        </div>
+        <p class="muted">The iPhone number pad has no minus key, so say which way with the choice above and type the mm without a sign.</p>
+      </fieldset>
+      <fieldset id="readings-E">
+        <legend>Floor check (mm)</legend>
+        <p class="muted">Lay a real tape on the floor, zero at the gauge's red zero. Read the AR ruler where the real tape shows 1000 and 2000.</p>
+        <div class="grid2">
+          <label class="field"><span>AR reading at the tape's 1000 mm</span><input type="number" inputmode="numeric" data-bind="draft.readings.r1000"></label>
+          <label class="field"><span>AR reading at the tape's 2000 mm</span><input type="number" inputmode="numeric" data-bind="draft.readings.r2000"></label>
+        </div>
+      </fieldset>
+
+      <fieldset id="tape-truth">
+        <legend>Tape measure (the truth)</legend>
+        <div class="grid2">
+          <label class="field"><span>Opening width, mm</span><input type="number" inputmode="numeric" data-bind="draft.tape.w"></label>
+          <label class="field"><span>Opening height, mm</span><input type="number" inputmode="numeric" data-bind="draft.tape.h"></label>
+          <label class="field"><span>Door name / number (each named door counts once in the go / no-go)</span><input type="text" data-bind="draft.tape.doorId" autocomplete="off" placeholder="e.g. front, no. 12"></label>
+        </div>
+      </fieldset>
+
+      <div id="row-result" class="note" role="status" aria-live="polite"></div>
+      <div class="row-buttons">
+        <button type="button" id="save-row">Save this row</button>
+      </div>
+
+      <h3>This session</h3>
+      <table class="kv" id="summary-table"></table>
+      <h3>By set-up (sticks to / way built / file)</h3>
+      <div class="table-wrap"><table class="data" id="setup-table"></table></div>
+      <h3>By page (top-level, iframe, other browser)</h3>
+      <div class="table-wrap"><table class="data" id="page-table"></table></div>
+      <h3>Go / no-go</h3>
+      <p class="muted">Only the product set-up counts here: made on this phone, sticks to the wall, standing up, scale lock on,
+        opened from Safari itself (not in an iframe or another app). Door readings use gauges A and B. Each named door
+        counts once (its first run); the tables above show every other set-up.</p>
+      <table class="kv" id="go-table"></table>
+      <h3>Rows</h3>
+      <div class="table-wrap"><table class="data" id="rows-table"></table></div>
+    </section>
+
+    <!-- 4 ------------------------------------------------------------------------------------- -->
+    <section class="panel" id="p4" aria-labelledby="p4h">
+      <h2 id="p4h">4. Product flow: photo, then pick the size in AR</h2>
+      <ol class="steps">
+        <li>Measure the opening with a tape and enter it below (or after).</li>
+        <li>Tap <strong>Photo the door</strong>, allow the camera, frame the whole door and tap <strong>Take photo</strong>.</li>
+        <li>Check the four corner dots sit on the inside corners of the opening. Drag any that are off.</li>
+        <li>Tap <strong>Make the outline links</strong>. Open each outline in AR. On the one that fits the door, tap
+          <strong>This size fits</strong> at the bottom of the AR view.</li>
+        <li>Back here, check the pick was recorded, then tap <strong>Save flow row</strong>.</li>
+      </ol>
+      <p class="muted">The outlines stick to the wall standing up (gauge D's normal choice), with step 2's scale lock and file
+        choice. Tick the box below only to test step 2's "Sticks to" and "Which way" here too.</p>
+
+      <fieldset>
+        <legend>Tape measure for this door</legend>
+        <div class="grid2">
+          <label class="field"><span>Opening width, mm</span><input type="number" inputmode="numeric" data-bind="flowDraft.tape.w"></label>
+          <label class="field"><span>Opening height, mm</span><input type="number" inputmode="numeric" data-bind="flowDraft.tape.h"></label>
+          <label class="field"><span>Its standard size</span><select data-bind="flowDraft.tape.size" id="true-size-select"></select></label>
+          <label class="field"><span>Door name / number (each named door counts once)</span><input type="text" data-bind="flowDraft.tape.doorId" autocomplete="off"></label>
+          <label class="field"><span>Outlines to offer</span>
+            <select data-bind="flowDraft.count"><option value="3">Top 3</option><option value="2">Top 2</option></select>
+          </label>
+        </div>
+        <div id="flow-truth" class="note" role="status" aria-live="polite"></div>
+        <div class="choices">
+          <label><input type="checkbox" data-bind="flowDraft.useStep2"> Use step 2's "Sticks to" and "Which way" for the outlines (testing only)</label>
+        </div>
+      </fieldset>
+
+      <div class="row-buttons">
+        <button type="button" id="photo-start">Photo the door</button>
+        <label class="button secondary" for="photo-file">Pick a photo instead</label>
+        <input type="file" id="photo-file" accept="image/*" class="hidden">
+      </div>
+      <div id="flow-status" role="status" aria-live="polite"></div>
+
+      <div id="camera-box" class="camera-box hidden">
+        <video id="camera-video" playsinline muted></video>
+        <div class="row-buttons">
+          <button type="button" id="photo-take">Take photo</button>
+          <button type="button" class="secondary" id="photo-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <div id="editor-box" class="editor-box hidden">
+        <canvas id="editor-canvas" aria-label="Photo of the door with four corner dots you can drag"></canvas>
+        <p class="muted">Drag a dot to move a corner. The estimate updates when you let go.</p>
+      </div>
+
+      <div id="estimate-box" class="hidden">
+        <h3>Photo estimate (shape only, no scale)</h3>
+        <div id="estimate-top"></div>
+        <table class="kv" id="estimate-table"></table>
+        <div class="row-buttons">
+          <button type="button" id="make-outlines">Make the outline links</button>
+        </div>
+      </div>
+      <div id="outline-links"></div>
+      <div id="flow-pick" class="note hidden" role="status" aria-live="polite"></div>
+      <div class="row-buttons">
+        <button type="button" id="save-flow" disabled>Save flow row</button>
+      </div>
+      <h3>Product flow rows</h3>
+      <table class="kv" id="flow-summary"></table>
+      <div class="table-wrap"><table class="data" id="flow-table"></table></div>
+    </section>
+
+    <!-- 5 ------------------------------------------------------------------------------------- -->
+    <section class="panel" id="p5" aria-labelledby="p5h">
+      <h2 id="p5h">5. Send the results</h2>
+      <fieldset>
+        <legend>One question for the business owner</legend>
+        <label class="field"><span>Is it OK for customers to leave the page briefly for Apple's AR view, then come back?</span>
+          <select data-bind="env.ownerLeaveOk">
+            <option value="">Not asked yet</option><option value="yes">Yes, that is fine</option><option value="no">No</option><option value="maybe">Maybe / depends</option>
+          </select>
+        </label>
+        <label class="field"><span>Owner's comment</span><input type="text" data-bind="env.ownerNote" autocomplete="off"></label>
+      </fieldset>
+      <ol class="steps">
+        <li>Tap <strong>Copy results</strong> and paste into a message or email, or</li>
+        <li>tap <strong>Share</strong> to send the file with any app, or <strong>Download JSON</strong> to keep it in Files.</li>
+      </ol>
+      <div class="row-buttons">
+        <button type="button" id="copy-results">Copy results</button>
+        <button type="button" class="secondary" id="share-results">Share</button>
+        <button type="button" class="secondary" id="download-results">Download JSON</button>
+      </div>
+      <div id="export-status" role="status" aria-live="polite"></div>
+      <textarea id="export-text" class="hidden" readonly aria-label="Results to copy by hand"></textarea>
+      <div class="row-buttons">
+        <button type="button" class="danger small" id="clear-all">Clear all results on this phone</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p><a href="../../">Back to SecureMeasure</a></p>
+  </footer>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <noscript><p class="bad">This test page needs JavaScript.</p></noscript>
+  <script type="module" src="arql.js"></script>
+</body>
+</html>
